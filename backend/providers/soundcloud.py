@@ -1,7 +1,8 @@
 """SoundCloud Public API v2 full-track provider with dynamic client_id discovery.
 
-Strictly filters out 30-second Go+ 'SNIP' previews and unofficial remixes/speed-ups,
-supporting both progressive MP3 streams and concurrent HLS fMP4 segment assembly.
+Strictly filters out 30-second Go+ 'SNIP' previews while matching full-length 'ALLOW'
+uploads across hyphenated/transliterated artists, optional-space separators, and
+lazy on-demand HLS fMP4/MP3 concurrent segment assembly.
 """
 
 from __future__ import annotations
@@ -25,6 +26,14 @@ CLIENT_ID_TTL = 12 * 3600  # 12 hours
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', re.IGNORECASE)
 _CLIENT_ID_RE = re.compile(r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]{30,36})["\']')
 _EXT_MAP_RE = re.compile(r'#EXT-X-MAP:URI="([^"]+)"')
+_SEP_SPLIT_RE = re.compile(r"\s*[-–—|/:]\s*")
+
+_UPLOAD_JUNK_RE = re.compile(
+    r"(?:\b(?:official\s*(?:music\s*)?(?:video|audio|mv|lyric\s*video|visualizer)|"
+    r"bản\s*chuẩn|ban\s*chuan|full\s*hd|full\s*audio|full\s*track|free\s*download|"
+    r"download|original\s*mix|visualizer|mv|audio|lyrics?)\b)",
+    re.IGNORECASE,
+)
 
 _NOISE_KEYWORDS = (
     "remix",
@@ -33,6 +42,7 @@ _NOISE_KEYWORDS = (
     "sped up",
     "slowed",
     "house",
+    "vinahouse",
     "lak",
     "dj",
     "mashup",
@@ -55,7 +65,7 @@ _NOISE_KEYWORDS = (
     "reverb",
 )
 _NOISE_PATTERNS = [
-    (kw, re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)", re.IGNORECASE))
+    (kw, re.compile(rf"(?<!\w){re.escape(lrc_parser.normalize_key(kw))}(?!\w)", re.IGNORECASE))
     for kw in _NOISE_KEYWORDS
 ]
 
@@ -69,15 +79,18 @@ _MAX_HLS_CACHE_ITEMS = 8
 
 
 def _noise_penalty(cand_text: str, target_text: str) -> float:
+    """Compute noise penalty on Unicode-normalized text (blocks Fraktur/fancy font bypasses)."""
+    norm_c = lrc_parser.normalize_key(cand_text)
+    norm_t = lrc_parser.normalize_key(target_text)
     penalty = 0.0
     for _, pat in _NOISE_PATTERNS:
-        if pat.search(cand_text) and not pat.search(target_text):
-            penalty += 0.45
+        if pat.search(norm_c) and not pat.search(norm_t):
+            penalty += 0.22
     return penalty
 
 
 def get_client_id(force_refresh: bool = False) -> Optional[str]:
-    """Discover a working 32-char SoundCloud public client_id from web asset bundles."""
+    """Discover a working SoundCloud public client_id from web asset bundles."""
     global _CACHED_CLIENT_ID, _CACHED_CLIENT_ID_AT
 
     env_cid = os.environ.get("SOUNDCLOUD_CLIENT_ID", "").strip()
@@ -151,9 +164,38 @@ def is_full_allow_track(item: Dict[str, Any], target_duration: int = 0) -> bool:
         return False
     if target_duration > 30:
         dur_sec = dur_ms // 1000
-        if abs(dur_sec - target_duration) > 20:
+        max_diff = max(140, int(target_duration * 0.75))
+        if abs(dur_sec - target_duration) > max_diff:
             return False
     return True
+
+
+def _strip_upload_junk(text: str) -> str:
+    cleaned = _UPLOAD_JUNK_RE.sub("", text or "")
+    cleaned = re.sub(r"[\[\]()]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip(" -–—|/:")
+
+
+def _strip_artist_tokens(text: str, norm_pa: str, norm_pa_compact: str) -> str:
+    """Remove artist name tokens from a combined title string like 'Come My Way Son Tung MTP'."""
+    norm_text = lrc_parser.normalize_key(text)
+    if not norm_text or not norm_pa:
+        return text
+    if norm_pa in norm_text:
+        reduced = norm_text.replace(norm_pa, " ").strip()
+        return re.sub(r"\s+", " ", reduced)
+    if len(norm_pa_compact) >= 4:
+        # Handle hyphen-collapsed forms like "son tung mtp" vs "son tung m tp"
+        tokens = norm_text.split()
+        artist_toks = set(norm_pa.split())
+        # Also add merged adjacent pairs of artist tokens (e.g. "m" + "tp" -> "mtp")
+        pa_list = norm_pa.split()
+        for i in range(len(pa_list) - 1):
+            artist_toks.add(pa_list[i] + pa_list[i + 1])
+        remaining = [tok for tok in tokens if tok not in artist_toks]
+        if remaining and len(remaining) < len(tokens):
+            return " ".join(remaining)
+    return text
 
 
 def score_candidate(
@@ -174,26 +216,30 @@ def score_candidate(
     pub_artist = str((item.get("publisher_metadata") or {}).get("artist") or "").strip()
     cand_artist = pub_artist or username
 
-    # Many SoundCloud uploads format title as "Artist - Song Title", "Song Title - Artist", or "Artist | Song Title | Official MV"
-    cleaned_raw = lrc_parser.clean_track_title(raw_title)
+    norm_pa = lrc_parser.normalize_key(primary_artist)
+    norm_pa_compact = norm_pa.replace(" ", "")
+    norm_full_compact = lrc_parser.normalize_key(full_artist or primary_artist).replace(" ", "")
+
+    cleaned_raw = _strip_upload_junk(lrc_parser.clean_track_title(raw_title))
     stripped_title = cleaned_raw
     title_artist_sim = 0.0
-    parts = [p.strip() for p in re.split(r"\s+(?:[-–—|])\s+", cleaned_raw) if p.strip()]
+
+    # Split on optional-space separators (handles 'Come My Way-Sơn Tùng MTP', 'Artist | Song | Official MV')
+    parts = [_strip_upload_junk(p) for p in _SEP_SPLIT_RE.split(cleaned_raw) if _strip_upload_junk(p)]
     if len(parts) >= 2:
         kept_parts: List[str] = []
         stripped_count = 0
         for part in parts:
-            if re.match(
-                r"^(?:official\s*(?:music\s*)?(?:video|audio|mv|lyric\s*video|visualizer)|mv|audio|lyrics?)$",
-                part,
-                re.IGNORECASE,
-            ):
-                stripped_count += 1
-                continue
+            norm_part = lrc_parser.normalize_key(part)
+            norm_part_compact = norm_part.replace(" ", "")
             art_s = max(
                 lrc_parser.token_similarity(part, primary_artist),
                 lrc_parser.token_similarity(part, full_artist or primary_artist),
             )
+            if len(norm_pa_compact) >= 3 and (
+                norm_pa_compact in norm_part_compact or norm_part_compact in norm_pa_compact
+            ):
+                art_s = max(art_s, 0.88)
             if art_s >= 0.50 and stripped_count + 1 < len(parts):
                 title_artist_sim = max(title_artist_sim, art_s)
                 stripped_count += 1
@@ -202,11 +248,15 @@ def score_candidate(
         if kept_parts:
             stripped_title = " - ".join(kept_parts)
 
+    de_artisted = _strip_artist_tokens(stripped_title, norm_pa, norm_pa_compact)
+
     title_sim = max(
         lrc_parser.token_similarity(lrc_parser.clean_track_title(stripped_title), clean_title),
+        lrc_parser.token_similarity(de_artisted, clean_title),
+        lrc_parser.token_similarity(cleaned_raw, clean_title),
         lrc_parser.token_similarity(lrc_parser.clean_track_title(raw_title), clean_title),
     )
-    if title_sim < 0.65:
+    if title_sim < 0.58:
         return -1.0
 
     dur_sec = int(item.get("duration") or 0) // 1000
@@ -222,27 +272,43 @@ def score_candidate(
         lrc_parser.token_similarity(cand_artist, full_artist or primary_artist),
         lrc_parser.token_similarity(username, primary_artist),
     )
-    norm_pa = lrc_parser.normalize_key(primary_artist)
-    if norm_pa and len(norm_pa) >= 2:
-        if norm_pa in lrc_parser.normalize_key(cand_artist) or norm_pa in lrc_parser.normalize_key(raw_title):
-            artist_sim = max(artist_sim, 0.85)
+    norm_cand_art = lrc_parser.normalize_key(cand_artist)
+    norm_raw_title = lrc_parser.normalize_key(raw_title)
+    norm_user = lrc_parser.normalize_key(username)
 
-    # Studio master match on SoundCloud when uploader username is a label/channel but title & duration match
+    if norm_pa and len(norm_pa) >= 2:
+        if norm_pa in norm_cand_art or norm_pa in norm_raw_title or norm_pa in norm_user:
+            artist_sim = max(artist_sim, 0.88)
+    if len(norm_pa_compact) >= 3:
+        if (
+            norm_pa_compact in norm_raw_title.replace(" ", "")
+            or norm_pa_compact in norm_cand_art.replace(" ", "")
+            or norm_pa_compact in norm_user.replace(" ", "")
+        ):
+            artist_sim = max(artist_sim, 0.88)
+    if len(norm_full_compact) >= 4:
+        if (
+            norm_full_compact in norm_raw_title.replace(" ", "")
+            or norm_full_compact in norm_cand_art.replace(" ", "")
+        ):
+            artist_sim = max(artist_sim, 0.88)
+
+    # Studio master / reupload match when uploader username is a label/fan channel but title & duration match closely
     if (
-        artist_sim < 0.45
-        and title_sim >= 0.90
-        and target_duration > 60
-        and dur_sec > 0
-        and abs(dur_sec - target_duration) <= 5
-        and noise_pen == 0.0
+        artist_sim < 0.40
+        and title_sim >= 0.88
+        and (
+            target_duration <= 30
+            or (dur_sec > 0 and abs(dur_sec - target_duration) <= 45)
+        )
     ):
         artist_sim = 0.55
 
-    if target_has_artist and artist_sim < 0.45:
+    if target_has_artist and artist_sim < 0.40:
         return -1.0
 
     if target_duration > 0 and dur_sec > 0:
-        dur_prox = max(0.0, 1.0 - abs(dur_sec - target_duration) / 20.0)
+        dur_prox = max(0.0, 1.0 - abs(dur_sec - target_duration) / 60.0)
     else:
         dur_prox = 0.65
 
@@ -267,7 +333,9 @@ def parse_hls_m3u8_urls(m3u8_text: str, base_url: str = "") -> List[str]:
     return urls
 
 
-def assemble_hls_segments(m3u8_url: str, cache_key: str = "", mime_hint: str = "audio/mp4") -> Optional[Tuple[bytes, str]]:
+def assemble_hls_segments(
+    m3u8_url: str, cache_key: str = "", mime_hint: str = "audio/mp4"
+) -> Optional[Tuple[bytes, str]]:
     """Download an HLS audio playlist's init map + segments concurrently into a single seekable buffer."""
     if cache_key:
         with _HLS_LOCK:
@@ -312,7 +380,9 @@ def assemble_hls_segments(m3u8_url: str, cache_key: str = "", mime_hint: str = "
     return full_bytes, ctype
 
 
-def _resolve_item_stream(item: Dict[str, Any], client_id: str) -> Optional[Dict[str, Any]]:
+def _resolve_item_stream(
+    item: Dict[str, Any], client_id: str, assemble_now: bool = True
+) -> Optional[Dict[str, Any]]:
     transcodings = ((item.get("media") or {}).get("transcodings")) or []
     if not transcodings:
         return None
@@ -351,7 +421,7 @@ def _resolve_item_stream(item: Dict[str, Any], client_id: str) -> Optional[Dict[
             except Exception:
                 continue
 
-    # 2. Fall back to HLS MP3 / fMP4 concurrent segment assembly
+    # 2. Fall back to HLS MP3 / fMP4 (lazy m3u8 resolution during /info, assembled on playback)
     hls_candidates: List[Tuple[int, Dict[str, Any]]] = []
     for tc in transcodings:
         fmt = tc.get("format") or {}
@@ -369,11 +439,19 @@ def _resolve_item_stream(item: Dict[str, Any], client_id: str) -> Optional[Dict[
     for _, tc in hls_candidates:
         try:
             m3u8_url = _fetch_transcoding_stream_url(tc)
-            if not m3u8_url:
+            if not m3u8_url or not m3u8_url.startswith("http"):
                 continue
             raw_mime = str((tc.get("format") or {}).get("mime_type") or "audio/mp4").split(";")[0].strip().lower()
+            cache_key = f"sc:{sc_id}" if sc_id else ""
+            if not assemble_now:
+                return {
+                    "kind": "hls",
+                    "m3u8_url": m3u8_url,
+                    "cache_key": cache_key,
+                    "content_type": raw_mime,
+                }
             assembled = assemble_hls_segments(
-                m3u8_url, cache_key=f"sc:{sc_id}", mime_hint=raw_mime
+                m3u8_url, cache_key=cache_key, mime_hint=raw_mime
             )
             if assembled:
                 return {
@@ -391,37 +469,54 @@ def find_best_stream(
     title: str,
     artist: str,
     duration: int = 0,
-    min_score: float = 0.70,
+    min_score: float = 0.60,
+    assemble_now: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Find and resolve a full-length SoundCloud stream.
 
-    Returns either:
+    Returns one of:
       - {"kind": "remote", "url": str, "content_type": str}
       - {"kind": "local", "bytes": bytes, "content_type": str}
+      - {"kind": "hls", "m3u8_url": str, "cache_key": str, "content_type": str} (when assemble_now=False)
       or None.
     """
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
-    query = f"{primary_artist} {clean_title}".strip()
-    if not query:
-        return None
+    queries: List[str] = []
+    for candidate_q in (
+        f"{primary_artist} {clean_title}".strip(),
+        f"{artist} {clean_title}".strip(),
+        clean_title.strip(),
+    ):
+        if candidate_q and candidate_q not in queries:
+            queries.append(candidate_q)
 
-    items = search_raw_tracks(query, limit=15)
-    if not items:
+    if not queries:
         return None
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
-    for item in items:
-        sc = score_candidate(
-            item,
-            clean_title=clean_title,
-            primary_artist=primary_artist,
-            full_artist=artist,
-            target_duration=duration,
-            raw_target_title=title,
-        )
-        if sc >= min_score:
-            scored.append((sc, item))
+    seen_ids: set[str] = set()
+
+    for q in queries:
+        items = search_raw_tracks(q, limit=15)
+        for item in items:
+            iid = str(item.get("id") or "")
+            if iid and iid in seen_ids:
+                continue
+            if iid:
+                seen_ids.add(iid)
+            sc = score_candidate(
+                item,
+                clean_title=clean_title,
+                primary_artist=primary_artist,
+                full_artist=artist,
+                target_duration=duration,
+                raw_target_title=title,
+            )
+            if sc >= min_score:
+                scored.append((sc, item))
+        if scored:
+            break
 
     if not scored:
         return None
@@ -432,7 +527,7 @@ def find_best_stream(
         return None
 
     for _, item in scored[:2]:
-        resolved = _resolve_item_stream(item, cid)
+        resolved = _resolve_item_stream(item, cid, assemble_now=assemble_now)
         if resolved:
             return resolved
     return None

@@ -92,13 +92,14 @@ class TestCloudEnvAndDBFallback(unittest.TestCase):
                 )
                 self.assertEqual(cookie_file.read_bytes(), cookie_payload)
 
-        # On cloud IPs (RENDER=true), dead public Piped/Invidious seeds are skipped by default
+        # On cloud IPs (RENDER=true), unauthenticated yt-dlp and dead public Piped/Invidious seeds are skipped
         with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=True), \
              mock.patch("backend.providers.youtube_music._resolve_via_innertube_player", return_value=None), \
-             mock.patch("backend.providers.youtube_music._resolve_via_yt_dlp", return_value=None), \
+             mock.patch("subprocess.run") as m_subproc, \
              mock.patch("backend.providers.youtube_music._resolve_via_piped") as m_piped, \
              mock.patch("backend.providers.youtube_music._resolve_via_invidious") as m_inv:
             self.assertIsNone(youtube_music.resolve_audio_stream("7u4g483WTzw"))
+            m_subproc.assert_not_called()
             m_piped.assert_not_called()
             m_inv.assert_not_called()
 

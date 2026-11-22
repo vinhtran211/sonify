@@ -2,19 +2,29 @@
 
 Keyless, $0, 100% ad-free CD-quality Lossless FLAC full-track audio streaming that
 works reliably from both cloud datacenter IPs (Render/AWS) and residential networks.
+Uses zero-probe /info resolution plus a single-flight /tmp LRU cache so every song
+hits tracks.monochrome.st/track/{id} at most once across all browser Range requests.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend import config, http_client, lrc_parser
 
 MONOCHROME_BASE = "https://tracks.monochrome.st"
+CACHE_DIR = Path(tempfile.gettempdir()) / "sonify_mc_cache"
+MAX_CACHE_FILES = 12
+MIN_TRACK_BYTES = 200_000
+PACE_INTERVAL_SEC = 1.0
 
 _NOISE_KEYWORDS = (
     "remix",
@@ -36,15 +46,72 @@ _NOISE_KEYWORDS = (
     "mashup",
 )
 _NOISE_PATTERNS = [
-    (kw, re.compile(rf"(?<!\w){re.escape(kw)}(?!\w)", re.IGNORECASE))
+    (kw, re.compile(rf"(?<!\w){re.escape(lrc_parser.normalize_key(kw))}(?!\w)", re.IGNORECASE))
     for kw in _NOISE_KEYWORDS
 ]
 
+_LOCKS_GUARD = threading.Lock()
+_TRACK_LOCKS: Dict[str, threading.Lock] = {}
+_PACE_LOCK = threading.Lock()
+_LAST_STREAM_START: float = 0.0
+_MIME_CACHE: Dict[str, str] = {}
+
+
+def _get_track_lock(raw_id: str) -> threading.Lock:
+    with _LOCKS_GUARD:
+        lock = _TRACK_LOCKS.get(raw_id)
+        if lock is None:
+            if len(_TRACK_LOCKS) > 256:
+                for k in list(_TRACK_LOCKS.keys()):
+                    if not _TRACK_LOCKS[k].locked():
+                        _TRACK_LOCKS.pop(k, None)
+                        if len(_TRACK_LOCKS) <= 128:
+                            break
+            lock = threading.Lock()
+            _TRACK_LOCKS[raw_id] = lock
+        return lock
+
+
+def _pace_upstream_request() -> None:
+    """Enforce >= 1.0s spacing between upstream /track/{id} downloads to avoid burst 429s."""
+    global _LAST_STREAM_START
+    with _PACE_LOCK:
+        now = time.monotonic()
+        wait = PACE_INTERVAL_SEC - (now - _LAST_STREAM_START)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_STREAM_START = time.monotonic()
+
+
+def _safe_cache_path(raw_id: str) -> Path:
+    safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", str(raw_id).strip())
+    return CACHE_DIR / f"{safe_name}.bin"
+
+
+def _evict_lru_cache_files() -> None:
+    try:
+        if not CACHE_DIR.is_dir():
+            return
+        files = sorted(
+            (p for p in CACHE_DIR.glob("*.bin") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in files[MAX_CACHE_FILES:]:
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
 
 def _noise_penalty(cand_text: str, target_text: str) -> float:
+    norm_c = lrc_parser.normalize_key(cand_text)
+    norm_t = lrc_parser.normalize_key(target_text)
     penalty = 0.0
     for _, pat in _NOISE_PATTERNS:
-        if pat.search(cand_text) and not pat.search(target_text):
+        if pat.search(norm_c) and not pat.search(norm_t):
             penalty += 0.35
     return penalty
 
@@ -103,7 +170,7 @@ def search_tracks(query: str, limit: int = 8) -> List[Dict[str, Any]]:
             except Exception:
                 pass
             if exc.code == 429 and attempt == 0:
-                time.sleep(2.0)
+                time.sleep(1.5)
                 continue
             return []
         except Exception:
@@ -118,7 +185,8 @@ def get_stream_url(raw_id: str) -> str:
 def probe_track_stream(raw_id: str) -> Optional[Tuple[str, str]]:
     """Probe a Monochrome track stream URL with cold-cache tolerance and 1x 429 retry.
 
-    Returns (final_url, content_type) where content_type is sniffed (e.g. 'audio/flac').
+    Note: find_best_stream() intentionally does NOT call this during /info to avoid
+    triggering burst 429 rate limits; this helper remains available for explicit probes.
     """
     if not raw_id:
         return None
@@ -144,6 +212,138 @@ def probe_track_stream(raw_id: str) -> Optional[Tuple[str, str]]:
             continue
         break
     return None
+
+
+def ensure_track_cached(raw_id: str) -> Optional[Tuple[Path, str]]:
+    """Download a Monochrome track at most once into bounded /tmp LRU cache (single-flight).
+
+    All concurrent browser Range requests (bytes=0-, Chrome tail probes, seeks) share
+    one single uninterrupted upstream download and then serve in <1ms from disk.
+    """
+    clean_id = str(raw_id or "").strip()
+    if not clean_id:
+        return None
+
+    bin_path = _safe_cache_path(clean_id)
+
+    # Fast path without waiting on download lock if already cached on disk
+    try:
+        if bin_path.is_file() and bin_path.stat().st_size >= MIN_TRACK_BYTES:
+            try:
+                os.utime(bin_path, None)
+            except OSError:
+                pass
+            ctype = _MIME_CACHE.get(clean_id)
+            if not ctype:
+                with bin_path.open("rb") as fh:
+                    head = fh.read(16)
+                ctype = http_client.sniff_media_mime(head, "audio/flac") or "audio/flac"
+                _MIME_CACHE[clean_id] = ctype
+            return bin_path, ctype
+    except OSError:
+        pass
+
+    track_lock = _get_track_lock(clean_id)
+    with track_lock:
+        # Re-check after acquiring per-track lock in case a concurrent request just finished
+        try:
+            if bin_path.is_file() and bin_path.stat().st_size >= MIN_TRACK_BYTES:
+                try:
+                    os.utime(bin_path, None)
+                except OSError:
+                    pass
+                ctype = _MIME_CACHE.get(clean_id)
+                if not ctype:
+                    with bin_path.open("rb") as fh:
+                        head = fh.read(16)
+                    ctype = http_client.sniff_media_mime(head, "audio/flac") or "audio/flac"
+                    _MIME_CACHE[clean_id] = ctype
+                return bin_path, ctype
+        except OSError:
+            pass
+
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        url = get_stream_url(clean_id)
+        hdrs = {"User-Agent": config.BROWSER_USER_AGENT}
+        backoffs = (1.5, 3.0, 4.5)
+
+        for attempt in range(4):
+            resp = None
+            tmp_path = bin_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            try:
+                _pace_upstream_request()
+                status, up_headers, resp = http_client.open_stream(
+                    url,
+                    headers=hdrs,
+                    range_header=None,
+                    method="GET",
+                    timeout=max(35.0, float(config.STREAM_READ_TIMEOUT)),
+                )
+                if status not in (200, 206):
+                    if status == 429 and attempt < len(backoffs):
+                        time.sleep(backoffs[attempt])
+                        continue
+                    return None
+
+                head_bytes = bytearray()
+                total_written = 0
+                with tmp_path.open("wb") as out_f:
+                    while True:
+                        chunk = resp.read(config.STREAM_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        if len(head_bytes) < 16:
+                            head_bytes.extend(chunk[: 16 - len(head_bytes)])
+                        out_f.write(chunk)
+                        total_written += len(chunk)
+
+                if total_written < MIN_TRACK_BYTES:
+                    tmp_path.unlink(missing_ok=True)
+                    return None
+
+                header_ct = up_headers.get("content-type", "audio/flac")
+                ctype = http_client.sniff_media_mime(bytes(head_bytes), header_ct) or "audio/flac"
+                tmp_path.replace(bin_path)
+                _MIME_CACHE[clean_id] = ctype
+                _evict_lru_cache_files()
+                return bin_path, ctype
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                tmp_path.unlink(missing_ok=True)
+                if code == 429 and attempt < len(backoffs):
+                    time.sleep(backoffs[attempt])
+                    continue
+                return None
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                return None
+            finally:
+                if resp is not None:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+
+    return None
+
+
+def fetch_track_bytes(raw_id: str) -> Optional[Tuple[bytes, str]]:
+    """Fetch full Monochrome audio bytes via the single-flight /tmp LRU cache."""
+    cached = ensure_track_cached(raw_id)
+    if not cached:
+        return None
+    path, ctype = cached
+    try:
+        return path.read_bytes(), ctype
+    except OSError:
+        return None
 
 
 def score_candidate(
@@ -191,7 +391,15 @@ def score_candidate(
     if norm_pa and len(norm_pa) >= 2:
         norm_ca = lrc_parser.normalize_key(cand_artist)
         norm_ct = lrc_parser.normalize_key(cand_title)
-        if norm_pa in norm_ca or norm_pa in norm_ct:
+        norm_pa_compact = norm_pa.replace(" ", "")
+        if (
+            norm_pa in norm_ca
+            or norm_pa in norm_ct
+            or (
+                len(norm_pa_compact) >= 3
+                and (norm_pa_compact in norm_ca.replace(" ", "") or norm_pa_compact in norm_ct.replace(" ", ""))
+            )
+        ):
             artist_sim = max(artist_sim, 0.55)
 
     if target_has_artist and artist_sim < 0.40:
@@ -224,9 +432,11 @@ def find_best_stream(
     isrc: str = "",
     min_score: float = 0.65,
 ) -> Optional[Tuple[str, str, str]]:
-    """Search Monochrome for a matching full-length lossless track and probe playability.
+    """Search Monochrome for a matching full-length lossless track WITHOUT probing /track/{id}.
 
-    Returns (stream_url, content_type, monochrome_track_id) or None.
+    Zero-probe resolution prevents /info + <video> burst 429s; actual audio download
+    happens once via single-flight ensure_track_cached() when playback begins.
+    Returns (stream_url, "audio/flac", monochrome_track_id) or None.
     """
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
@@ -269,11 +479,8 @@ def find_best_stream(
         return None
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    for _, cand in scored[:2]:
-        raw_id = str(cand.get("rawId") or "")
-        if not raw_id:
-            continue
-        probed = probe_track_stream(raw_id)
-        if probed:
-            return probed[0], probed[1], raw_id
+    for _, cand in scored:
+        raw_id = str(cand.get("rawId") or "").strip()
+        if raw_id:
+            return get_stream_url(raw_id), "audio/flac", raw_id
     return None

@@ -7,7 +7,9 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 
 from backend import config, http_client, offline_catalog
@@ -25,6 +27,7 @@ from backend.providers import (
 _RANGE_RE = re.compile(r"^\s*bytes=(\d*)-(\d*)\s*$", re.IGNORECASE)
 _YT_SOURCES = frozenset({"youtube-innertube", "yt-dlp", "piped", "invidious", "youtube"})
 _VALID_STREAM_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
+PREVIEW_CACHE_TTL = 12.0
 
 
 class StreamUnavailableError(RuntimeError):
@@ -125,6 +128,15 @@ class StreamService:
         with self._cache_lock:
             self._cache.clear()
 
+    def _get_valid_cached(self, track_id: str, now: float) -> Optional[ResolvedStream]:
+        cached = self._cache.get(track_id)
+        if not cached:
+            return None
+        ttl = PREVIEW_CACHE_TTL if cached.mode == "preview" else config.STREAM_CACHE_TTL
+        if (now - cached.resolved_at) < ttl:
+            return cached
+        return None
+
     def _load_track_metadata(self, track_id: str) -> Optional[Dict[str, Any]]:
         track = self.db.get_track(track_id, include_extra=True)
         if track:
@@ -203,8 +215,8 @@ class StreamService:
 
         if not force_refresh and not excluded:
             with self._cache_lock:
-                cached = self._cache.get(track_id)
-                if cached and (now - cached.resolved_at) < config.STREAM_CACHE_TTL:
+                cached = self._get_valid_cached(track_id, now)
+                if cached:
                     return cached
 
         # Single-flight per track_id so concurrent /info + /stream share one resolution
@@ -213,11 +225,11 @@ class StreamService:
             now = time.time()
             if not force_refresh and not excluded:
                 with self._cache_lock:
-                    cached = self._cache.get(track_id)
-                    if cached and (now - cached.resolved_at) < config.STREAM_CACHE_TTL:
+                    cached = self._get_valid_cached(track_id, now)
+                    if cached:
                         return cached
 
-            return self._resolve_stream_unlocked(track_id, excluded)
+            return self._resolve_stream_unlocked(track_id, excluded, force_refresh=force_refresh)
 
     def _try_resolve_monochrome(
         self,
@@ -230,27 +242,24 @@ class StreamService:
         duration: int,
         extra: Dict[str, Any],
         excluded: Set[str],
+        force_refresh: bool = False,
     ) -> Optional[ResolvedStream]:
         if "monochrome" in excluded or prefix == "mc":
             return None
 
+        # Zero-probe fast path: cached monochromeTrackId returns immediately with 0 calls to /track/{id}
         cached_mc_id = str(extra.get("monochromeTrackId") or "").strip()
-        if cached_mc_id:
-            try:
-                probed = monochrome.probe_track_stream(cached_mc_id)
-                if probed:
-                    resolved = ResolvedStream(
-                        track_id=track_id,
-                        mode="full",
-                        source="monochrome",
-                        content_type=probed[1],
-                        url=probed[0],
-                        headers={"User-Agent": config.BROWSER_USER_AGENT},
-                    )
-                    self._store_cache(resolved)
-                    return resolved
-            except Exception:
-                pass
+        if cached_mc_id and not force_refresh:
+            resolved = ResolvedStream(
+                track_id=track_id,
+                mode="full",
+                source="monochrome",
+                content_type="audio/flac",
+                url=monochrome.get_stream_url(cached_mc_id),
+                headers={"User-Agent": config.BROWSER_USER_AGENT},
+            )
+            self._store_cache(resolved)
+            return resolved
 
         if not title:
             return None
@@ -345,7 +354,9 @@ class StreamService:
                 pass
         return None
 
-    def _resolve_stream_unlocked(self, track_id: str, excluded: Set[str]) -> ResolvedStream:
+    def _resolve_stream_unlocked(
+        self, track_id: str, excluded: Set[str], force_refresh: bool = False
+    ) -> ResolvedStream:
         prefix, _, raw_id = track_id.partition(":")
         track = self._load_track_metadata(track_id)
         extra = (track or {}).get("_extra") or {}
@@ -429,21 +440,16 @@ class StreamService:
                 pass
 
         if prefix == "mc" and raw_id and "monochrome" not in excluded:
-            try:
-                mc_res = monochrome.probe_track_stream(raw_id)
-                if mc_res:
-                    resolved = ResolvedStream(
-                        track_id=track_id,
-                        mode="full",
-                        source="monochrome",
-                        content_type=mc_res[1],
-                        url=mc_res[0],
-                        headers={"User-Agent": config.BROWSER_USER_AGENT},
-                    )
-                    self._store_cache(resolved)
-                    return resolved
-            except Exception:
-                pass
+            resolved = ResolvedStream(
+                track_id=track_id,
+                mode="full",
+                source="monochrome",
+                content_type="audio/flac",
+                url=monochrome.get_stream_url(raw_id),
+                headers={"User-Agent": config.BROWSER_USER_AGENT},
+            )
+            self._store_cache(resolved)
+            return resolved
 
         # ------------------------------------------------------------------
         # Tier 1 & Tier 2 (Environment-Aware Primary Full-Track Sources):
@@ -452,7 +458,7 @@ class StreamService:
         # ------------------------------------------------------------------
         if config.is_cloud_env():
             mc_resolved = self._try_resolve_monochrome(
-                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded
+                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
             )
             if mc_resolved:
                 return mc_resolved
@@ -470,7 +476,7 @@ class StreamService:
                 return yt_resolved
 
             mc_resolved = self._try_resolve_monochrome(
-                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded
+                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
             )
             if mc_resolved:
                 return mc_resolved
@@ -496,19 +502,35 @@ class StreamService:
                 pass
 
         # ------------------------------------------------------------------
-        # Tier 4: SoundCloud Public API v2 full-track match (strict ALLOW + non-remix gate)
+        # Tier 4: SoundCloud Public API v2 full-track match (strict ALLOW + lazy HLS assembly)
         # ------------------------------------------------------------------
         if title and "soundcloud" not in excluded:
             try:
-                sc_match = soundcloud.find_best_stream(title, artist, duration)
+                sc_match = soundcloud.find_best_stream(
+                    title, artist, duration, assemble_now=False
+                )
                 if sc_match:
-                    if sc_match.get("kind") == "local" and sc_match.get("bytes"):
+                    kind = sc_match.get("kind")
+                    if kind == "local" and sc_match.get("bytes"):
                         resolved = ResolvedStream(
                             track_id=track_id,
                             mode="full",
                             source="soundcloud",
                             content_type=str(sc_match.get("content_type") or "audio/mp4"),
                             local_bytes=sc_match["bytes"],
+                        )
+                    elif kind == "hls" and sc_match.get("m3u8_url"):
+                        resolved = ResolvedStream(
+                            track_id=track_id,
+                            mode="full",
+                            source="soundcloud",
+                            content_type=str(sc_match.get("content_type") or "audio/mpeg"),
+                            url=str(sc_match["m3u8_url"]),
+                            headers={
+                                "User-Agent": config.BROWSER_USER_AGENT,
+                                "X-SC-M3U8": str(sc_match["m3u8_url"]),
+                                "X-SC-Cache-Key": str(sc_match.get("cache_key") or ""),
+                            },
                         )
                     else:
                         resolved = ResolvedStream(
@@ -613,6 +635,15 @@ class StreamService:
 
     def _store_cache(self, resolved: ResolvedStream) -> None:
         with self._cache_lock:
+            # Never poison an existing valid "full" cache entry with a "preview" fallback
+            if resolved.mode == "preview":
+                existing = self._cache.get(resolved.track_id)
+                if (
+                    existing
+                    and existing.mode == "full"
+                    and (time.time() - existing.resolved_at) < config.STREAM_CACHE_TTL
+                ):
+                    return
             if len(self._cache) > 256:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[resolved.track_id] = resolved
@@ -690,6 +721,58 @@ class StreamService:
             if not head_only:
                 self._write_chunks(handler, data)
 
+    def _serve_file_path(
+        self,
+        handler: Any,
+        file_path: Path,
+        resolved: ResolvedStream,
+        range_header: Optional[str],
+        head_only: bool,
+    ) -> None:
+        total = file_path.stat().st_size
+        byte_range, ok = parse_byte_range(range_header, total)
+        if not ok:
+            handler.send_response(416)
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.send_header("Content-Range", f"bytes */{total}")
+            handler.send_header("X-Ad-Free", "true")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return
+
+        if byte_range is not None:
+            start, end = byte_range
+            length = end - start + 1
+            handler.send_response(206)
+            self._send_common_stream_headers(handler, resolved)
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            handler.send_header("Content-Length", str(length))
+            handler.end_headers()
+        else:
+            start = 0
+            length = total
+            handler.send_response(200)
+            self._send_common_stream_headers(handler, resolved)
+            handler.send_header("Content-Length", str(length))
+            handler.end_headers()
+
+        if head_only:
+            return
+
+        try:
+            with file_path.open("rb") as fh:
+                if start > 0:
+                    fh.seek(start)
+                remaining = length
+                while remaining > 0:
+                    buf = fh.read(min(config.STREAM_CHUNK_SIZE, remaining))
+                    if not buf:
+                        break
+                    handler.wfile.write(buf)
+                    remaining -= len(buf)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+
     def _write_chunks(self, handler: Any, payload: bytes) -> None:
         step = config.STREAM_CHUNK_SIZE
         view = memoryview(payload)
@@ -707,13 +790,61 @@ class StreamService:
             self._send_stream_unavailable(handler, exc.message, head_only)
             return
 
-        if resolved.local_bytes is not None:
-            self._serve_local_bytes(handler, resolved, range_header, head_only)
-            return
-
-        # Proxy remote stream; on pre-header failure, exclude failed source and cascade to next real provider
+        # Proxy/serve resolved stream; on pre-header failure, exclude failed source and cascade
         excluded: Set[str] = set()
-        for attempt in range(3):
+        for attempt in range(4):
+            if resolved.local_bytes is not None:
+                self._serve_local_bytes(handler, resolved, range_header, head_only)
+                return
+
+            # Monochrome single-flight /tmp LRU cache: hits tracks.monochrome.st/track/{id} at most ONCE
+            mc_prefix = monochrome.MONOCHROME_BASE + "/track/"
+            if resolved.source == "monochrome" and resolved.url.startswith(mc_prefix):
+                mc_id = urllib.parse.unquote(resolved.url[len(mc_prefix) :].split("?", 1)[0]).strip("/")
+                cached_mc = monochrome.ensure_track_cached(mc_id) if mc_id else None
+                if cached_mc:
+                    file_path, ctype = cached_mc
+                    resolved.content_type = ctype
+                    self._serve_file_path(handler, file_path, resolved, range_header, head_only)
+                    return
+                # Monochrome track download failed even after 429 retries -> cascade to SoundCloud/JioSaavn/etc.
+                self.invalidate(track_id)
+                excluded.add("monochrome")
+                try:
+                    resolved = self.resolve_stream(
+                        track_id, force_refresh=True, exclude_sources=excluded
+                    )
+                    continue
+                except StreamUnavailableError as uerr:
+                    self._send_stream_unavailable(handler, uerr.message, head_only)
+                    return
+
+            # Deferred SoundCloud HLS assembly: assemble once into memory LRU, then serve all Range requests locally
+            sc_m3u8 = resolved.headers.get("X-SC-M3U8") if resolved.source == "soundcloud" else None
+            if sc_m3u8:
+                cache_key = resolved.headers.get("X-SC-Cache-Key") or ""
+                try:
+                    assembled = soundcloud.assemble_hls_segments(
+                        sc_m3u8, cache_key=cache_key, mime_hint=resolved.content_type
+                    )
+                except Exception:
+                    assembled = None
+                if assembled:
+                    resolved.local_bytes = assembled[0]
+                    resolved.content_type = assembled[1]
+                    self._serve_local_bytes(handler, resolved, range_header, head_only)
+                    return
+                self.invalidate(track_id)
+                excluded.add("soundcloud")
+                try:
+                    resolved = self.resolve_stream(
+                        track_id, force_refresh=True, exclude_sources=excluded
+                    )
+                    continue
+                except StreamUnavailableError as uerr:
+                    self._send_stream_unavailable(handler, uerr.message, head_only)
+                    return
+
             resp = None
             headers_sent = False
             try:
@@ -733,16 +864,6 @@ class StreamService:
                             headers=resolved.headers,
                             range_header=range_header or "bytes=0-",
                             method="GET",
-                            timeout=config.STREAM_READ_TIMEOUT,
-                        )
-                    elif head_exc.code == 429 and resolved.source == "monochrome":
-                        head_exc.close()
-                        time.sleep(2.0)
-                        status, up_headers, resp = http_client.open_stream(
-                            resolved.url,
-                            headers=resolved.headers,
-                            range_header=range_header,
-                            method="HEAD" if head_only else "GET",
                             timeout=config.STREAM_READ_TIMEOUT,
                         )
                     else:
@@ -788,7 +909,7 @@ class StreamService:
                     handler.send_header("Content-Length", "0")
                     handler.end_headers()
                     return
-                if attempt < 2 and exc.code in (403, 404, 410, 429, 500, 502, 503):
+                if attempt < 3 and exc.code in (403, 404, 410, 429, 500, 502, 503):
                     self.invalidate(track_id)
                     is_fresh = (time.time() - resolved.resolved_at) < 30.0
                     if attempt >= 1 or is_fresh:
@@ -799,9 +920,6 @@ class StreamService:
                         )
                     except StreamUnavailableError as uerr:
                         self._send_stream_unavailable(handler, uerr.message, head_only)
-                        return
-                    if resolved.local_bytes is not None:
-                        self._serve_local_bytes(handler, resolved, range_header, head_only)
                         return
                     continue
                 self._send_stream_unavailable(
@@ -815,7 +933,7 @@ class StreamService:
             except Exception:
                 if headers_sent:
                     return
-                if attempt < 2:
+                if attempt < 3:
                     self.invalidate(track_id)
                     excluded.add(resolved.source)
                     try:
@@ -824,9 +942,6 @@ class StreamService:
                         )
                     except StreamUnavailableError as uerr:
                         self._send_stream_unavailable(handler, uerr.message, head_only)
-                        return
-                    if resolved.local_bytes is not None:
-                        self._serve_local_bytes(handler, resolved, range_header, head_only)
                         return
                     continue
                 self._send_stream_unavailable(

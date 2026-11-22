@@ -294,19 +294,60 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
             -1.0,
         )
 
-        # find_best_stream retries 429 and returns Lossless FLAC stream
+        # Zero-probe find_best_stream returns stream URL directly with 0 calls to probe_url (/track/{id})
         with mock.patch("backend.providers.monochrome.search_tracks", return_value=[norm]), \
-             mock.patch("backend.http_client.probe_url", side_effect=[
-                 (False, 429, {}, "https://tracks.monochrome.st/track/42188284"),
-                 (True, 206, {"content-type": "audio/flac"}, "https://tracks.monochrome.st/track/42188284"),
-             ]), \
-             mock.patch("time.sleep"):
+             mock.patch("backend.http_client.probe_url") as m_probe:
             best = monochrome.find_best_stream("Đừng Làm Trái Tim Anh Đau", "Sơn Tùng M-TP", 279)
             self.assertIsNotNone(best)
             url, mime, mc_id = best
             self.assertEqual(url, "https://tracks.monochrome.st/track/42188284")
             self.assertEqual(mime, "audio/flac")
             self.assertEqual(mc_id, "42188284")
+            m_probe.assert_not_called()
+
+        # Single-flight /tmp LRU cache: retries HTTP 429, sniffs fLaC -> audio/flac, serves 2nd call from disk
+        import io
+        from pathlib import Path
+        flac_payload = b"fLaC" + bytes(i % 256 for i in range(250_000))
+
+        class _FakeResp:
+            def __init__(self, data: bytes):
+                self._buf = io.BytesIO(data)
+
+            def read(self, n: int = -1) -> bytes:
+                return self._buf.read(n)
+
+            def close(self) -> None:
+                self._buf.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "mc_cache"
+            open_calls = []
+
+            def fake_open(*args, **kwargs):
+                open_calls.append(args[0])
+                if len(open_calls) == 1:
+                    raise urllib.error.HTTPError(args[0], 429, "Too Many Requests", {}, None)
+                return 200, {"content-type": "application/octet-stream"}, _FakeResp(flac_payload)
+
+            with mock.patch.object(monochrome, "CACHE_DIR", cache_dir), \
+                 mock.patch.object(monochrome, "PACE_INTERVAL_SEC", 0.0), \
+                 mock.patch.dict(monochrome._MIME_CACHE, {}, clear=True), \
+                 mock.patch("backend.http_client.open_stream", side_effect=fake_open), \
+                 mock.patch("time.sleep"):
+                res1 = monochrome.ensure_track_cached("42188284")
+                self.assertIsNotNone(res1)
+                path1, ctype1 = res1
+                self.assertEqual(ctype1, "audio/flac")
+                self.assertEqual(path1.read_bytes(), flac_payload)
+                self.assertEqual(len(open_calls), 2)  # 1x 429 + 1x success
+
+                # Second call serves directly from disk with zero upstream open_stream calls
+                res2 = monochrome.ensure_track_cached("42188284")
+                self.assertIsNotNone(res2)
+                self.assertEqual(res2[0], path1)
+                self.assertEqual(res2[1], "audio/flac")
+                self.assertEqual(len(open_calls), 2)
 
     def test_soundcloud_allow_policy_gate_and_hls_assembly(self):
         # Dynamic 31-32 char client_id extraction from SoundCloud asset bundle
@@ -359,8 +400,38 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
             0.70,
         )
 
-        # Reject unrequested remix on SoundCloud
+        # Space-collapsed artist ("Son Tung M-TP" <-> "Sơn Tùng MTP"), no-space separator, & MV duration delta
+        no_space_mv = {
+            "id": 199999,
+            "title": "Come My Way-Sơn Tùng MTP (Bản Chuẩn)",
+            "policy": "ALLOW",
+            "streamable": True,
+            "duration": 225000,
+            "full_duration": 225000,
+            "user": {"username": "VPop Channel"},
+        }
+        self.assertTrue(soundcloud.is_full_allow_track(no_space_mv, 192))
+        self.assertGreaterEqual(
+            soundcloud.score_candidate(
+                no_space_mv,
+                clean_title="Come My Way",
+                primary_artist="Son Tung M-TP",
+                full_artist="Son Tung M-TP",
+                target_duration=192,
+            ),
+            0.60,
+        )
+
+        # Penalize unrequested remixes including Unicode Fraktur bypass ("𝖗𝖊𝖒𝖎𝖝")
         remix_track = {**allow_track, "title": "Đừng Làm Trái Tim Anh Đau (Vinahouse Remix)"}
+        fraktur_remix = {**allow_track, "title": "Đừng Làm Trái Tim Anh Đau (𝖗𝖊𝖒𝖎𝖝)"}
+        clean_score = soundcloud.score_candidate(
+            allow_track,
+            clean_title="Đừng Làm Trái Tim Anh Đau",
+            primary_artist="Sơn Tùng M-TP",
+            full_artist="Sơn Tùng M-TP",
+            target_duration=279,
+        )
         self.assertLess(
             soundcloud.score_candidate(
                 remix_track,
@@ -369,7 +440,17 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
                 full_artist="Sơn Tùng M-TP",
                 target_duration=279,
             ),
-            0.68,
+            clean_score - 0.30,
+        )
+        self.assertLess(
+            soundcloud.score_candidate(
+                fraktur_remix,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            clean_score - 0.15,
         )
 
         # HLS M3U8 parsing (#EXT-X-MAP + segments) & concurrent byte assembly
@@ -682,33 +763,55 @@ class TestStreamWaterfall(unittest.TestCase):
             cached = self.db.get_track("dz:2830386932", include_extra=True)
             self.assertEqual(cached["_extra"].get("monochromeTrackId"), "42188284")
 
-        # 2. Subsequent refresh uses cached monochromeTrackId fast-path via probe_track_stream
+        # 2. Subsequent resolution (after memory cache eviction, force_refresh=False) uses zero-probe cached monochromeTrackId fast-path
+        self.stream.invalidate("dz:2830386932")
         with mock.patch("backend.config.is_cloud_env", return_value=True), \
-             mock.patch("backend.providers.monochrome.probe_track_stream", return_value=(
-                 "https://tracks.monochrome.st/track/42188284",
-                 "audio/flac",
-             )) as m_probe_mc, \
+             mock.patch("backend.providers.monochrome.probe_track_stream") as m_probe_mc, \
              mock.patch("backend.providers.monochrome.find_best_stream") as m_mc_find2:
-            res2 = self.stream.resolve_stream("dz:2830386932", force_refresh=True)
+            res2 = self.stream.resolve_stream("dz:2830386932", force_refresh=False)
             self.assertEqual((res2.mode, res2.source, res2.content_type), ("full", "monochrome", "audio/flac"))
-            m_probe_mc.assert_called_once_with("42188284")
+            self.assertEqual(res2.url, "https://tracks.monochrome.st/track/42188284")
+            m_probe_mc.assert_not_called()
             m_mc_find2.assert_not_called()
 
-        # 3. When Monochrome, YouTube, and JioSaavn fail on cloud, SoundCloud full-track HLS buffer succeeds
-        sc_bytes = b"\x00\x00\x00\x1cftypisom" + b"S" * 100000
+        # 3. Never poison an existing valid "full" cache entry with a "preview" fallback, and expire preview after 12s
+        self.stream._store_cache(
+            ResolvedStream(
+                track_id="dz:2830386932",
+                mode="preview",
+                source="deezer-preview",
+                content_type="audio/mpeg",
+                url="https://preview.dz/st.mp3",
+            )
+        )
+        self.assertEqual(self.stream._cache["dz:2830386932"].mode, "full")
+
+        preview_only = ResolvedStream(
+            track_id="dz:shortpreview",
+            mode="preview",
+            source="deezer-preview",
+            content_type="audio/mpeg",
+            url="https://preview.dz/short.mp3",
+            resolved_at=1000.0,
+        )
+        self.stream._store_cache(preview_only)
+        self.assertIsNotNone(self.stream._get_valid_cached("dz:shortpreview", now=1005.0))
+        self.assertIsNone(self.stream._get_valid_cached("dz:shortpreview", now=1020.0))
+
+        # 4. When Monochrome, YouTube, and JioSaavn fail on cloud, SoundCloud lazy HLS succeeds cleanly
         with mock.patch("backend.config.is_cloud_env", return_value=True), \
-             mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
              mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
              mock.patch("backend.providers.youtube_music.find_best_video_id", return_value=None), \
              mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
              mock.patch("backend.providers.soundcloud.find_best_stream", return_value={
-                 "kind": "local",
-                 "bytes": sc_bytes,
-                 "content_type": "audio/mp4",
+                 "kind": "hls",
+                 "m3u8_url": "https://cf-hls.sndcdn.test/playlist.m3u8",
+                 "cache_key": "sc:1764711960",
+                 "content_type": "audio/mpeg",
              }):
             res_sc = self.stream.resolve_stream("dz:2830386932", force_refresh=True)
-            self.assertEqual((res_sc.mode, res_sc.source, res_sc.content_type), ("full", "soundcloud", "audio/mp4"))
-            self.assertEqual(res_sc.local_bytes, sc_bytes)
+            self.assertEqual((res_sc.mode, res_sc.source, res_sc.content_type), ("full", "soundcloud", "audio/mpeg"))
+            self.assertEqual(res_sc.headers.get("X-SC-M3U8"), "https://cf-hls.sndcdn.test/playlist.m3u8")
 
     def test_tier4_itunes_missing_preview_refreshes_from_lookup(self):
         self.db.upsert_track({

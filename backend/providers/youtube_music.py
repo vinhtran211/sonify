@@ -371,6 +371,13 @@ def _get_ytdlp_extra_args() -> List[str]:
 def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
     if not shutil.which("yt-dlp"):
         return None
+    # On cloud datacenter IPs without cookies or proxy, anonymous yt-dlp hits LOGIN_REQUIRED
+    # and wastes 7-10s before reaching SoundCloud/JioSaavn — skip immediately unless configured.
+    if config.is_cloud_env() and not (
+        os.environ.get("YTDLP_COOKIES_B64", "").strip()
+        or os.environ.get("YTDLP_PROXY", "").strip()
+    ):
+        return None
     try:
         cmd = [
             "yt-dlp",
