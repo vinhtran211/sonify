@@ -29,8 +29,8 @@ _TITLE_NOISE_PATTERNS = [
     r"\[\s*live\s*at[^\]]*\]",
     r"\(\s*(?:audio|hd|4k|hq|mv|lyrics?)\s*\)",
     r"\[\s*(?:audio|hd|4k|hq|mv|lyrics?)\s*\]",
-    r"\s+-\s*(?:remaster(?:ed)?(?:\s*\d{4})?|radio\s*edit|official\s*(?:audio|video|mv))$",
-    r"\s+(?:feat\.?|ft\.?)\s+.+$",
+    r"\s*[-–—|]\s*(?:remaster(?:ed)?(?:\s*\d{4})?|radio\s*edit|official\s*(?:music\s*)?(?:audio|video|mv|lyric\s*video|visualizer)[^-–—|]*)$",
+    r"\s+(?:feat\.?|ft\.?|featuring)\s+.+$",
 ]
 _TITLE_NOISE_RE = [re.compile(p, re.IGNORECASE) for p in _TITLE_NOISE_PATTERNS]
 _ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\sx\s)\s*", re.IGNORECASE)

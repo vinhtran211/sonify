@@ -140,14 +140,38 @@ def fetch_json(
     return json.loads(text)
 
 
+def sniff_media_mime(head_bytes: bytes, header_ctype: str = "") -> str:
+    """Sniff true audio/video MIME type from magic bytes when upstream sends application/octet-stream."""
+    raw_ct = (header_ctype or "").split(";")[0].strip().lower()
+    if head_bytes:
+        if head_bytes.startswith(b"fLaC"):
+            return "audio/flac"
+        if len(head_bytes) >= 8 and head_bytes[4:8] == b"ftyp":
+            return "video/mp4" if raw_ct == "video/mp4" else "audio/mp4"
+        if head_bytes.startswith(b"ID3") or (
+            len(head_bytes) >= 2 and head_bytes[0] == 0xFF and (head_bytes[1] & 0xE0) == 0xE0
+        ):
+            return "audio/mpeg"
+        if head_bytes.startswith(b"OggS"):
+            return "audio/ogg"
+        if head_bytes.startswith(b"\x1a\x45\xdf\xa3"):
+            return "video/webm" if raw_ct == "video/webm" else "audio/webm"
+        if len(head_bytes) >= 12 and head_bytes[:4] == b"RIFF" and head_bytes[8:12] == b"WAVE":
+            return "audio/wav"
+    if raw_ct.startswith("audio/") or raw_ct in ("video/mp4", "video/webm"):
+        return raw_ct
+    return ""
+
+
 def _is_valid_media_content_type(content_type: str, sample: bytes) -> bool:
     ct = (content_type or "").split(";")[0].strip().lower()
     if ct:
-        return ct.startswith("audio/") or ct in (
-            "video/mp4",
-            "video/webm",
-            "application/octet-stream",
-        )
+        if ct.startswith("audio/") or ct in ("video/mp4", "video/webm"):
+            return True
+        if ct in ("application/octet-stream", "binary/octet-stream"):
+            stripped = (sample or b"").lstrip()
+            return bool(sample) and not stripped.startswith((b"<", b"{", b"["))
+        return False
     if not sample:
         return False
     stripped = sample.lstrip()
@@ -160,10 +184,9 @@ def _extract_total_size(status: int, resp_headers: Dict[str, str]) -> Optional[i
         total_part = cr.rsplit("/", 1)[-1].strip()
         if total_part.isdigit():
             return int(total_part)
-    if status == 200:
-        cl = resp_headers.get("content-length", "").strip()
-        if cl.isdigit():
-            return int(cl)
+    cl = resp_headers.get("content-length", "").strip()
+    if cl.isdigit():
+        return int(cl)
     return None
 
 
@@ -172,8 +195,10 @@ def probe_url(
     headers: Optional[Dict[str, str]] = None,
     timeout: float = config.STREAM_PROBE_TIMEOUT,
     verify_tail: bool = False,
+    min_total_bytes: int = 0,
+    initial_range: str = "bytes=0-",
 ) -> Tuple[bool, int, Dict[str, str], str]:
-    """Probe a media URL with open-ended Range: bytes=0- (and optional tail check) to prove real playability."""
+    """Probe a media URL with open-ended Range: bytes=0- (and optional tail/size check) to prove real playability."""
     if is_offline_mode():
         return False, 0, {}, url
 
@@ -191,7 +216,7 @@ def probe_url(
             return st, rh, f_url, chunk
 
     try:
-        status, resp_headers, final_url, sample = _run_probe(url, "bytes=0-")
+        status, resp_headers, final_url, sample = _run_probe(url, initial_range)
     except urllib.error.HTTPError as exc:
         code = exc.code
         try:
@@ -215,8 +240,17 @@ def probe_url(
     if not _is_valid_media_content_type(resp_headers.get("content-type", ""), sample):
         return False, status, resp_headers, final_url
 
+    # Upgrade application/octet-stream to true sniffed audio MIME (e.g. fLaC -> audio/flac)
+    raw_ct = resp_headers.get("content-type", "").split(";")[0].strip().lower()
+    sniffed = sniff_media_mime(sample, raw_ct)
+    if sniffed and (not raw_ct or raw_ct in ("application/octet-stream", "binary/octet-stream")):
+        resp_headers["content-type"] = sniffed
+
+    total = _extract_total_size(status, resp_headers)
+    if min_total_bytes > 0 and total is not None and total < min_total_bytes:
+        return False, status, resp_headers, final_url
+
     if verify_tail:
-        total = _extract_total_size(status, resp_headers)
         if total is not None and total > 1_200_000:
             tail_start = max(0, total - 1024)
             tail_end = total - 1

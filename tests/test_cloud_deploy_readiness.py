@@ -57,6 +57,51 @@ class TestCloudEnvAndDBFallback(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PORT": "not-a-number"}, clear=True):
             self.assertEqual(config.resolve_default_port(), 8080)
 
+    def test_is_cloud_env_detection_for_render_railway_fly_spaces_and_override(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(config.is_cloud_env())
+
+        for env_key in ("RENDER", "RENDER_SERVICE_ID", "RAILWAY_ENVIRONMENT", "FLY_APP_NAME", "SPACE_ID"):
+            with mock.patch.dict(os.environ, {env_key: "true"}, clear=True):
+                self.assertTrue(config.is_cloud_env(), f"Expected is_cloud_env() True for {env_key}")
+
+        with mock.patch.dict(os.environ, {"SONIFY_CLOUD_MODE": "1"}, clear=True):
+            self.assertTrue(config.is_cloud_env())
+
+        with mock.patch.dict(os.environ, {"RENDER": "true", "SONIFY_CLOUD_MODE": "0"}, clear=True):
+            self.assertFalse(config.is_cloud_env())
+
+    def test_ytdlp_cookies_b64_and_proxy_and_cloud_piped_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cookie_file = Path(tmp) / "yt_cookies.txt"
+            import base64
+            cookie_payload = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tabc\n"
+            b64_str = base64.b64encode(cookie_payload).decode("ascii")
+
+            with mock.patch.object(youtube_music, "_COOKIES_FILE_PATH", cookie_file), \
+                 mock.patch.object(youtube_music, "_COOKIES_B64_HASH", ""), \
+                 mock.patch.dict(
+                     os.environ,
+                     {"YTDLP_COOKIES_B64": b64_str, "YTDLP_PROXY": "http://127.0.0.1:8888"},
+                     clear=True,
+                 ):
+                args = youtube_music._get_ytdlp_extra_args()
+                self.assertEqual(
+                    args,
+                    ["--cookies", str(cookie_file), "--proxy", "http://127.0.0.1:8888"],
+                )
+                self.assertEqual(cookie_file.read_bytes(), cookie_payload)
+
+        # On cloud IPs (RENDER=true), dead public Piped/Invidious seeds are skipped by default
+        with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=True), \
+             mock.patch("backend.providers.youtube_music._resolve_via_innertube_player", return_value=None), \
+             mock.patch("backend.providers.youtube_music._resolve_via_yt_dlp", return_value=None), \
+             mock.patch("backend.providers.youtube_music._resolve_via_piped") as m_piped, \
+             mock.patch("backend.providers.youtube_music._resolve_via_invidious") as m_inv:
+            self.assertIsNone(youtube_music.resolve_audio_stream("7u4g483WTzw"))
+            m_piped.assert_not_called()
+            m_inv.assert_not_called()
+
     def test_unwritable_db_path_falls_back_cleanly(self):
         with tempfile.TemporaryDirectory() as tmp:
             fallback_path = Path(tmp) / "fallback" / "music.db"

@@ -48,6 +48,25 @@ def is_offline_env() -> bool:
     )
 
 
+def is_cloud_env() -> bool:
+    """Detect cloud hosting environment (Render, Railway, Fly.io, HF Spaces, or explicit SONIFY_CLOUD_MODE)."""
+    cloud_flag = os.environ.get("SONIFY_CLOUD_MODE", "").strip().lower()
+    if cloud_flag in ("1", "true", "yes", "on"):
+        return True
+    if cloud_flag in ("0", "false", "no", "off"):
+        return False
+    return any(
+        bool(os.environ.get(k))
+        for k in (
+            "RENDER",
+            "RENDER_SERVICE_ID",
+            "RAILWAY_ENVIRONMENT",
+            "FLY_APP_NAME",
+            "SPACE_ID",
+        )
+    )
+
+
 # Cache TTLs (seconds)
 HOME_CACHE_TTL = 600          # 10 minutes
 SEARCH_CACHE_TTL = 300        # 5 minutes
@@ -60,7 +79,8 @@ INSTANCE_FAIL_TTL = 600       # 10 minutes
 # HTTP Timeouts (seconds)
 PROVIDER_TIMEOUT = 7.5
 STREAM_PROBE_TIMEOUT = 4.5
-STREAM_READ_TIMEOUT = 15.0
+MONOCHROME_PROBE_TIMEOUT = 22.0
+STREAM_READ_TIMEOUT = 25.0
 
 # Streaming
 STREAM_CHUNK_SIZE = 65536     # 64 KiB

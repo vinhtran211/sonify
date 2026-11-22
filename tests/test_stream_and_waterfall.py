@@ -12,9 +12,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from backend import crypto_des, http_client
+from backend import config, crypto_des, http_client
 from backend.db import Database
-from backend.providers import audius, jiosaavn, youtube_music
+from backend.providers import audius, jiosaavn, monochrome, soundcloud, youtube_music
 from backend.server import create_server
 from backend.services.stream_service import (
     ResolvedStream,
@@ -196,6 +196,216 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
         _MockAudioCDNHandler.return_html_error_200 = True
         ok_html, _, _, _ = http_client.probe_url(self.url)
         self.assertFalse(ok_html)
+        _MockAudioCDNHandler.return_html_error_200 = False
+
+    def test_sniff_media_mime_and_probe_url_octet_stream_upgrade_and_min_bytes(self):
+        # Magic-byte media container sniffing
+        self.assertEqual(http_client.sniff_media_mime(b"fLaC\x00\x00\x00\x22\x10\x00\x10\x00"), "audio/flac")
+        self.assertEqual(http_client.sniff_media_mime(b"\x00\x00\x00\x1cftypisom\x00\x00\x02\x00"), "audio/mp4")
+        self.assertEqual(http_client.sniff_media_mime(b"ID3\x04\x00\x00\x00\x00\x00\x00"), "audio/mpeg")
+        self.assertEqual(http_client.sniff_media_mime(b"\xff\xfb\x90\x64\x00\x00\x00\x00"), "audio/mpeg")
+        self.assertEqual(http_client.sniff_media_mime(b"OggS\x00\x02\x00\x00\x00\x00\x00\x00"), "audio/ogg")
+        self.assertEqual(http_client.sniff_media_mime(b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81"), "audio/webm")
+        self.assertEqual(http_client.sniff_media_mime(b"RIFF\x24\x08\x00\x00WAVEfmt "), "audio/wav")
+        self.assertEqual(http_client.sniff_media_mime(b"<html>not audio</html>"), "")
+        self.assertEqual(http_client.sniff_media_mime(b"sh"), "")
+
+        # probe_url upgrades application/octet-stream with fLaC magic bytes -> audio/flac
+        orig_payload = _MockAudioCDNHandler.payload
+        try:
+            _MockAudioCDNHandler.payload = b"fLaC" + bytes(i % 256 for i in range(16384))
+            _MockAudioCDNHandler.content_type = "application/octet-stream"
+            ok, st, hdrs, _ = http_client.probe_url(self.url, min_total_bytes=8000)
+            self.assertTrue(ok)
+            self.assertEqual(st, 206)
+            self.assertEqual(hdrs.get("content-type"), "audio/flac")
+
+            # min_total_bytes rejects truncated/tiny files
+            ok_tiny, _, _, _ = http_client.probe_url(self.url, min_total_bytes=500_000)
+            self.assertFalse(ok_tiny)
+        finally:
+            _MockAudioCDNHandler.payload = orig_payload
+            _MockAudioCDNHandler.content_type = "audio/mpeg"
+
+    def test_monochrome_normalization_isrc_matching_and_429_retry(self):
+        raw_item = {
+            "id": "42188284",
+            "title": "Đừng Làm Trái Tim Anh Đau",
+            "artistNames": ["Sơn Tùng M-TP"],
+            "albumTitle": "Đừng Làm Trái Tim Anh Đau - Single",
+            "duration": 279208,
+            "isrc": "vna012400001",
+            "playable": True,
+        }
+        norm = monochrome._normalize_track(raw_item)
+        self.assertIsNotNone(norm)
+        self.assertEqual(norm["id"], "mc:42188284")
+        self.assertEqual(norm["duration"], 279)
+        self.assertEqual(norm["isrc"], "VNA012400001")
+
+        # Unplayable items are skipped
+        self.assertIsNone(monochrome._normalize_track({**raw_item, "playable": False}))
+
+        # Exact ISRC match gets score 1.0
+        self.assertEqual(
+            monochrome.score_candidate(
+                norm,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+                target_isrc="VNA012400001",
+            ),
+            1.0,
+        )
+
+        # Reject cover/nightcore, wrong artist, or large duration mismatch
+        cover_cand = {**norm, "title": "Đừng Làm Trái Tim Anh Đau (Piano Cover)", "isrc": ""}
+        self.assertLess(
+            monochrome.score_candidate(
+                cover_cand,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            0.65,
+        )
+        wrong_art = {**norm, "artist": "Random Singer", "artistNames": ["Random Singer"], "isrc": ""}
+        self.assertEqual(
+            monochrome.score_candidate(
+                wrong_art,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            -1.0,
+        )
+        wrong_dur = {**norm, "duration": 180, "isrc": ""}
+        self.assertEqual(
+            monochrome.score_candidate(
+                wrong_dur,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            -1.0,
+        )
+
+        # find_best_stream retries 429 and returns Lossless FLAC stream
+        with mock.patch("backend.providers.monochrome.search_tracks", return_value=[norm]), \
+             mock.patch("backend.http_client.probe_url", side_effect=[
+                 (False, 429, {}, "https://tracks.monochrome.st/track/42188284"),
+                 (True, 206, {"content-type": "audio/flac"}, "https://tracks.monochrome.st/track/42188284"),
+             ]), \
+             mock.patch("time.sleep"):
+            best = monochrome.find_best_stream("Đừng Làm Trái Tim Anh Đau", "Sơn Tùng M-TP", 279)
+            self.assertIsNotNone(best)
+            url, mime, mc_id = best
+            self.assertEqual(url, "https://tracks.monochrome.st/track/42188284")
+            self.assertEqual(mime, "audio/flac")
+            self.assertEqual(mc_id, "42188284")
+
+    def test_soundcloud_allow_policy_gate_and_hls_assembly(self):
+        # Dynamic 31-32 char client_id extraction from SoundCloud asset bundle
+        fake_html = '<html><script crossorigin src="https://a-v2.sndcdn.com/assets/48-abc.js"></script></html>'
+        fake_js = 'window.__sc = {client_id:"dH1Xed1fpITYonug76sw39jvdq58M3h"};'
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch("backend.http_client.fetch_text", side_effect=[fake_html, fake_js]):
+            os.environ.pop("SOUNDCLOUD_CLIENT_ID", None)
+            cid = soundcloud.get_client_id(force_refresh=True)
+            self.assertEqual(cid, "dH1Xed1fpITYonug76sw39jvdq58M3h")
+
+        # Strictly reject 30s Go+ SNIP preview tracks
+        snip_track = {
+            "id": 111,
+            "title": "Die With A Smile",
+            "policy": "SNIP",
+            "duration": 30000,
+            "full_duration": 251000,
+        }
+        self.assertFalse(soundcloud.is_full_allow_track(snip_track, 251))
+
+        # Accept only policy == "ALLOW" full tracks with duration >= 90s matching full_duration
+        allow_track = {
+            "id": 1764711960,
+            "title": "Sơn Tùng M-TP - Đừng Làm Trái Tim Anh Đau",
+            "policy": "ALLOW",
+            "streamable": True,
+            "duration": 279000,
+            "full_duration": 279000,
+            "user": {"username": "Sơn Tùng M-TP Official"},
+            "publisher_metadata": {"artist": "Sơn Tùng M-TP"},
+            "media": {
+                "transcodings": [
+                    {
+                        "url": "https://api-v2.soundcloud.test/media/hls",
+                        "format": {"protocol": "hls", "mime_type": 'audio/mp4; codecs="mp4a.40.2"'},
+                    }
+                ]
+            },
+        }
+        self.assertTrue(soundcloud.is_full_allow_track(allow_track, 279))
+        self.assertGreaterEqual(
+            soundcloud.score_candidate(
+                allow_track,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            0.70,
+        )
+
+        # Reject unrequested remix on SoundCloud
+        remix_track = {**allow_track, "title": "Đừng Làm Trái Tim Anh Đau (Vinahouse Remix)"}
+        self.assertLess(
+            soundcloud.score_candidate(
+                remix_track,
+                clean_title="Đừng Làm Trái Tim Anh Đau",
+                primary_artist="Sơn Tùng M-TP",
+                full_artist="Sơn Tùng M-TP",
+                target_duration=279,
+            ),
+            0.68,
+        )
+
+        # HLS M3U8 parsing (#EXT-X-MAP + segments) & concurrent byte assembly
+        m3u8 = (
+            "#EXTM3U\n"
+            '#EXT-X-MAP:URI="https://cf-hls.sndcdn.test/init.mp4"\n'
+            "#EXTINF:10.0,\n"
+            "https://cf-hls.sndcdn.test/seg1.m4s\n"
+            "#EXTINF:10.0,\n"
+            "https://cf-hls.sndcdn.test/seg2.m4s\n"
+        )
+        urls = soundcloud.parse_hls_m3u8_urls(m3u8)
+        self.assertEqual(
+            urls,
+            [
+                "https://cf-hls.sndcdn.test/init.mp4",
+                "https://cf-hls.sndcdn.test/seg1.m4s",
+                "https://cf-hls.sndcdn.test/seg2.m4s",
+            ],
+        )
+        seg_payloads = {
+            "https://cf-hls.sndcdn.test/init.mp4": b"\x00\x00\x00\x1cftypisom" + b"I" * 80000,
+            "https://cf-hls.sndcdn.test/seg1.m4s": b"A" * 80000,
+            "https://cf-hls.sndcdn.test/seg2.m4s": b"B" * 80000,
+        }
+        with mock.patch("backend.http_client.fetch_text", return_value=m3u8), \
+             mock.patch(
+                 "backend.http_client.fetch_bytes",
+                 side_effect=lambda u, **kw: (200, {}, seg_payloads[u]),
+             ):
+            res_hls = soundcloud.assemble_hls_segments("https://cf-hls.sndcdn.test/playlist.m3u8")
+            self.assertIsNotNone(res_hls)
+            assembled, mime_hls = res_hls
+            self.assertEqual(mime_hls, "audio/mp4")
+            self.assertTrue(assembled.startswith(b"\x00\x00\x00\x1cftypisom"))
+            self.assertEqual(len(assembled), 240012)
 
     def test_youtube_innertube_android_itag18_extraction_and_strict_matching(self):
         captured = {}
@@ -353,6 +563,11 @@ class TestStreamWaterfall(unittest.TestCase):
             called_urls = m_probe.call_args[0][0]
             self.assertEqual(called_urls[0], "https://aac.saavncdn.com/x/track_320.mp4")
 
+        self.db.upsert_track({"id": "mc:42188284", "source": "monochrome", "title": "FLAC Song", "artist": "FLAC Artist"})
+        with mock.patch("backend.providers.monochrome.probe_track_stream", return_value=("https://tracks.monochrome.st/track/42188284", "audio/flac")):
+            res_mc = self.stream.resolve_stream("mc:42188284")
+            self.assertEqual((res_mc.mode, res_mc.source, res_mc.content_type), ("full", "monochrome", "audio/flac"))
+
     def test_online_waterfall_order_and_zero_silent_offline_synth(self):
         self.db.upsert_track({
             "id": "dz:908604612",
@@ -361,52 +576,71 @@ class TestStreamWaterfall(unittest.TestCase):
             "artist": "The Weeknd",
             "duration": 200,
             "previewUrl": "https://preview.dz/old.mp3",
+            "_extra": {"isrc": "UGAB21901521"},
         })
 
-        # Tier 1: YouTube Music (ANDROID itag=18 video/mp4) is primary universal full-track
-        with mock.patch("backend.providers.youtube_music.find_best_video_id", return_value="J7p4bzqLvCw"), \
-             mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=("https://yt/itag18.mp4", "video/mp4", {"User-Agent": "Android"}, "youtube-innertube")):
-            r1 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
-            self.assertEqual((r1.mode, r1.source, r1.content_type), ("full", "youtube-innertube", "video/mp4"))
-            cached_t = self.db.get_track("dz:908604612", include_extra=True)
-            self.assertEqual(cached_t["_extra"].get("videoId"), "J7p4bzqLvCw")
-            self.assertEqual(cached_t["_extra"].get("videoIdMatchVersion"), 2)
+        with mock.patch("backend.config.is_cloud_env", return_value=False):
+            # Tier 1 (Local): YouTube Music (ANDROID itag=18 video/mp4) is primary universal full-track
+            with mock.patch("backend.providers.youtube_music.find_best_video_id", return_value="J7p4bzqLvCw"), \
+                 mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=("https://yt/itag18.mp4", "video/mp4", {"User-Agent": "Android"}, "youtube-innertube")):
+                r1 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual((r1.mode, r1.source, r1.content_type), ("full", "youtube-innertube", "video/mp4"))
+                cached_t = self.db.get_track("dz:908604612", include_extra=True)
+                self.assertEqual(cached_t["_extra"].get("videoId"), "J7p4bzqLvCw")
+                self.assertEqual(cached_t["_extra"].get("videoIdMatchVersion"), 2)
 
-        # Tier 2: YouTube fails -> JioSaavn 320kbps cross-match
-        with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
-             mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=("https://saavn/bl_320.mp4", "audio/mp4")):
-            r2 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
-            self.assertEqual((r2.mode, r2.source), ("full", "jiosaavn"))
+            # Next: YouTube fails -> Monochrome Lossless FLAC
+            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.find_best_stream", return_value=("https://tracks.monochrome.st/track/42001362", "audio/flac", "42001362")):
+                r_mc = self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual((r_mc.mode, r_mc.source, r_mc.content_type), ("full", "monochrome", "audio/flac"))
 
-        # Tier 3: YouTube & JioSaavn fail -> Audius cross-match
-        with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
-             mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
-             mock.patch("backend.providers.audius.find_best_stream", return_value=("https://audius/full.mp3", "audio/mpeg")):
-            r3 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
-            self.assertEqual((r3.mode, r3.source), ("full", "audius"))
+            # Next: YouTube & Monochrome fail -> JioSaavn 320kbps cross-match
+            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=("https://saavn/bl_320.mp4", "audio/mp4")):
+                r2 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual((r2.mode, r2.source), ("full", "jiosaavn"))
 
-        # Tier 4: All full sources fail -> Official Deezer 30s preview (with expired-403 refresh)
-        with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
-             mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
-             mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
-             mock.patch("backend.providers.deezer.get_track", return_value={"id": "dz:908604612", "source": "deezer", "title": "Blinding Lights", "artist": "The Weeknd", "previewUrl": "https://preview.dz/fresh.mp3"}), \
-             mock.patch("backend.http_client.probe_url", side_effect=[
-                 (False, 403, {}, "https://preview.dz/old.mp3"),
-                 (True, 206, {"content-type": "audio/mpeg"}, "https://preview.dz/fresh.mp3"),
-             ]):
-            r4 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
-            self.assertEqual((r4.mode, r4.source), ("preview", "deezer-preview"))
-            self.assertEqual(r4.url, "https://preview.dz/fresh.mp3")
+            # Next: YouTube, Monochrome, JioSaavn & SoundCloud fail -> Audius cross-match
+            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.audius.find_best_stream", return_value=("https://audius/full.mp3", "audio/mpeg")):
+                r3 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual((r3.mode, r3.source), ("full", "audius"))
 
-        # Online mode MUST NEVER fall back to fake offline-synth WAV when all upstream sources fail!
-        with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
-             mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
-             mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
-             mock.patch("backend.providers.deezer.get_track", return_value=None), \
-             mock.patch("backend.http_client.probe_url", return_value=(False, 0, {}, "")):
-            with self.assertRaises(StreamUnavailableError) as ctx:
-                self.stream.resolve_stream("dz:908604612", force_refresh=True)
-            self.assertEqual(ctx.exception.status, 502)
+            # Tier 4: All full sources fail -> Official Deezer 30s preview (with expired-403 refresh)
+            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.deezer.get_track", return_value={"id": "dz:908604612", "source": "deezer", "title": "Blinding Lights", "artist": "The Weeknd", "previewUrl": "https://preview.dz/fresh.mp3"}), \
+                 mock.patch("backend.http_client.probe_url", side_effect=[
+                     (False, 403, {}, "https://preview.dz/old.mp3"),
+                     (True, 206, {"content-type": "audio/mpeg"}, "https://preview.dz/fresh.mp3"),
+                 ]):
+                r4 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual((r4.mode, r4.source), ("preview", "deezer-preview"))
+                self.assertEqual(r4.url, "https://preview.dz/fresh.mp3")
+
+            # Online mode MUST NEVER fall back to fake offline-synth WAV when all upstream sources fail!
+            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
+                 mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.deezer.get_track", return_value=None), \
+                 mock.patch("backend.http_client.probe_url", return_value=(False, 0, {}, "")):
+                with self.assertRaises(StreamUnavailableError) as ctx:
+                    self.stream.resolve_stream("dz:908604612", force_refresh=True)
+                self.assertEqual(ctx.exception.status, 502)
 
         # Explicit local:* track or explicit offline mode STILL serves deterministic offline-synth WAV
         r_local = self.stream.resolve_stream("local:neon-horizon")
@@ -416,6 +650,65 @@ class TestStreamWaterfall(unittest.TestCase):
         http_client.set_offline_mode(True)
         r_off = self.stream.resolve_stream("dz:908604612", force_refresh=True)
         self.assertEqual((r_off.mode, r_off.source), ("offline-synth", "offline-synth"))
+
+    def test_cloud_mode_prioritizes_monochrome_lossless_flac_and_soundcloud_fallback(self):
+        self.db.upsert_track({
+            "id": "dz:2830386932",
+            "source": "deezer",
+            "title": "Đừng Làm Trái Tim Anh Đau",
+            "artist": "Sơn Tùng M-TP",
+            "duration": 279,
+            "previewUrl": "https://preview.dz/st.mp3",
+            "_extra": {"isrc": "VNA012400001"},
+        })
+
+        # 1. On cloud datacenter IPs (is_cloud_env() == True), Monochrome is tried BEFORE YouTube Music
+        with mock.patch("backend.config.is_cloud_env", return_value=True), \
+             mock.patch("backend.providers.monochrome.find_best_stream", return_value=(
+                 "https://tracks.monochrome.st/track/42188284",
+                 "audio/flac",
+                 "42188284",
+             )) as m_mc_find, \
+             mock.patch("backend.providers.youtube_music.find_best_video_id") as m_yt:
+            res = self.stream.resolve_stream("dz:2830386932", force_refresh=True)
+            self.assertEqual((res.mode, res.source, res.content_type), ("full", "monochrome", "audio/flac"))
+            self.assertEqual(res.url, "https://tracks.monochrome.st/track/42188284")
+            m_mc_find.assert_called_once_with(
+                title="Đừng Làm Trái Tim Anh Đau", artist="Sơn Tùng M-TP", duration=279, isrc="VNA012400001"
+            )
+            m_yt.assert_not_called()
+
+            # Cached monochromeTrackId is persisted in tracks_cache.extra_json
+            cached = self.db.get_track("dz:2830386932", include_extra=True)
+            self.assertEqual(cached["_extra"].get("monochromeTrackId"), "42188284")
+
+        # 2. Subsequent refresh uses cached monochromeTrackId fast-path via probe_track_stream
+        with mock.patch("backend.config.is_cloud_env", return_value=True), \
+             mock.patch("backend.providers.monochrome.probe_track_stream", return_value=(
+                 "https://tracks.monochrome.st/track/42188284",
+                 "audio/flac",
+             )) as m_probe_mc, \
+             mock.patch("backend.providers.monochrome.find_best_stream") as m_mc_find2:
+            res2 = self.stream.resolve_stream("dz:2830386932", force_refresh=True)
+            self.assertEqual((res2.mode, res2.source, res2.content_type), ("full", "monochrome", "audio/flac"))
+            m_probe_mc.assert_called_once_with("42188284")
+            m_mc_find2.assert_not_called()
+
+        # 3. When Monochrome, YouTube, and JioSaavn fail on cloud, SoundCloud full-track HLS buffer succeeds
+        sc_bytes = b"\x00\x00\x00\x1cftypisom" + b"S" * 100000
+        with mock.patch("backend.config.is_cloud_env", return_value=True), \
+             mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
+             mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.youtube_music.find_best_video_id", return_value=None), \
+             mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.soundcloud.find_best_stream", return_value={
+                 "kind": "local",
+                 "bytes": sc_bytes,
+                 "content_type": "audio/mp4",
+             }):
+            res_sc = self.stream.resolve_stream("dz:2830386932", force_refresh=True)
+            self.assertEqual((res_sc.mode, res_sc.source, res_sc.content_type), ("full", "soundcloud", "audio/mp4"))
+            self.assertEqual(res_sc.local_bytes, sc_bytes)
 
     def test_tier4_itunes_missing_preview_refreshes_from_lookup(self):
         self.db.upsert_track({
@@ -427,7 +720,9 @@ class TestStreamWaterfall(unittest.TestCase):
             "previewUrl": "",
         })
         with mock.patch("backend.providers.youtube_music.find_best_video_id", return_value=None), \
+             mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
              mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
              mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
              mock.patch("backend.providers.apple_itunes.get_track", return_value={
                  "id": "it:777888",
@@ -530,6 +825,27 @@ class TestStreamProxyLiveHTTP(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertEqual(r.read(), b"")
             self.assertEqual(r.headers.get("X-Stream-Mode"), "full")
+
+        # Monochrome octet-stream upstream header is upgraded to resolved.content_type ("audio/flac")
+        _MockAudioCDNHandler.content_type = "application/octet-stream"
+        self.srv.stream._store_cache(
+            ResolvedStream(
+                track_id="dz:mockflac",
+                mode="full",
+                source="monochrome",
+                content_type="audio/flac",
+                url=self.cdn_url,
+                headers={"User-Agent": "SonifyTest"},
+            )
+        )
+        flac_req = urllib.request.Request(
+            f"{self.base}/api/stream/dz:mockflac", headers={"Range": "bytes=0-1023"}
+        )
+        with urllib.request.urlopen(flac_req, timeout=5) as r:
+            self.assertEqual(r.status, 206)
+            self.assertEqual(r.headers.get("Content-Type"), "audio/flac")
+            self.assertEqual(r.headers.get("X-Stream-Source"), "monochrome")
+            self.assertEqual(len(r.read()), 1024)
 
     def test_remote_proxy_head_405_fallback_and_no_content_length_does_not_hang(self):
         _MockAudioCDNHandler.reject_head_405 = True

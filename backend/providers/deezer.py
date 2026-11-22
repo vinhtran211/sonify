@@ -29,7 +29,8 @@ def _normalize_track(raw: Dict[str, Any], album_override: Optional[Dict[str, Any
     )
     artist_id = artist_obj.get("id")
     album_id = album_obj.get("id")
-    return {
+    isrc = str(raw.get("isrc") or "").strip().upper()
+    track: Dict[str, Any] = {
         "id": f"dz:{tid}",
         "source": "deezer",
         "title": str(raw.get("title") or raw.get("title_short") or "Untitled"),
@@ -45,6 +46,9 @@ def _normalize_track(raw: Dict[str, Any], album_override: Optional[Dict[str, Any
         "previewUrl": str(raw.get("preview") or ""),
         "streamUrl": f"/api/stream/dz:{tid}",
     }
+    if isrc:
+        track["_extra"] = {"isrc": isrc}
+    return track
 
 
 def _normalize_artist(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:

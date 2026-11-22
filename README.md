@@ -63,12 +63,13 @@ This repository includes a Render Blueprint (`render.yaml`) and production `Dock
 - **Up-to-Date Live Catalog + 100% Ad-Free Streaming Proxy**
   - Live metadata aggregation across **Deezer Public API**, **Apple Music RSS Charts (VN & US) + iTunes Search/Lookup**, **JioSaavn API** (DES-ECB 320kbps decryptor), **Audius Decentralized API**, and **YouTube Music InnerTube**.
   - **Zero ads, zero sponsored slots, zero trackers** (`X-Ad-Free: true` on every stream response).
-  - Backend `/api/stream/{track_id}` proxy with full HTTP `Range` (`206 Partial Content`) support and a **resilient ad-free resolution waterfall**:
-    1. Native full-length stream (`Audius` / `JioSaavn` / `YouTube`)
-    2. YouTube Music full-length stream (InnerTube `ANDROID` fast-start MP4/AAC -> `yt-dlp` -> Piped/Invidious pool), verified with open-ended `Range: bytes=0-`
+  - Backend `/api/stream/{track_id}` proxy with full HTTP `Range` (`206 Partial Content`) support and a **cloud-aware ad-free resolution waterfall**:
+    1. Native full-length stream (`Audius` / `JioSaavn` / `YouTube` / `Monochrome`)
+    2. **Monochrome Lossless FLAC** (`https://tracks.monochrome.st`, primary on cloud/Render datacenter IPs; ISRC + strict title/artist/duration matching + magic-byte `fLaC -> audio/flac` sniffing) & **YouTube Music** (InnerTube `ANDROID` fast-start MP4/AAC -> `yt-dlp` with optional `YTDLP_COOKIES_B64`/`YTDLP_PROXY`), verified with open-ended `Range: bytes=0-`
     3. JioSaavn 320kbps cross-match (strict title/artist/duration gate)
-    4. Audius full-track cross-match (strict title/artist/duration gate)
-    5. Official 30-second preview of the exact track (`X-Stream-Mode: preview`), or honest `502 Stream Unavailable` if unreachable online (offline synth WAV is strictly reserved for explicit `--offline` / `local:*` showcase tracks)
+    4. SoundCloud Public API v2 full-track match (strict `policy=ALLOW` non-remix MP3 & concurrent HLS fMP4 assembly)
+    5. Audius full-track cross-match (strict title/artist/duration gate)
+    6. Official 30-second preview of the exact track (`X-Stream-Mode: preview`), or honest `502 Stream Unavailable` if unreachable online (offline synth WAV is strictly reserved for explicit `--offline` / `local:*` showcase tracks)
 - **Real-Time Synced & Plain Lyrics**
   - 5-stage lyrics waterfall (**LRCLIB** `/api/get` & `/api/search` -> **YouTube Music InnerTube** -> **Lyrics.ovh** -> built-in local `.lrc`) backed by a 7-day SQLite cache.
   - Available both in the **Right Side Drawer** and as an **Immersive Full-Stage Lyrics View** (`#/lyrics`).

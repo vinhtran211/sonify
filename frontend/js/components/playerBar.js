@@ -238,7 +238,11 @@ export function updatePlayerBar() {
     }
     if (badgeEl) {
       if (st.streamMode === 'full') {
-        badgeEl.textContent = `Full Track${st.streamSource ? ` • ${st.streamSource}` : ''}`;
+        const srcLabel =
+          st.streamSource === 'monochrome'
+            ? 'Lossless FLAC'
+            : st.streamSource || '';
+        badgeEl.textContent = `Full Track${srcLabel ? ` • ${srcLabel}` : ''}`;
         badgeEl.className = 'stream-badge full';
       } else if (st.streamMode === 'preview') {
         badgeEl.textContent = '30s Preview';

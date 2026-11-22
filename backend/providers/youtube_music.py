@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from backend import config, http_client, lrc_parser
@@ -331,24 +334,60 @@ def find_best_video_id(title: str, artist: str, duration: int = 0) -> Optional[s
     return best_vid if best_score >= 0.62 else None
 
 
+_COOKIES_LOCK = threading.Lock()
+_COOKIES_B64_HASH: str = ""
+_COOKIES_FILE_PATH: Path = Path("/tmp/sonify/yt_cookies.txt")
+
+
+def _get_ytdlp_extra_args() -> List[str]:
+    """Return optional --cookies and --proxy arguments when YTDLP_COOKIES_B64 / YTDLP_PROXY are set."""
+    global _COOKIES_B64_HASH
+    extra_args: List[str] = []
+
+    cookies_b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
+    if cookies_b64:
+        with _COOKIES_LOCK:
+            try:
+                if cookies_b64 != _COOKIES_B64_HASH or not _COOKIES_FILE_PATH.is_file():
+                    raw = base64.b64decode(cookies_b64)
+                    _COOKIES_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    _COOKIES_FILE_PATH.write_bytes(raw)
+                    try:
+                        os.chmod(_COOKIES_FILE_PATH, 0o600)
+                    except OSError:
+                        pass
+                    _COOKIES_B64_HASH = cookies_b64
+                extra_args.extend(["--cookies", str(_COOKIES_FILE_PATH)])
+            except Exception:
+                pass
+
+    proxy_val = os.environ.get("YTDLP_PROXY", "").strip()
+    if proxy_val:
+        extra_args.extend(["--proxy", proxy_val])
+
+    return extra_args
+
+
 def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
     if not shutil.which("yt-dlp"):
         return None
     try:
+        cmd = [
+            "yt-dlp",
+            "-J",
+            "--no-download",
+            "--no-playlist",
+            "--no-warnings",
+            "--no-check-formats",
+            "--extractor-args",
+            "youtube:player_client=android,tv_embedded,ios",
+            "--socket-timeout",
+            "6",
+        ]
+        cmd.extend(_get_ytdlp_extra_args())
+        cmd.append(f"https://www.youtube.com/watch?v={video_id}")
         proc = subprocess.run(
-            [
-                "yt-dlp",
-                "-J",
-                "--no-download",
-                "--no-playlist",
-                "--no-warnings",
-                "--no-check-formats",
-                "--extractor-args",
-                "youtube:player_client=android,tv_embedded,ios",
-                "--socket-timeout",
-                "6",
-                f"https://www.youtube.com/watch?v={video_id}",
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=12,
@@ -716,6 +755,14 @@ def resolve_audio_stream(video_id: str) -> Optional[Tuple[str, str, Dict[str, st
     res = _resolve_via_yt_dlp(video_id)
     if res:
         return res[0], res[1], res[2], "yt-dlp"
+
+    # Skip dead public Piped/Invidious seeds on cloud datacenter IPs unless explicitly enabled
+    if config.is_cloud_env() and os.environ.get("SONIFY_ENABLE_PUBLIC_PIPED", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
 
     res = _resolve_via_piped(video_id)
     if res:
