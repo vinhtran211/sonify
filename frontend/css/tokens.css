@@ -1,0 +1,130 @@
+/* Sonify Design Tokens — Spotify-inspired dark theme */
+:root {
+  /* Surfaces */
+  --bg-base: #000000;
+  --bg-surface: #121212;
+  --bg-elevated: #181818;
+  --bg-card: #181818;
+  --bg-card-hover: #282828;
+  --bg-hover: #282828;
+  --bg-active: #333333;
+  --bg-overlay: rgba(0, 0, 0, 0.72);
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  /* Brand Accents */
+  --accent-primary: #1db954;
+  --accent-hover: #1ed760;
+  --accent-active: #169c46;
+  --accent-subtle: rgba(29, 185, 84, 0.16);
+  --accent-glow: rgba(29, 185, 84, 0.35);
+  --liked-gradient: linear-gradient(135deg, #450af5 0%, #8e8ee5 100%);
+  --danger: #f15e6c;
+  --warning: #ffa42b;
+
+  /* Typography */
+  --font-sans: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --text-primary: #ffffff;
+  --text-secondary: #b3b3b3;
+  --text-muted: #727272;
+
+  /* Layout Dimensions */
+  --sidebar-width: 264px;
+  --drawer-width: 344px;
+  --player-height: 88px;
+  --topbar-height: 64px;
+  --shell-gap: 8px;
+  --mobile-nav-height: 60px;
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-panel: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 9999px;
+
+  /* Shadows */
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-fab: 0 8px 18px rgba(0, 0, 0, 0.55);
+  --shadow-menu: 0 16px 40px rgba(0, 0, 0, 0.72);
+
+  /* Transitions */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --transition-fast: 150ms var(--ease-out);
+  --transition-med: 240ms var(--ease-out);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  user-select: none;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button, input, textarea, select {
+  font-family: inherit;
+  color: inherit;
+}
+
+button {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+input, textarea {
+  user-select: text;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Custom subtle scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}

@@ -1,0 +1,15 @@
+# Exclude runtime DBs, caches, VCS, tests, and docs from Docker build context
+.git/
+.gitignore
+data/
+data/*.db*
+**/__pycache__/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.log
+*.tmp
+tests/
+docs/
