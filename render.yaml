@@ -3,6 +3,7 @@ services:
     name: sonify-music
     runtime: docker
     plan: free
+    region: singapore
     autoDeploy: true
     healthCheckPath: /api/health
     envVars:

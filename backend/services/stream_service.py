@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from backend import config, http_client, offline_catalog
 from backend.db import Database
@@ -55,6 +56,15 @@ class ResolvedStream:
     headers: Dict[str, str] = field(default_factory=dict)
     local_bytes: Optional[bytes] = None
     resolved_at: float = field(default_factory=time.time)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _extract_monochrome_id(resolved: ResolvedStream) -> Optional[str]:
+    mc_prefix = monochrome.MONOCHROME_BASE + "/track/"
+    if resolved.source == "monochrome" and resolved.url.startswith(mc_prefix):
+        mc_id = urllib.parse.unquote(resolved.url[len(mc_prefix) :].split("?", 1)[0]).strip("/")
+        return mc_id or None
+    return None
 
 
 def parse_byte_range(range_header: Optional[str], total_size: int) -> Tuple[Optional[Tuple[int, int]], bool]:
@@ -354,6 +364,187 @@ class StreamService:
                 pass
         return None
 
+    def _try_resolve_jiosaavn(
+        self,
+        track_id: str,
+        title: str,
+        artist: str,
+        duration: int,
+        excluded: Set[str],
+        attempts: List[Dict[str, Any]],
+    ) -> Optional[ResolvedStream]:
+        if not title or "jiosaavn" in excluded:
+            return None
+        t0 = time.monotonic()
+        try:
+            js_match = jiosaavn.find_best_stream(title, artist, duration)
+            ms = int((time.monotonic() - t0) * 1000)
+            if js_match:
+                attempts.append({"provider": "jiosaavn", "outcome": "ok", "ms": ms})
+                resolved = ResolvedStream(
+                    track_id=track_id,
+                    mode="full",
+                    source="jiosaavn",
+                    content_type=js_match[1],
+                    url=js_match[0],
+                    headers={"User-Agent": config.BROWSER_USER_AGENT},
+                    diagnostics=list(attempts),
+                )
+                self._store_cache(resolved)
+                return resolved
+            attempts.append({"provider": "jiosaavn", "outcome": "no_match", "ms": ms})
+        except Exception:
+            attempts.append(
+                {"provider": "jiosaavn", "outcome": "error", "ms": int((time.monotonic() - t0) * 1000)}
+            )
+        return None
+
+    def _try_resolve_soundcloud(
+        self,
+        track_id: str,
+        title: str,
+        artist: str,
+        duration: int,
+        excluded: Set[str],
+        attempts: List[Dict[str, Any]],
+    ) -> Optional[ResolvedStream]:
+        if not title or "soundcloud" in excluded:
+            return None
+        t0 = time.monotonic()
+        sc_stats: Dict[str, Any] = {}
+        try:
+            sc_match = soundcloud.find_best_stream(
+                title, artist, duration, assemble_now=False, stats=sc_stats
+            )
+            ms = int((time.monotonic() - t0) * 1000)
+            detail_parts = []
+            if sc_stats:
+                detail_parts.append(f"total={sc_stats.get('total_items', 0)}")
+                detail_parts.append(f"snip={sc_stats.get('snip_count', 0)}")
+                detail_parts.append(f"scored={sc_stats.get('scored_count', 0)}")
+                if sc_stats.get("transcode_failures"):
+                    detail_parts.append(f"tc_fail={sc_stats['transcode_failures']}")
+            detail = ",".join(detail_parts)
+            if sc_match:
+                entry: Dict[str, Any] = {"provider": "soundcloud", "outcome": "ok", "ms": ms}
+                if detail:
+                    entry["detail"] = detail
+                attempts.append(entry)
+                kind = sc_match.get("kind")
+                if kind == "local" and sc_match.get("bytes"):
+                    resolved = ResolvedStream(
+                        track_id=track_id,
+                        mode="full",
+                        source="soundcloud",
+                        content_type=str(sc_match.get("content_type") or "audio/mp4"),
+                        local_bytes=sc_match["bytes"],
+                        diagnostics=list(attempts),
+                    )
+                elif kind == "hls" and sc_match.get("m3u8_url"):
+                    resolved = ResolvedStream(
+                        track_id=track_id,
+                        mode="full",
+                        source="soundcloud",
+                        content_type=str(sc_match.get("content_type") or "audio/mpeg"),
+                        url=str(sc_match["m3u8_url"]),
+                        headers={
+                            "User-Agent": config.BROWSER_USER_AGENT,
+                            "X-SC-M3U8": str(sc_match["m3u8_url"]),
+                            "X-SC-Cache-Key": str(sc_match.get("cache_key") or ""),
+                        },
+                        diagnostics=list(attempts),
+                    )
+                else:
+                    resolved = ResolvedStream(
+                        track_id=track_id,
+                        mode="full",
+                        source="soundcloud",
+                        content_type=str(sc_match.get("content_type") or "audio/mpeg"),
+                        url=str(sc_match.get("url") or ""),
+                        headers={"User-Agent": config.BROWSER_USER_AGENT},
+                        diagnostics=list(attempts),
+                    )
+                self._store_cache(resolved)
+                return resolved
+
+            outcome = (
+                "no_allow"
+                if sc_stats.get("total_items", 0) > 0 and sc_stats.get("allow_count", 0) == 0
+                else ("transcode_failed" if sc_stats.get("scored_count", 0) > 0 else "no_match")
+            )
+            entry = {"provider": "soundcloud", "outcome": outcome, "ms": ms}
+            if detail:
+                entry["detail"] = detail
+            attempts.append(entry)
+        except Exception:
+            attempts.append(
+                {"provider": "soundcloud", "outcome": "error", "ms": int((time.monotonic() - t0) * 1000)}
+            )
+        return None
+
+    def _try_resolve_audius(
+        self,
+        track_id: str,
+        title: str,
+        artist: str,
+        duration: int,
+        excluded: Set[str],
+        attempts: List[Dict[str, Any]],
+    ) -> Optional[ResolvedStream]:
+        if not title or "audius" in excluded:
+            return None
+        t0 = time.monotonic()
+        try:
+            au_match = audius.find_best_stream(title, artist, duration)
+            ms = int((time.monotonic() - t0) * 1000)
+            if au_match:
+                attempts.append({"provider": "audius", "outcome": "ok", "ms": ms})
+                resolved = ResolvedStream(
+                    track_id=track_id,
+                    mode="full",
+                    source="audius",
+                    content_type=au_match[1],
+                    url=au_match[0],
+                    headers={"User-Agent": config.BROWSER_USER_AGENT},
+                    diagnostics=list(attempts),
+                )
+                self._store_cache(resolved)
+                return resolved
+            attempts.append({"provider": "audius", "outcome": "no_match", "ms": ms})
+        except Exception:
+            attempts.append(
+                {"provider": "audius", "outcome": "error", "ms": int((time.monotonic() - t0) * 1000)}
+            )
+        return None
+
+    @staticmethod
+    def _log_preview_fallback(
+        track_id: str,
+        title: str,
+        artist: str,
+        resolved: ResolvedStream,
+    ) -> None:
+        parts = []
+        for a in resolved.diagnostics:
+            prov = a.get("provider", "?")
+            out = a.get("outcome", "?")
+            ms = a.get("ms", 0)
+            detail = a.get("detail")
+            if detail:
+                parts.append(f"{prov}:{out}({detail},{ms}ms)")
+            else:
+                parts.append(f"{prov}:{out}({ms}ms)")
+        trace = ",".join(parts)
+        try:
+            print(
+                f'[stream-fallback] track={track_id} title="{title}" artist="{artist}" '
+                f"mode={resolved.mode} source={resolved.source} trace={trace}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+
     def _resolve_stream_unlocked(
         self, track_id: str, excluded: Set[str], force_refresh: bool = False
     ) -> ResolvedStream:
@@ -364,10 +555,12 @@ class StreamService:
         artist = (track or {}).get("artist") or ""
         duration = int((track or {}).get("duration") or 0)
         preview_url = (track or {}).get("previewUrl") or ""
+        attempts: List[Dict[str, Any]] = []
 
         # Offline synthesized WAV is STRICTLY limited to local:* demo tracks or explicit offline mode
         if prefix == "local" or http_client.is_offline_mode():
             resolved = self._tier5_offline_wav(track_id, duration=duration or 45)
+            resolved.diagnostics = [{"provider": "offline-synth", "outcome": "ok", "ms": 0}]
             self._store_cache(resolved)
             return resolved
 
@@ -377,6 +570,7 @@ class StreamService:
         # Tier 0: Native full-length streams (Audius / JioSaavn / YouTube / Monochrome)
         # ------------------------------------------------------------------
         if prefix == "au" and raw_id and "audius" not in excluded:
+            t0 = time.monotonic()
             try:
                 au_url = audius.get_stream_url(raw_id)
                 ok, _, hdrs, final_url = http_client.probe_url(
@@ -386,6 +580,7 @@ class StreamService:
                     ctype = hdrs.get("content-type", "audio/mpeg").split(";")[0].strip()
                     if not ctype.startswith("audio/"):
                         ctype = "audio/mpeg"
+                    attempts.append({"provider": "audius-native", "outcome": "ok", "ms": int((time.monotonic() - t0) * 1000)})
                     resolved = ResolvedStream(
                         track_id=track_id,
                         mode="full",
@@ -393,13 +588,16 @@ class StreamService:
                         content_type=ctype,
                         url=final_url,
                         headers={"User-Agent": config.BROWSER_USER_AGENT},
+                        diagnostics=list(attempts),
                     )
                     self._store_cache(resolved)
                     return resolved
             except Exception:
                 pass
+            attempts.append({"provider": "audius-native", "outcome": "failed", "ms": int((time.monotonic() - t0) * 1000)})
 
         if prefix == "js" and raw_id and "jiosaavn" not in excluded:
+            t0 = time.monotonic()
             try:
                 if not extra.get("encrypted_media_url") and not extra.get("direct_urls"):
                     details = jiosaavn.get_song_details(raw_id)
@@ -409,6 +607,7 @@ class StreamService:
                 cand_urls = jiosaavn.resolve_candidate_urls(extra)
                 found = jiosaavn.probe_best_url(cand_urls)
                 if found:
+                    attempts.append({"provider": "jiosaavn-native", "outcome": "ok", "ms": int((time.monotonic() - t0) * 1000)})
                     resolved = ResolvedStream(
                         track_id=track_id,
                         mode="full",
@@ -416,16 +615,20 @@ class StreamService:
                         content_type=found[1],
                         url=found[0],
                         headers={"User-Agent": config.BROWSER_USER_AGENT},
+                        diagnostics=list(attempts),
                     )
                     self._store_cache(resolved)
                     return resolved
             except Exception:
                 pass
+            attempts.append({"provider": "jiosaavn-native", "outcome": "failed", "ms": int((time.monotonic() - t0) * 1000)})
 
         if prefix == "yt" and raw_id and not yt_excluded:
+            t0 = time.monotonic()
             try:
                 yt_res = youtube_music.resolve_audio_stream(raw_id)
                 if yt_res and yt_res[3] not in excluded:
+                    attempts.append({"provider": yt_res[3], "outcome": "ok", "ms": int((time.monotonic() - t0) * 1000)})
                     resolved = ResolvedStream(
                         track_id=track_id,
                         mode="full",
@@ -433,13 +636,16 @@ class StreamService:
                         content_type=yt_res[1],
                         url=yt_res[0],
                         headers=yt_res[2],
+                        diagnostics=list(attempts),
                     )
                     self._store_cache(resolved)
                     return resolved
             except Exception:
                 pass
+            attempts.append({"provider": "youtube-native", "outcome": "failed", "ms": int((time.monotonic() - t0) * 1000)})
 
         if prefix == "mc" and raw_id and "monochrome" not in excluded:
+            attempts.append({"provider": "monochrome-native", "outcome": "ok", "ms": 0})
             resolved = ResolvedStream(
                 track_id=track_id,
                 mode="full",
@@ -447,130 +653,125 @@ class StreamService:
                 content_type="audio/flac",
                 url=monochrome.get_stream_url(raw_id),
                 headers={"User-Agent": config.BROWSER_USER_AGENT},
+                diagnostics=list(attempts),
             )
             self._store_cache(resolved)
             return resolved
 
         # ------------------------------------------------------------------
-        # Tier 1 & Tier 2 (Environment-Aware Primary Full-Track Sources):
-        # - On Cloud (Render/AWS datacenter IP): Monochrome (Lossless FLAC) FIRST -> YouTube second
-        # - On Local / Residential IP: Fast YouTube ANDROID itag=18 FIRST -> Monochrome second
+        # Environment-Aware Primary Full-Track Waterfall:
+        # - On Cloud (Render/AWS datacenter IP):
+        #     Monochrome -> [YouTube ONLY when YTDLP_COOKIES_B64/PATH/PROXY set]
+        #     -> SoundCloud -> JioSaavn -> Audius -> Preview
+        # - On Local / Residential IP:
+        #     YouTube ANDROID itag=18 -> Monochrome -> JioSaavn -> SoundCloud -> Audius -> Preview
         # ------------------------------------------------------------------
         if config.is_cloud_env():
-            mc_resolved = self._try_resolve_monochrome(
-                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
-            )
-            if mc_resolved:
-                return mc_resolved
-
-            yt_resolved = self._try_resolve_youtube(
-                track_id, prefix, track, title, artist, duration, extra, excluded
-            )
-            if yt_resolved:
-                return yt_resolved
-        else:
-            yt_resolved = self._try_resolve_youtube(
-                track_id, prefix, track, title, artist, duration, extra, excluded
-            )
-            if yt_resolved:
-                return yt_resolved
-
-            mc_resolved = self._try_resolve_monochrome(
-                track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
-            )
-            if mc_resolved:
-                return mc_resolved
-
-        # ------------------------------------------------------------------
-        # Tier 3: JioSaavn 320kbps full-track cross-match (strict artist+title gate)
-        # ------------------------------------------------------------------
-        if title and "jiosaavn" not in excluded:
-            try:
-                js_match = jiosaavn.find_best_stream(title, artist, duration)
-                if js_match:
-                    resolved = ResolvedStream(
-                        track_id=track_id,
-                        mode="full",
-                        source="jiosaavn",
-                        content_type=js_match[1],
-                        url=js_match[0],
-                        headers={"User-Agent": config.BROWSER_USER_AGENT},
-                    )
-                    self._store_cache(resolved)
-                    return resolved
-            except Exception:
-                pass
-
-        # ------------------------------------------------------------------
-        # Tier 4: SoundCloud Public API v2 full-track match (strict ALLOW + lazy HLS assembly)
-        # ------------------------------------------------------------------
-        if title and "soundcloud" not in excluded:
-            try:
-                sc_match = soundcloud.find_best_stream(
-                    title, artist, duration, assemble_now=False
+            # Tier 1 (Cloud): Monochrome Lossless FLAC (progressive <1s TTFB cache)
+            if "monochrome" not in excluded and prefix != "mc":
+                t0 = time.monotonic()
+                mc_resolved = self._try_resolve_monochrome(
+                    track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
                 )
-                if sc_match:
-                    kind = sc_match.get("kind")
-                    if kind == "local" and sc_match.get("bytes"):
-                        resolved = ResolvedStream(
-                            track_id=track_id,
-                            mode="full",
-                            source="soundcloud",
-                            content_type=str(sc_match.get("content_type") or "audio/mp4"),
-                            local_bytes=sc_match["bytes"],
-                        )
-                    elif kind == "hls" and sc_match.get("m3u8_url"):
-                        resolved = ResolvedStream(
-                            track_id=track_id,
-                            mode="full",
-                            source="soundcloud",
-                            content_type=str(sc_match.get("content_type") or "audio/mpeg"),
-                            url=str(sc_match["m3u8_url"]),
-                            headers={
-                                "User-Agent": config.BROWSER_USER_AGENT,
-                                "X-SC-M3U8": str(sc_match["m3u8_url"]),
-                                "X-SC-Cache-Key": str(sc_match.get("cache_key") or ""),
-                            },
-                        )
-                    else:
-                        resolved = ResolvedStream(
-                            track_id=track_id,
-                            mode="full",
-                            source="soundcloud",
-                            content_type=str(sc_match.get("content_type") or "audio/mpeg"),
-                            url=str(sc_match.get("url") or ""),
-                            headers={"User-Agent": config.BROWSER_USER_AGENT},
-                        )
-                    self._store_cache(resolved)
-                    return resolved
-            except Exception:
-                pass
+                ms = int((time.monotonic() - t0) * 1000)
+                if mc_resolved:
+                    attempts.append({"provider": "monochrome", "outcome": "ok", "ms": ms})
+                    mc_resolved.diagnostics = list(attempts)
+                    return mc_resolved
+                attempts.append({"provider": "monochrome", "outcome": "no_match", "ms": ms})
 
-        # ------------------------------------------------------------------
-        # Tier 5: Audius full-track cross-match (strict artist+title gate)
-        # ------------------------------------------------------------------
-        if title and "audius" not in excluded:
-            try:
-                au_match = audius.find_best_stream(title, artist, duration)
-                if au_match:
-                    resolved = ResolvedStream(
-                        track_id=track_id,
-                        mode="full",
-                        source="audius",
-                        content_type=au_match[1],
-                        url=au_match[0],
-                        headers={"User-Agent": config.BROWSER_USER_AGENT},
+            # Tier 2 (Cloud): YouTube ONLY when authenticated/proxied credentials are configured
+            if not yt_excluded and prefix != "yt":
+                if youtube_music.has_cloud_youtube_credentials():
+                    t0 = time.monotonic()
+                    yt_resolved = self._try_resolve_youtube(
+                        track_id, prefix, track, title, artist, duration, extra, excluded
                     )
-                    self._store_cache(resolved)
-                    return resolved
-            except Exception:
-                pass
+                    ms = int((time.monotonic() - t0) * 1000)
+                    if yt_resolved:
+                        attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
+                        yt_resolved.diagnostics = list(attempts)
+                        return yt_resolved
+                    attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
+                else:
+                    attempts.append(
+                        {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
+                    )
+
+            # Tier 3 (Cloud): SoundCloud Public API v2 (promoted ahead of JioSaavn on cloud)
+            sc_resolved = self._try_resolve_soundcloud(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if sc_resolved:
+                return sc_resolved
+
+            # Tier 4 (Cloud): JioSaavn 320kbps
+            js_resolved = self._try_resolve_jiosaavn(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if js_resolved:
+                return js_resolved
+
+            # Tier 5 (Cloud): Audius
+            au_resolved = self._try_resolve_audius(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if au_resolved:
+                return au_resolved
+        else:
+            # Tier 1 (Local): Fast YouTube ANDROID itag=18
+            if not yt_excluded and prefix != "yt":
+                t0 = time.monotonic()
+                yt_resolved = self._try_resolve_youtube(
+                    track_id, prefix, track, title, artist, duration, extra, excluded
+                )
+                ms = int((time.monotonic() - t0) * 1000)
+                if yt_resolved:
+                    attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
+                    yt_resolved.diagnostics = list(attempts)
+                    return yt_resolved
+                attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
+
+            # Tier 2 (Local): Monochrome Lossless FLAC
+            if "monochrome" not in excluded and prefix != "mc":
+                t0 = time.monotonic()
+                mc_resolved = self._try_resolve_monochrome(
+                    track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
+                )
+                ms = int((time.monotonic() - t0) * 1000)
+                if mc_resolved:
+                    attempts.append({"provider": "monochrome", "outcome": "ok", "ms": ms})
+                    mc_resolved.diagnostics = list(attempts)
+                    return mc_resolved
+                attempts.append({"provider": "monochrome", "outcome": "no_match", "ms": ms})
+
+            # Tier 3 (Local): JioSaavn 320kbps
+            js_resolved = self._try_resolve_jiosaavn(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if js_resolved:
+                return js_resolved
+
+            # Tier 4 (Local): SoundCloud Public API v2
+            sc_resolved = self._try_resolve_soundcloud(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if sc_resolved:
+                return sc_resolved
+
+            # Tier 5 (Local): Audius
+            au_resolved = self._try_resolve_audius(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if au_resolved:
+                return au_resolved
 
         # ------------------------------------------------------------------
         # Tier 6: Official 30-second preview of THAT exact track (Deezer / iTunes)
         # ------------------------------------------------------------------
         preview_src = "deezer-preview" if prefix == "dz" else "itunes-preview"
         if preview_src not in excluded and (preview_url or (prefix in ("dz", "it") and raw_id)):
+            t0 = time.monotonic()
             candidate_preview = preview_url
             if candidate_preview:
                 ok, status, hdrs, final_url = http_client.probe_url(
@@ -592,6 +793,7 @@ class StreamService:
                     ctype = hdrs.get("content-type", "audio/mpeg").split(";")[0].strip()
                     if not ctype.startswith("audio/"):
                         ctype = "audio/mpeg" if ".mp3" in final_url.lower() else "audio/mp4"
+                    attempts.append({"provider": preview_src, "outcome": "preview", "ms": int((time.monotonic() - t0) * 1000)})
                     resolved = ResolvedStream(
                         track_id=track_id,
                         mode="preview",
@@ -599,8 +801,10 @@ class StreamService:
                         content_type=ctype,
                         url=final_url,
                         headers={"User-Agent": config.BROWSER_USER_AGENT},
+                        diagnostics=list(attempts),
                     )
                     self._store_cache(resolved)
+                    self._log_preview_fallback(track_id, title, artist, resolved)
                     return resolved
             elif prefix in ("dz", "it") and raw_id:
                 try:
@@ -615,6 +819,7 @@ class StreamService:
                         if ok:
                             ctype = hdrs.get("content-type", "audio/mpeg").split(";")[0].strip()
                             default_ct = "audio/mpeg" if prefix == "dz" else "audio/mp4"
+                            attempts.append({"provider": preview_src, "outcome": "preview", "ms": int((time.monotonic() - t0) * 1000)})
                             resolved = ResolvedStream(
                                 track_id=track_id,
                                 mode="preview",
@@ -622,8 +827,10 @@ class StreamService:
                                 content_type=ctype if ctype.startswith("audio/") else default_ct,
                                 url=final_url,
                                 headers={"User-Agent": config.BROWSER_USER_AGENT},
+                                diagnostics=list(attempts),
                             )
                             self._store_cache(resolved)
+                            self._log_preview_fallback(track_id, title, artist, resolved)
                             return resolved
                 except Exception:
                     pass
@@ -648,9 +855,17 @@ class StreamService:
                 self._cache.pop(next(iter(self._cache)))
             self._cache[resolved.track_id] = resolved
 
-    def get_stream_info(self, track_id: str) -> Dict[str, Any]:
+    def get_stream_info(self, track_id: str, debug: bool = False) -> Dict[str, Any]:
         resolved = self.resolve_stream(track_id)
-        return {
+        # Proactive non-blocking pre-warm for Monochrome tracks so the first 64 KB
+        # is already on disk before the browser fires GET /api/stream/{track_id}.
+        mc_id = _extract_monochrome_id(resolved)
+        if mc_id:
+            try:
+                monochrome.start_background_cache(mc_id)
+            except Exception:
+                pass
+        payload: Dict[str, Any] = {
             "trackId": track_id,
             "streamUrl": f"/api/stream/{track_id}",
             "streamMode": resolved.mode,
@@ -658,6 +873,10 @@ class StreamService:
             "contentType": resolved.content_type,
             "adFree": True,
         }
+        if debug:
+            payload["diagnostics"] = list(resolved.diagnostics)
+            payload["cloudMode"] = config.is_cloud_env()
+        return payload
 
     def _send_common_stream_headers(self, handler: Any, resolved: ResolvedStream) -> None:
         handler.send_header("Content-Type", resolved.content_type)
@@ -773,6 +992,152 @@ class StreamService:
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
 
+    def _serve_progressive_monochrome(
+        self,
+        handler: Any,
+        mc_id: str,
+        resolved: ResolvedStream,
+        range_header: Optional[str],
+        head_only: bool,
+    ) -> bool:
+        """Stream a Monochrome track progressively as soon as the first 64 KiB lands on disk.
+
+        Returns True once HTTP headers have been sent (or completed cleanly), or False if
+        the upstream download failed before headers so the caller can cascade to SoundCloud/etc.
+        """
+        handle = monochrome.get_or_start_download(mc_id)
+        if not handle:
+            return False
+
+        handle.wait_until_ready(timeout=20.0)
+        if (
+            handle.failed
+            or (handle.done and handle.bytes_written < monochrome.MIN_TRACK_BYTES)
+            or not (handle.ready or handle.done)
+        ):
+            return False
+
+        if handle.content_type:
+            resolved.content_type = handle.content_type
+
+        if handle.is_complete:
+            self._serve_file_path(handler, handle.final_path, resolved, range_header, head_only)
+            return True
+
+        known_total = handle.total_size
+        if known_total <= 0:
+            # Chunked upstream without Content-Length: wait for completion then serve from disk
+            handle.wait_until_done(timeout=45.0)
+            if handle.failed or not handle.final_path.is_file():
+                return False
+            if handle.content_type:
+                resolved.content_type = handle.content_type
+            self._serve_file_path(handler, handle.final_path, resolved, range_header, head_only)
+            return True
+
+        byte_range, ok = parse_byte_range(range_header, known_total)
+        if not ok:
+            handler.send_response(416)
+            handler.send_header("Accept-Ranges", "bytes")
+            handler.send_header("Content-Range", f"bytes */{known_total}")
+            handler.send_header("X-Ad-Free", "true")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return True
+
+        if byte_range is not None:
+            start, end = byte_range
+            length = end - start + 1
+            handler.send_response(206)
+            self._send_common_stream_headers(handler, resolved)
+            handler.send_header("Content-Range", f"bytes {start}-{end}/{known_total}")
+            handler.send_header("Content-Length", str(length))
+            handler.end_headers()
+        else:
+            start = 0
+            end = known_total - 1
+            length = known_total
+            handler.send_response(200)
+            self._send_common_stream_headers(handler, resolved)
+            handler.send_header("Content-Length", str(length))
+            handler.end_headers()
+
+        if head_only:
+            return True
+
+        fh = None
+        using_final = False
+        pos = start
+
+        def _open_active_file(prefer_final: bool = False):
+            nonlocal using_final
+            paths = (
+                (handle.final_path, handle.part_path)
+                if prefer_final
+                else (handle.part_path, handle.final_path)
+            )
+            for candidate in paths:
+                try:
+                    f = candidate.open("rb")
+                    using_final = candidate == handle.final_path
+                    return f
+                except FileNotFoundError:
+                    continue
+            return None
+
+        try:
+            while pos <= end:
+                with handle.cond:
+                    deadline = time.monotonic() + 45.0
+                    while handle.bytes_written <= pos and not handle.done:
+                        remaining_wait = deadline - time.monotonic()
+                        if remaining_wait <= 0:
+                            break
+                        handle.cond.wait(timeout=remaining_wait)
+                    avail = handle.bytes_written
+                    is_done = handle.done
+
+                if avail <= pos:
+                    break
+
+                to_read = min(config.STREAM_CHUNK_SIZE, avail - pos, end - pos + 1)
+                if fh is None:
+                    fh = _open_active_file(prefer_final=is_done)
+                    if fh is None:
+                        break
+                fh.seek(pos)
+                buf = fh.read(to_read)
+                if not buf:
+                    # Handle atomic rename part_path -> final_path cleanly
+                    if not using_final and handle.final_path.is_file():
+                        try:
+                            fh.close()
+                        except Exception:
+                            pass
+                        fh = _open_active_file(prefer_final=True)
+                        if fh is None:
+                            break
+                        fh.seek(pos)
+                        buf = fh.read(to_read)
+                    if not buf:
+                        if is_done:
+                            break
+                        time.sleep(0.01)
+                        continue
+
+                handler.wfile.write(buf)
+                pos += len(buf)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # Browser closed/seeked socket — background producer continues uninterrupted!
+            pass
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        return True
+
     def _write_chunks(self, handler: Any, payload: bytes) -> None:
         step = config.STREAM_CHUNK_SIZE
         view = memoryview(payload)
@@ -797,17 +1162,15 @@ class StreamService:
                 self._serve_local_bytes(handler, resolved, range_header, head_only)
                 return
 
-            # Monochrome single-flight /tmp LRU cache: hits tracks.monochrome.st/track/{id} at most ONCE
-            mc_prefix = monochrome.MONOCHROME_BASE + "/track/"
-            if resolved.source == "monochrome" and resolved.url.startswith(mc_prefix):
-                mc_id = urllib.parse.unquote(resolved.url[len(mc_prefix) :].split("?", 1)[0]).strip("/")
-                cached_mc = monochrome.ensure_track_cached(mc_id) if mc_id else None
-                if cached_mc:
-                    file_path, ctype = cached_mc
-                    resolved.content_type = ctype
-                    self._serve_file_path(handler, file_path, resolved, range_header, head_only)
+            # Monochrome single-flight progressive /tmp cache: hits tracks.monochrome.st/track/{id}
+            # at most ONCE and starts streaming 200/206 immediately after first 64 KiB (<1s TTFB).
+            mc_id = _extract_monochrome_id(resolved)
+            if mc_id:
+                if self._serve_progressive_monochrome(
+                    handler, mc_id, resolved, range_header, head_only
+                ):
                     return
-                # Monochrome track download failed even after 429 retries -> cascade to SoundCloud/JioSaavn/etc.
+                # Monochrome failed before headers -> cascade cleanly to SoundCloud/JioSaavn/etc.
                 self.invalidate(track_id)
                 excluded.add("monochrome")
                 try:

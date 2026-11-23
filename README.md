@@ -43,12 +43,15 @@ This repository includes a Render Blueprint (`render.yaml`) and production `Dock
 ### Option A — One-Click Blueprint (`render.yaml`)
 1. Push this repository (`main` branch) to GitHub.
 2. Open [dashboard.render.com](https://dashboard.render.com/) -> **New +** -> **Blueprint** -> connect your GitHub repo.
-3. Render automatically detects `render.yaml` (`sonify-music`, Docker, **Free** plan, `/api/health`) — click **Apply** to deploy live at `https://sonify-music.onrender.com`.
+3. Render automatically detects `render.yaml` (`sonify-music`, Docker, **Free** plan, **`region: singapore`**, `/api/health`) — click **Apply** to deploy live.
 
 ### Option B — Manual Web Service
 1. On [dashboard.render.com](https://dashboard.render.com/), click **New +** -> **Web Service** -> select your GitHub repo.
-2. Choose **Language / Runtime: Docker**, **Instance Type: Free ($0/month)**, and **Health Check Path: `/api/health`**.
+2. Choose **Language / Runtime: Docker**, **Region: Singapore (Southeast Asia)**, **Instance Type: Free ($0/month)**, and **Health Check Path: `/api/health`**.
 3. Click **Create Web Service** — Render builds `Dockerfile` automatically and binds dynamically to `$PORT` (default `10000`).
+
+> **Region & Full-Track Note (Important for Existing Oregon Services):**
+> `render.yaml` specifies `region: singapore` because SoundCloud Go+ 30-second `SNIP` paywalls apply in the US (Oregon) but **not** in Singapore, unlocking full-track coverage for brand-new Global/V-Pop releases absent from Monochrome and cutting Southeast Asia latency ~6x. Render does **not** migrate an existing live service across regions in-place when `render.yaml` changes — to switch an existing US-Oregon service to Singapore, create a fresh Render Blueprint/Web Service in **Singapore** (~2 minutes on Free tier), **or** keep your existing region and set optional `YTDLP_COOKIES_B64` (base64 Netscape cookies) or `YTDLP_PROXY` in Render Environment Variables for 100% YouTube Music catalog coverage. You can inspect live provider traces via `GET /api/stream/{trackId}/info?debug=1` and deployment flags via `GET /api/health`.
 
 ---
 
@@ -65,11 +68,11 @@ This repository includes a Render Blueprint (`render.yaml`) and production `Dock
   - **Zero ads, zero sponsored slots, zero trackers** (`X-Ad-Free: true` on every stream response).
   - Backend `/api/stream/{track_id}` proxy with full HTTP `Range` (`206 Partial Content`) support and a **cloud-aware ad-free resolution waterfall**:
     1. Native full-length stream (`Audius` / `JioSaavn` / `YouTube` / `Monochrome`)
-    2. **Monochrome Lossless FLAC** (`https://tracks.monochrome.st`, primary on cloud/Render datacenter IPs; ISRC + strict title/artist/duration matching + magic-byte `fLaC -> audio/flac` sniffing) & **YouTube Music** (InnerTube `ANDROID` fast-start MP4/AAC -> `yt-dlp` with optional `YTDLP_COOKIES_B64`/`YTDLP_PROXY`), verified with open-ended `Range: bytes=0-`
-    3. JioSaavn 320kbps cross-match (strict title/artist/duration gate)
-    4. SoundCloud Public API v2 full-track match (strict `policy=ALLOW` non-remix MP3 & concurrent HLS fMP4 assembly)
+    2. **Monochrome Lossless FLAC** (`https://tracks.monochrome.st`, primary on cloud/Render with decoupled progressive `/tmp` single-flight cache streaming immediately after 64 KiB + proactive pre-warm on `/info`, ISRC + strict title/artist/duration matching, 2-step ASCII fallback search, and magic-byte `fLaC -> audio/flac` sniffing) & **YouTube Music** (primary locally via InnerTube `ANDROID` fast-start MP4/AAC; on cloud enabled automatically when `YTDLP_COOKIES_B64`/`YTDLP_COOKIES_PATH`/`YTDLP_PROXY` is set and skipped cleanly otherwise)
+    3. **SoundCloud Public API v2** (promoted ahead of JioSaavn on cloud; strict `policy=ALLOW` full-track gate, skipping `abr_sq`/`audio/mpegurl` & `snipped` transcodings, multi-query `limit=25` + `scored[:6]` traversal, lazy HLS fMP4/MP3 assembly)
+    4. JioSaavn 320kbps cross-match (strict title/artist/duration gate)
     5. Audius full-track cross-match (strict title/artist/duration gate)
-    6. Official 30-second preview of the exact track (`X-Stream-Mode: preview`), or honest `502 Stream Unavailable` if unreachable online (offline synth WAV is strictly reserved for explicit `--offline` / `local:*` showcase tracks)
+    6. Official 30-second preview of the exact track (`X-Stream-Mode: preview`, 12s short TTL so full-track recovery is never poisoned), or honest `502 Stream Unavailable` if unreachable online (offline synth WAV is strictly reserved for explicit `--offline` / `local:*` showcase tracks)
 - **Real-Time Synced & Plain Lyrics**
   - 5-stage lyrics waterfall (**LRCLIB** `/api/get` & `/api/search` -> **YouTube Music InnerTube** -> **Lyrics.ovh** -> built-in local `.lrc`) backed by a 7-day SQLite cache.
   - Available both in the **Right Side Drawer** and as an **Immersive Full-Stage Lyrics View** (`#/lyrics`).

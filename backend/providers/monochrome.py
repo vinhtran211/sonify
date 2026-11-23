@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,9 @@ from backend import config, http_client, lrc_parser
 MONOCHROME_BASE = "https://tracks.monochrome.st"
 CACHE_DIR = Path(tempfile.gettempdir()) / "sonify_mc_cache"
 MAX_CACHE_FILES = 12
+MAX_CACHE_BYTES = 300 * 1024 * 1024  # 300 MiB disk cap on Render /tmp
 MIN_TRACK_BYTES = 200_000
+READY_THRESHOLD_BYTES = 65_536       # Stream headers+bytes immediately after first 64 KiB
 PACE_INTERVAL_SEC = 1.0
 
 _NOISE_KEYWORDS = (
@@ -55,6 +58,53 @@ _TRACK_LOCKS: Dict[str, threading.Lock] = {}
 _PACE_LOCK = threading.Lock()
 _LAST_STREAM_START: float = 0.0
 _MIME_CACHE: Dict[str, str] = {}
+
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_DOWNLOADS: Dict[str, "ProgressiveCacheEntry"] = {}
+
+
+@dataclass
+class ProgressiveCacheEntry:
+    """Single-flight progressive background download handle backed by /tmp/sonify_mc_cache."""
+
+    clean_id: str
+    part_path: Path
+    final_path: Path
+    cond: threading.Condition = field(default_factory=threading.Condition)
+    bytes_written: int = 0
+    total_size: int = 0          # upstream Content-Length if known (> 0)
+    content_type: str = "audio/flac"
+    done: bool = False
+    failed: bool = False
+    ready: bool = False          # True once bytes_written >= 65536 (or done & valid)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.done and not self.failed and self.final_path.is_file()
+
+    def wait_until_ready(self, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout)
+        with self.cond:
+            while not (self.ready or self.done):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(timeout=remaining)
+            return self.ready and not self.failed
+
+    def wait_until_done(self, timeout: float = 120.0) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout)
+        with self.cond:
+            while not self.done:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(timeout=remaining)
+            return self.done and not self.failed
+
+
+# Alias for external callers / spec naming
+ProgressiveHandle = ProgressiveCacheEntry
 
 
 def _get_track_lock(raw_id: str) -> threading.Lock:
@@ -89,17 +139,32 @@ def _safe_cache_path(raw_id: str) -> Path:
 
 
 def _evict_lru_cache_files() -> None:
+    """Enforce both MAX_CACHE_FILES and MAX_CACHE_BYTES on completed *.bin files (never active *.part)."""
     try:
         if not CACHE_DIR.is_dir():
             return
-        files = sorted(
-            (p for p in CACHE_DIR.glob("*.bin") if p.is_file()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for stale in files[MAX_CACHE_FILES:]:
+        files: List[Tuple[float, int, Path]] = []
+        for p in CACHE_DIR.glob("*.bin"):
             try:
-                stale.unlink(missing_ok=True)
+                if p.is_file():
+                    st = p.stat()
+                    files.append((st.st_mtime, st.st_size, p))
+            except OSError:
+                continue
+        files.sort(key=lambda item: item[0], reverse=True)
+
+        kept_bytes = 0
+        kept_count = 0
+        for _, size, path in files:
+            # Always keep at least the newest completed track even if a Hi-Res FLAC is large
+            if kept_count == 0 or (
+                kept_count < MAX_CACHE_FILES and (kept_bytes + size) <= MAX_CACHE_BYTES
+            ):
+                kept_count += 1
+                kept_bytes += size
+                continue
+            try:
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
     except OSError:
@@ -214,62 +279,32 @@ def probe_track_stream(raw_id: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def ensure_track_cached(raw_id: str) -> Optional[Tuple[Path, str]]:
-    """Download a Monochrome track at most once into bounded /tmp LRU cache (single-flight).
-
-    All concurrent browser Range requests (bytes=0-, Chrome tail probes, seeks) share
-    one single uninterrupted upstream download and then serve in <1ms from disk.
-    """
-    clean_id = str(raw_id or "").strip()
-    if not clean_id:
-        return None
-
-    bin_path = _safe_cache_path(clean_id)
-
-    # Fast path without waiting on download lock if already cached on disk
+def _read_cached_mime(clean_id: str, bin_path: Path) -> str:
+    ctype = _MIME_CACHE.get(clean_id)
+    if ctype:
+        return ctype
     try:
-        if bin_path.is_file() and bin_path.stat().st_size >= MIN_TRACK_BYTES:
-            try:
-                os.utime(bin_path, None)
-            except OSError:
-                pass
-            ctype = _MIME_CACHE.get(clean_id)
-            if not ctype:
-                with bin_path.open("rb") as fh:
-                    head = fh.read(16)
-                ctype = http_client.sniff_media_mime(head, "audio/flac") or "audio/flac"
-                _MIME_CACHE[clean_id] = ctype
-            return bin_path, ctype
+        with bin_path.open("rb") as fh:
+            head = fh.read(16)
+        ctype = http_client.sniff_media_mime(head, "audio/flac") or "audio/flac"
     except OSError:
-        pass
+        ctype = "audio/flac"
+    _MIME_CACHE[clean_id] = ctype
+    return ctype
 
-    track_lock = _get_track_lock(clean_id)
-    with track_lock:
-        # Re-check after acquiring per-track lock in case a concurrent request just finished
-        try:
-            if bin_path.is_file() and bin_path.stat().st_size >= MIN_TRACK_BYTES:
-                try:
-                    os.utime(bin_path, None)
-                except OSError:
-                    pass
-                ctype = _MIME_CACHE.get(clean_id)
-                if not ctype:
-                    with bin_path.open("rb") as fh:
-                        head = fh.read(16)
-                    ctype = http_client.sniff_media_mime(head, "audio/flac") or "audio/flac"
-                    _MIME_CACHE[clean_id] = ctype
-                return bin_path, ctype
-        except OSError:
-            pass
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        url = get_stream_url(clean_id)
-        hdrs = {"User-Agent": config.BROWSER_USER_AGENT}
-        backoffs = (1.5, 3.0, 4.5)
+def _run_producer(entry: ProgressiveCacheEntry) -> None:
+    """Background producer thread: downloads tracks.monochrome.st/track/{id} once into .part -> .bin."""
+    url = get_stream_url(entry.clean_id)
+    hdrs = {"User-Agent": config.BROWSER_USER_AGENT}
+    backoffs = (1.5, 3.0, 4.5)
+    succeeded = False
 
+    try:
+        entry.final_path.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(4):
             resp = None
-            tmp_path = bin_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            total_written = 0
             try:
                 _pace_upstream_request()
                 status, up_headers, resp = http_client.open_stream(
@@ -277,61 +312,208 @@ def ensure_track_cached(raw_id: str) -> Optional[Tuple[Path, str]]:
                     headers=hdrs,
                     range_header=None,
                     method="GET",
-                    timeout=max(35.0, float(config.STREAM_READ_TIMEOUT)),
+                    timeout=max(45.0, float(config.STREAM_READ_TIMEOUT)),
                 )
                 if status not in (200, 206):
                     if status == 429 and attempt < len(backoffs):
                         time.sleep(backoffs[attempt])
                         continue
-                    return None
+                    break
+
+                raw_cl = str(up_headers.get("content-length") or "").strip()
+                known_total = int(raw_cl) if raw_cl.isdigit() and int(raw_cl) > 0 else 0
+                header_ct = up_headers.get("content-type", "audio/flac")
+
+                with entry.cond:
+                    entry.total_size = known_total
+                    entry.bytes_written = 0
+                    entry.ready = False
 
                 head_bytes = bytearray()
-                total_written = 0
-                with tmp_path.open("wb") as out_f:
+                sniffed_ct = "audio/flac"
+                sniffed_done = False
+
+                with entry.part_path.open("wb") as out_f:
                     while True:
                         chunk = resp.read(config.STREAM_CHUNK_SIZE)
                         if not chunk:
                             break
                         if len(head_bytes) < 16:
                             head_bytes.extend(chunk[: 16 - len(head_bytes)])
+                        if not sniffed_done and (len(head_bytes) >= 12 or total_written == 0):
+                            sniffed_ct = (
+                                http_client.sniff_media_mime(bytes(head_bytes), header_ct)
+                                or "audio/flac"
+                            )
+                            if len(head_bytes) >= 12:
+                                sniffed_done = True
                         out_f.write(chunk)
+                        out_f.flush()
                         total_written += len(chunk)
 
-                if total_written < MIN_TRACK_BYTES:
-                    tmp_path.unlink(missing_ok=True)
-                    return None
+                        with entry.cond:
+                            entry.bytes_written = total_written
+                            entry.content_type = sniffed_ct
+                            if total_written >= READY_THRESHOLD_BYTES:
+                                entry.ready = True
+                            entry.cond.notify_all()
 
-                header_ct = up_headers.get("content-type", "audio/flac")
-                ctype = http_client.sniff_media_mime(bytes(head_bytes), header_ct) or "audio/flac"
-                tmp_path.replace(bin_path)
-                _MIME_CACHE[clean_id] = ctype
+                if total_written < MIN_TRACK_BYTES:
+                    entry.part_path.unlink(missing_ok=True)
+                    break
+
+                final_ct = http_client.sniff_media_mime(bytes(head_bytes), header_ct) or sniffed_ct
+                entry.part_path.replace(entry.final_path)
+                _MIME_CACHE[entry.clean_id] = final_ct
+                with entry.cond:
+                    entry.content_type = final_ct
+                    entry.bytes_written = total_written
+                    entry.total_size = total_written
+                    entry.ready = True
+                    entry.failed = False
+                    entry.done = True
+                    entry.cond.notify_all()
+                succeeded = True
                 _evict_lru_cache_files()
-                return bin_path, ctype
+                break
             except urllib.error.HTTPError as exc:
                 code = exc.code
                 try:
                     exc.close()
                 except Exception:
                     pass
-                tmp_path.unlink(missing_ok=True)
-                if code == 429 and attempt < len(backoffs):
+                entry.part_path.unlink(missing_ok=True)
+                if code == 429 and total_written == 0 and attempt < len(backoffs):
                     time.sleep(backoffs[attempt])
                     continue
-                return None
+                break
             except Exception:
-                tmp_path.unlink(missing_ok=True)
-                if attempt == 0:
+                entry.part_path.unlink(missing_ok=True)
+                if total_written == 0 and attempt == 0:
                     time.sleep(1.0)
                     continue
-                return None
+                break
             finally:
                 if resp is not None:
                     try:
                         resp.close()
                     except Exception:
                         pass
+    finally:
+        if not succeeded:
+            try:
+                entry.part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            with entry.cond:
+                entry.failed = True
+                entry.done = True
+                entry.cond.notify_all()
+        with _ACTIVE_LOCK:
+            if _ACTIVE_DOWNLOADS.get(entry.clean_id) is entry:
+                _ACTIVE_DOWNLOADS.pop(entry.clean_id, None)
 
-    return None
+
+def get_or_start_download(raw_id: str) -> Optional[ProgressiveCacheEntry]:
+    """Return a completed or in-progress single-flight ProgressiveCacheEntry without blocking.
+
+    - If already cached on disk: returns a completed handle immediately (<1ms).
+    - If already downloading: returns the shared handle (guaranteed 1 upstream hit total).
+    - Otherwise spawns a detached daemon producer thread so browser pauses/cancels never
+      abort or duplicate the upstream Monochrome request.
+    """
+    clean_id = str(raw_id or "").strip()
+    if not clean_id:
+        return None
+
+    final_path = _safe_cache_path(clean_id)
+
+    # Lock-free fast path for already completed files on disk
+    try:
+        if final_path.is_file():
+            st = final_path.stat()
+            if st.st_size >= MIN_TRACK_BYTES:
+                try:
+                    os.utime(final_path, None)
+                except OSError:
+                    pass
+                ctype = _read_cached_mime(clean_id, final_path)
+                return ProgressiveCacheEntry(
+                    clean_id=clean_id,
+                    part_path=final_path,
+                    final_path=final_path,
+                    bytes_written=st.st_size,
+                    total_size=st.st_size,
+                    content_type=ctype,
+                    done=True,
+                    failed=False,
+                    ready=True,
+                )
+    except OSError:
+        pass
+
+    with _ACTIVE_LOCK:
+        # Re-check disk under lock in case a producer just finished and popped itself
+        try:
+            if final_path.is_file():
+                st = final_path.stat()
+                if st.st_size >= MIN_TRACK_BYTES:
+                    try:
+                        os.utime(final_path, None)
+                    except OSError:
+                        pass
+                    ctype = _read_cached_mime(clean_id, final_path)
+                    return ProgressiveCacheEntry(
+                        clean_id=clean_id,
+                        part_path=final_path,
+                        final_path=final_path,
+                        bytes_written=st.st_size,
+                        total_size=st.st_size,
+                        content_type=ctype,
+                        done=True,
+                        failed=False,
+                        ready=True,
+                    )
+        except OSError:
+            pass
+
+        existing = _ACTIVE_DOWNLOADS.get(clean_id)
+        if existing is not None and not existing.failed:
+            return existing
+
+        part_name = f"{final_path.stem}.part.{os.getpid()}.{int(time.time() * 1000)}.{threading.get_ident()}"
+        part_path = final_path.with_name(part_name)
+        entry = ProgressiveCacheEntry(
+            clean_id=clean_id,
+            part_path=part_path,
+            final_path=final_path,
+        )
+        _ACTIVE_DOWNLOADS[clean_id] = entry
+
+    t = threading.Thread(
+        target=_run_producer,
+        args=(entry,),
+        name=f"mc-dl-{clean_id[:16]}",
+        daemon=True,
+    )
+    t.start()
+    return entry
+
+
+def start_background_cache(raw_id: str) -> Optional[ProgressiveCacheEntry]:
+    """Non-blocking pre-warm helper invoked by /api/stream/{id}/info for Monochrome tracks."""
+    return get_or_start_download(raw_id)
+
+
+def ensure_track_cached(raw_id: str) -> Optional[Tuple[Path, str]]:
+    """Backwards-compatible blocking wrapper around get_or_start_download()."""
+    handle = get_or_start_download(raw_id)
+    if not handle:
+        return None
+    handle.wait_until_done(timeout=120.0)
+    if handle.failed or not handle.done or not handle.final_path.is_file():
+        return None
+    return handle.final_path, handle.content_type
 
 
 def fetch_track_bytes(raw_id: str) -> Optional[Tuple[bytes, str]]:
@@ -435,34 +617,34 @@ def find_best_stream(
     """Search Monochrome for a matching full-length lossless track WITHOUT probing /track/{id}.
 
     Zero-probe resolution prevents /info + <video> burst 429s; actual audio download
-    happens once via single-flight ensure_track_cached() when playback begins.
+    happens once via single-flight progressive background cache when playback begins.
     Returns (stream_url, "audio/flac", monochrome_track_id) or None.
     """
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
-    query = f"{primary_artist} {clean_title}".strip()
-    if not query:
+    primary_query = f"{primary_artist} {clean_title}".strip()
+    if not primary_query:
         return None
 
-    candidates = search_tracks(query, limit=8)
+    queries: List[str] = [primary_query]
+    ascii_q = lrc_parser.normalize_key(primary_query).strip()
+    if ascii_q and ascii_q.lower() != primary_query.lower():
+        queries.append(ascii_q)
+    if clean_title and len(clean_title.strip()) >= 4 and primary_artist:
+        ct_q = clean_title.strip()
+        if all(ct_q.lower() != existing.lower() for existing in queries):
+            queries.append(ct_q)
+
     scored: List[Tuple[float, Dict[str, Any]]] = []
+    seen_ids: set[str] = set()
 
-    for cand in candidates:
-        sc = score_candidate(
-            cand,
-            clean_title=clean_title,
-            primary_artist=primary_artist,
-            full_artist=artist,
-            target_duration=duration,
-            target_isrc=isrc,
-            raw_target_title=title,
-        )
-        if sc >= min_score:
-            scored.append((sc, cand))
-
-    # Secondary title-only query if combined query yielded no match (e.g. transliterated artist credit)
-    if not scored and clean_title and primary_artist:
-        for cand in search_tracks(clean_title, limit=8):
+    for q in queries:
+        for cand in search_tracks(q, limit=10):
+            rid = str(cand.get("rawId") or "").strip()
+            if rid and rid in seen_ids:
+                continue
+            if rid:
+                seen_ids.add(rid)
             sc = score_candidate(
                 cand,
                 clean_title=clean_title,
@@ -474,6 +656,8 @@ def find_best_stream(
             )
             if sc >= min_score:
                 scored.append((sc, cand))
+        if scored:
+            break
 
     if not scored:
         return None

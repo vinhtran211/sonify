@@ -488,6 +488,104 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
             self.assertTrue(assembled.startswith(b"\x00\x00\x00\x1cftypisom"))
             self.assertEqual(len(assembled), 240012)
 
+    def test_soundcloud_skips_abr_sq_snipped_preview_and_tries_scored_up_to_6(self):
+        # 1. _resolve_item_stream skips snipped=True, abr_sq/audio/mpegurl, and /preview/ URLs
+        called_urls = []
+
+        def fake_fetch_json(u, **kw):
+            called_urls.append(u)
+            if "preview_tc" in u:
+                return {"url": "https://cf-hls.sndcdn.test/preview/hls/playlist.m3u8"}
+            if "aac160" in u:
+                return {"url": "https://cf-hls.sndcdn.test/stream/hls/aac160.m3u8"}
+            if "mp3hls" in u:
+                return {"url": "https://cf-hls.sndcdn.test/stream/hls/mp3.m3u8"}
+            return {}
+
+        item = {
+            "id": 987654,
+            "track_authorization": "tok",
+            "media": {
+                "transcodings": [
+                    {
+                        "url": "https://api-v2.soundcloud.test/media/abr_sq",
+                        "preset": "abr_sq",
+                        "snipped": False,
+                        "format": {"protocol": "hls", "mime_type": "audio/mpegurl"},
+                    },
+                    {
+                        "url": "https://api-v2.soundcloud.test/media/snipped_mp3",
+                        "preset": "mp3_1_0",
+                        "snipped": True,
+                        "format": {"protocol": "hls", "mime_type": "audio/mpeg"},
+                    },
+                    {
+                        "url": "https://api-v2.soundcloud.test/media/preview_tc",
+                        "preset": "mp3_1_0",
+                        "snipped": False,
+                        "format": {"protocol": "hls", "mime_type": "audio/mpeg"},
+                    },
+                    {
+                        "url": "https://api-v2.soundcloud.test/media/aac160",
+                        "preset": "aac_160k",
+                        "snipped": False,
+                        "format": {"protocol": "hls", "mime_type": 'audio/mp4; codecs="mp4a.40.2"'},
+                    },
+                ]
+            },
+        }
+        with mock.patch("backend.http_client.fetch_json", side_effect=fake_fetch_json):
+            res = soundcloud._resolve_item_stream(item, client_id="cid123", assemble_now=False)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["kind"], "hls")
+            self.assertEqual(res["m3u8_url"], "https://cf-hls.sndcdn.test/stream/hls/aac160.m3u8")
+            # abr_sq and snipped_mp3 must NEVER be requested
+            self.assertFalse(any("abr_sq" in u for u in called_urls))
+            self.assertFalse(any("snipped_mp3" in u for u in called_urls))
+
+        # 2. Multi-query collection & scored[:6] fallback when candidates #1 and #2 fail transcoding
+        def make_cand(cid_num: int):
+            return {
+                "id": cid_num,
+                "title": "ROSÉ - APT.",
+                "policy": "ALLOW",
+                "duration": 170000,
+                "full_duration": 170000,
+                "user": {"username": "ROSE Official"},
+            }
+
+        c1, c2, c3 = make_cand(101), make_cand(102), make_cand(103)
+        search_calls = []
+
+        def fake_search(q, limit=25):
+            search_calls.append((q, limit))
+            if len(search_calls) == 1:
+                return [c1]
+            return [c2, c3]
+
+        resolve_order = []
+
+        def fake_resolve(it, cid, assemble_now=True):
+            resolve_order.append(it["id"])
+            if it["id"] in (101, 102):
+                return None
+            return {"kind": "hls", "m3u8_url": "https://cf-hls.sndcdn.test/stream/ok.m3u8", "cache_key": "sc:103", "content_type": "audio/mp4"}
+
+        stats = {}
+        with mock.patch("backend.providers.soundcloud.search_raw_tracks", side_effect=fake_search), \
+             mock.patch("backend.providers.soundcloud.get_client_id", return_value="cid123"), \
+             mock.patch("backend.providers.soundcloud._resolve_item_stream", side_effect=fake_resolve):
+            found = soundcloud.find_best_stream("APT.", "ROSÉ", 170, assemble_now=False, stats=stats)
+            self.assertIsNotNone(found)
+            self.assertEqual(found["cache_key"], "sc:103")
+            # Did not stop after only 1 candidate from query #1; searched ASCII fallback too
+            self.assertGreaterEqual(len(search_calls), 2)
+            self.assertEqual(search_calls[0][1], 25)
+            # Tried candidates #1, #2, and succeeded on #3
+            self.assertEqual(resolve_order, [101, 102, 103])
+            self.assertEqual(stats.get("transcode_failures"), 2)
+            self.assertEqual(stats.get("scored_count"), 3)
+
     def test_youtube_innertube_android_itag18_extraction_and_strict_matching(self):
         captured = {}
 
@@ -813,6 +911,56 @@ class TestStreamWaterfall(unittest.TestCase):
             self.assertEqual((res_sc.mode, res_sc.source, res_sc.content_type), ("full", "soundcloud", "audio/mpeg"))
             self.assertEqual(res_sc.headers.get("X-SC-M3U8"), "https://cf-hls.sndcdn.test/playlist.m3u8")
 
+    def test_cloud_waterfall_skips_anonymous_youtube_runs_soundcloud_before_jiosaavn_and_debug_info(self):
+        self.db.upsert_track({
+            "id": "dz:4045817471",
+            "source": "deezer",
+            "title": "New 2026 Track",
+            "artist": "Global Star",
+            "duration": 210,
+            "previewUrl": "https://preview.dz/new2026.mp3",
+            "_extra": {"isrc": "USUM72600001"},
+        })
+
+        # 1. Under RENDER=true WITHOUT YouTube credentials: YouTube is skipped, SoundCloud runs BEFORE JioSaavn
+        call_order = []
+        with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=True), \
+             mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.youtube_music.find_best_video_id") as m_yt, \
+             mock.patch("backend.providers.soundcloud.find_best_stream", side_effect=lambda *a, **kw: (call_order.append("soundcloud"), {
+                 "kind": "hls",
+                 "m3u8_url": "https://cf-hls.sndcdn.test/stream/ok.m3u8",
+                 "cache_key": "sc:999",
+                 "content_type": "audio/mp4",
+             })[1]), \
+             mock.patch("backend.providers.jiosaavn.find_best_stream", side_effect=lambda *a, **kw: (call_order.append("jiosaavn"), None)[1]):
+            res = self.stream.resolve_stream("dz:4045817471", force_refresh=True)
+            self.assertEqual((res.mode, res.source), ("full", "soundcloud"))
+            m_yt.assert_not_called()
+            self.assertEqual(call_order, ["soundcloud"])
+            # Diagnostics record skipped_cloud_no_credentials
+            yt_diag = [d for d in res.diagnostics if d.get("provider") == "youtube"]
+            self.assertEqual(len(yt_diag), 1)
+            self.assertEqual(yt_diag[0]["outcome"], "skipped_cloud_no_credentials")
+
+            # Default get_stream_info omits diagnostics; debug=True includes diagnostics + cloudMode
+            plain_info = self.stream.get_stream_info("dz:4045817471", debug=False)
+            self.assertNotIn("diagnostics", plain_info)
+            dbg_info = self.stream.get_stream_info("dz:4045817471", debug=True)
+            self.assertTrue(dbg_info["cloudMode"])
+            self.assertIsInstance(dbg_info["diagnostics"], list)
+            self.assertTrue(any(d["provider"] == "soundcloud" and d["outcome"] == "ok" for d in dbg_info["diagnostics"]))
+
+        # 2. Under RENDER=true WITH YTDLP_COOKIES_B64 set: has_cloud_youtube_credentials() is True and YouTube runs in Tier 2
+        with mock.patch.dict(os.environ, {"RENDER": "true", "YTDLP_COOKIES_B64": "Y29va2ll"}, clear=True), \
+             mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.youtube_music.find_best_video_id", return_value="vid12345678") as m_yt2, \
+             mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=("https://yt/ok.mp4", "video/mp4", {"User-Agent": "Android"}, "yt-dlp")):
+            self.assertTrue(youtube_music.has_cloud_youtube_credentials())
+            res_yt = self.stream.resolve_stream("dz:4045817471", force_refresh=True)
+            self.assertEqual((res_yt.mode, res_yt.source), ("full", "yt-dlp"))
+            m_yt2.assert_called_once()
+
     def test_tier4_itunes_missing_preview_refreshes_from_lookup(self):
         self.db.upsert_track({
             "id": "it:777888",
@@ -1005,6 +1153,148 @@ class TestStreamProxyLiveHTTP(unittest.TestCase):
             self.assertEqual(err_body["error"]["code"], "STREAM_UNAVAILABLE")
             self.assertIn("application/json", ctx.exception.headers.get("Content-Type", ""))
             ctx.exception.close()
+
+    def test_progressive_monochrome_streams_before_done_dedupes_concurrent_and_cascades_on_error(self):
+        import time as _time
+        from pathlib import Path
+
+        head_chunk = b"fLaC" + bytes(i % 256 for i in range(65532))  # 65,536 bytes (64 KiB)
+        tail_chunk = bytes((i * 7) % 256 for i in range(196608))     # 196,608 bytes (192 KiB) -> total 262,144 B
+        full_payload = head_chunk + tail_chunk
+        release_tail = threading.Event()
+        open_calls = []
+
+        class _GatedUpstreamResp:
+            def __init__(self):
+                self._stage = 0
+
+            def read(self, n: int = 65536) -> bytes:
+                if self._stage == 0:
+                    self._stage = 1
+                    return head_chunk
+                if self._stage == 1:
+                    release_tail.wait(timeout=5.0)
+                    self._stage = 2
+                    return tail_chunk
+                return b""
+
+            def close(self) -> None:
+                pass
+
+        def fake_open_stream(url, **kw):
+            open_calls.append(url)
+            return 200, {
+                "content-type": "application/octet-stream",
+                "content-length": str(len(full_payload)),
+            }, _GatedUpstreamResp()
+
+        cache_dir = Path(self._tmp.name) / "prog_mc_cache"
+        self.srv.stream._store_cache(
+            ResolvedStream(
+                track_id="dz:prog1",
+                mode="full",
+                source="monochrome",
+                content_type="audio/flac",
+                url=f"{monochrome.MONOCHROME_BASE}/track/998877",
+                headers={"User-Agent": "SonifyTest"},
+            )
+        )
+
+        with mock.patch.object(monochrome, "CACHE_DIR", cache_dir), \
+             mock.patch.object(monochrome, "PACE_INTERVAL_SEC", 0.0), \
+             mock.patch.dict(monochrome._ACTIVE_DOWNLOADS, {}, clear=True), \
+             mock.patch.dict(monochrome._MIME_CACHE, {}, clear=True), \
+             mock.patch("backend.http_client.open_stream", side_effect=fake_open_stream):
+            # 1. /info triggers non-blocking pre-warm via start_background_cache
+            with urllib.request.urlopen(f"{self.base}/api/stream/dz:prog1/info?debug=1", timeout=5) as r_info:
+                info_data = json.loads(r_info.read().decode("utf-8"))
+                self.assertEqual(info_data["streamMode"], "full")
+                self.assertEqual(info_data["streamSource"], "monochrome")
+                self.assertIn("diagnostics", info_data)
+
+            # 2. First 64 KiB 206 streams IMMEDIATELY BEFORE tail_chunk is released!
+            t0 = _time.monotonic()
+            req_head = urllib.request.Request(
+                f"{self.base}/api/stream/dz:prog1", headers={"Range": "bytes=0-65535"}
+            )
+            with urllib.request.urlopen(req_head, timeout=5) as r1:
+                got_head = r1.read()
+                dt_head = _time.monotonic() - t0
+                self.assertEqual(r1.status, 206)
+                self.assertEqual(r1.headers.get("Content-Type"), "audio/flac")
+                self.assertEqual(r1.headers.get("Content-Range"), f"bytes 0-65535/{len(full_payload)}")
+                self.assertEqual(got_head, head_chunk)
+                self.assertLess(dt_head, 1.5)
+                self.assertFalse(release_tail.is_set())
+
+            # 3. Concurrent tail Range request + early client disconnect share the SINGLE upstream call
+            tail_result = {}
+
+            def fetch_tail():
+                req_tail = urllib.request.Request(
+                    f"{self.base}/api/stream/dz:prog1",
+                    headers={"Range": f"bytes=200000-{len(full_payload)-1}"},
+                )
+                with urllib.request.urlopen(req_tail, timeout=5) as rt:
+                    tail_result["status"] = rt.status
+                    tail_result["body"] = rt.read()
+
+            t_tail = threading.Thread(target=fetch_tail)
+            t_tail.start()
+
+            # Simulate browser opening bytes=0- and abruptly closing socket mid-stream
+            req_abort = urllib.request.Request(
+                f"{self.base}/api/stream/dz:prog1", headers={"Range": "bytes=0-"}
+            )
+            resp_abort = urllib.request.urlopen(req_abort, timeout=5)
+            _ = resp_abort.read(4096)
+            resp_abort.close()
+
+            # Now release tail: producer must still complete atomically despite client disconnect
+            release_tail.set()
+            t_tail.join(timeout=5.0)
+            self.assertEqual(tail_result.get("status"), 206)
+            self.assertEqual(tail_result.get("body"), full_payload[200000:])
+            self.assertEqual(len(open_calls), 1, f"Expected exactly 1 upstream call, got {len(open_calls)}")
+
+            # 4. Subsequent Range request reads cleanly from completed .bin file with 0 new upstream calls
+            req_after = urllib.request.Request(
+                f"{self.base}/api/stream/dz:prog1", headers={"Range": "bytes=65536-131071"}
+            )
+            with urllib.request.urlopen(req_after, timeout=5) as r_after:
+                self.assertEqual(r_after.status, 206)
+                self.assertEqual(r_after.read(), full_payload[65536:131072])
+            self.assertEqual(len(open_calls), 1)
+
+        # 5. Pre-header Monochrome 404 cascades cleanly to SoundCloud before sending HTTP headers
+        self.srv.stream._store_cache(
+            ResolvedStream(
+                track_id="dz:progfail",
+                mode="full",
+                source="monochrome",
+                content_type="audio/flac",
+                url=f"{monochrome.MONOCHROME_BASE}/track/dead404",
+                headers={"User-Agent": "SonifyTest"},
+            )
+        )
+        sc_fallback = ResolvedStream(
+            track_id="dz:progfail",
+            mode="full",
+            source="soundcloud",
+            content_type="audio/mp4",
+            local_bytes=b"\x00\x00\x00\x1cftypisom" + b"X" * 16384,
+        )
+        with mock.patch.object(monochrome, "CACHE_DIR", cache_dir), \
+             mock.patch.object(monochrome, "PACE_INTERVAL_SEC", 0.0), \
+             mock.patch.dict(monochrome._ACTIVE_DOWNLOADS, {}, clear=True), \
+             mock.patch("backend.http_client.open_stream", side_effect=urllib.error.HTTPError("https://tracks.monochrome.st/track/dead404", 404, "Not Found", {}, None)), \
+             mock.patch.object(self.srv.stream, "resolve_stream", side_effect=[self.srv.stream._cache["dz:progfail"], sc_fallback]) as m_casc:
+            with urllib.request.urlopen(f"{self.base}/api/stream/dz:progfail", timeout=5) as r_casc:
+                self.assertEqual(r_casc.status, 200)
+                self.assertEqual(r_casc.headers.get("X-Stream-Source"), "soundcloud")
+                self.assertEqual(r_casc.headers.get("X-Stream-Mode"), "full")
+                self.assertTrue(r_casc.read().startswith(b"\x00\x00\x00\x1cftypisom"))
+            self.assertIn("monochrome", m_casc.call_args[1].get("exclude_sources", set()))
 
 
 if __name__ == "__main__":

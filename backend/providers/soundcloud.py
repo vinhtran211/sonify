@@ -122,7 +122,7 @@ def get_client_id(force_refresh: bool = False) -> Optional[str]:
     return None
 
 
-def search_raw_tracks(query: str, limit: int = 15) -> List[Dict[str, Any]]:
+def search_raw_tracks(query: str, limit: int = 25) -> List[Dict[str, Any]]:
     q = (query or "").strip()
     if not q:
         return []
@@ -131,7 +131,9 @@ def search_raw_tracks(query: str, limit: int = 15) -> List[Dict[str, Any]]:
         return []
 
     for attempt in range(2):
-        params = urllib.parse.urlencode({"q": q, "client_id": cid, "limit": str(limit)})
+        params = urllib.parse.urlencode(
+            {"q": q, "client_id": cid, "limit": str(limit), "app_locale": "en"}
+        )
         url = f"{SC_API_BASE}/search/tracks?{params}"
         try:
             data = http_client.fetch_json(url, timeout=config.PROVIDER_TIMEOUT)
@@ -402,18 +404,20 @@ def _resolve_item_stream(
         data = http_client.fetch_json(full_u, timeout=config.PROVIDER_TIMEOUT)
         return str((data or {}).get("url") or "") or None
 
-    # 1. Prefer progressive direct HTTP stream (audio/mpeg) when available
+    # 1. Prefer progressive direct HTTP stream (audio/mpeg) when available (never snipped/preview)
     for tc in transcodings:
+        if tc.get("snipped") is True:
+            continue
         fmt = tc.get("format") or {}
         if fmt.get("protocol") == "progressive":
             try:
                 stream_url = _fetch_transcoding_stream_url(tc)
-                if not stream_url:
+                if not stream_url or "/preview/" in stream_url.lower():
                     continue
                 ok, _, resp_hdrs, final_url = http_client.probe_url(
                     stream_url, timeout=config.STREAM_PROBE_TIMEOUT, min_total_bytes=400_000
                 )
-                if ok:
+                if ok and "/preview/" not in final_url.lower():
                     ctype = resp_hdrs.get("content-type", "audio/mpeg").split(";")[0].strip().lower()
                     if not ctype.startswith("audio/"):
                         ctype = "audio/mpeg"
@@ -424,22 +428,31 @@ def _resolve_item_stream(
     # 2. Fall back to HLS MP3 / fMP4 (lazy m3u8 resolution during /info, assembled on playback)
     hls_candidates: List[Tuple[int, Dict[str, Any]]] = []
     for tc in transcodings:
+        if tc.get("snipped") is True:
+            continue
         fmt = tc.get("format") or {}
-        if fmt.get("protocol") == "hls":
-            mime = str(fmt.get("mime_type") or "").lower()
-            if "mpeg" in mime or "mp3" in mime:
-                pref = 3
-            elif "mp4" in mime:
-                pref = 2
-            else:
-                pref = 1
-            hls_candidates.append((pref, tc))
+        if fmt.get("protocol") != "hls":
+            continue
+        mime = str(fmt.get("mime_type") or "").lower()
+        preset = str(tc.get("preset") or "").lower()
+        # Skip adaptive bitrate master playlists (abr_sq / audio/mpegurl) which return 404 or multi-variant manifests
+        if "mpegurl" in mime or preset.startswith("abr"):
+            continue
+        if mime.startswith("audio/mpeg") or "mp3" in mime:
+            pref = 4
+        elif "mp4" in mime and "160" in preset:
+            pref = 3
+        elif "mp4" in mime:
+            pref = 2
+        else:
+            pref = 1
+        hls_candidates.append((pref, tc))
 
     hls_candidates.sort(key=lambda x: x[0], reverse=True)
     for _, tc in hls_candidates:
         try:
             m3u8_url = _fetch_transcoding_stream_url(tc)
-            if not m3u8_url or not m3u8_url.startswith("http"):
+            if not m3u8_url or not m3u8_url.startswith("http") or "/preview/" in m3u8_url.lower():
                 continue
             raw_mime = str((tc.get("format") or {}).get("mime_type") or "audio/mp4").split(";")[0].strip().lower()
             cache_key = f"sc:{sc_id}" if sc_id else ""
@@ -471,6 +484,7 @@ def find_best_stream(
     duration: int = 0,
     min_score: float = 0.60,
     assemble_now: bool = True,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Find and resolve a full-length SoundCloud stream.
 
@@ -482,29 +496,51 @@ def find_best_stream(
     """
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
-    queries: List[str] = []
+    ascii_artist = lrc_parser.normalize_key(primary_artist).strip()
+    ascii_title = lrc_parser.normalize_key(clean_title).strip()
+
+    primary_queries: List[str] = []
     for candidate_q in (
         f"{primary_artist} {clean_title}".strip(),
         f"{artist} {clean_title}".strip(),
-        clean_title.strip(),
+        f"{ascii_artist} {ascii_title}".strip(),
     ):
-        if candidate_q and candidate_q not in queries:
-            queries.append(candidate_q)
+        if candidate_q and all(candidate_q.lower() != q.lower() for q in primary_queries):
+            primary_queries.append(candidate_q)
 
-    if not queries:
+    fallback_query = (
+        clean_title.strip()
+        if len(clean_title.strip()) >= 4
+        else f"{clean_title} {primary_artist} full".strip()
+    )
+
+    if not primary_queries and not fallback_query:
         return None
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
     seen_ids: set[str] = set()
+    total_items = 0
+    snip_count = 0
+    allow_count = 0
+    queries_tried = 0
+    transcode_failures = 0
 
-    for q in queries:
-        items = search_raw_tracks(q, limit=15)
+    def _run_query(q: str) -> None:
+        nonlocal total_items, snip_count, allow_count, queries_tried
+        queries_tried += 1
+        items = search_raw_tracks(q, limit=25)
         for item in items:
             iid = str(item.get("id") or "")
             if iid and iid in seen_ids:
                 continue
             if iid:
                 seen_ids.add(iid)
+            total_items += 1
+            policy = str(item.get("policy") or "").upper()
+            if policy == "SNIP":
+                snip_count += 1
+            elif policy == "ALLOW":
+                allow_count += 1
             sc = score_candidate(
                 item,
                 clean_title=clean_title,
@@ -515,8 +551,31 @@ def find_best_stream(
             )
             if sc >= min_score:
                 scored.append((sc, item))
-        if scored:
+
+    for q in primary_queries:
+        if queries_tried >= 3 or len(scored) >= 4:
             break
+        _run_query(q)
+
+    if (
+        len(scored) < 3
+        and queries_tried < 3
+        and fallback_query
+        and all(fallback_query.lower() != q.lower() for q in primary_queries)
+    ):
+        _run_query(fallback_query)
+
+    if stats is not None:
+        stats.update(
+            {
+                "total_items": total_items,
+                "snip_count": snip_count,
+                "allow_count": allow_count,
+                "scored_count": len(scored),
+                "queries_tried": queries_tried,
+                "transcode_failures": 0,
+            }
+        )
 
     if not scored:
         return None
@@ -526,8 +585,14 @@ def find_best_stream(
     if not cid:
         return None
 
-    for _, item in scored[:2]:
+    for _, item in scored[:6]:
         resolved = _resolve_item_stream(item, cid, assemble_now=assemble_now)
         if resolved:
+            if stats is not None:
+                stats["transcode_failures"] = transcode_failures
             return resolved
+        transcode_failures += 1
+
+    if stats is not None:
+        stats["transcode_failures"] = transcode_failures
     return None

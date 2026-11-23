@@ -210,6 +210,9 @@ class TestCloudServerProcessAndRenderPackaging(unittest.TestCase):
                 self.assertEqual(health["status"], "ok")
                 self.assertTrue(health["adFree"])
                 self.assertTrue(health["dbReady"])
+                self.assertIn("cloudMode", health)
+                self.assertIn("ytDlpConfigured", health)
+                self.assertIn("renderRegion", health)
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                     hdrs = {k.lower(): v for k, v in r.headers.items()}
@@ -240,6 +243,7 @@ class TestCloudServerProcessAndRenderPackaging(unittest.TestCase):
         self.assertIn("name: sonify-music", render_yaml)
         self.assertIn("runtime: docker", render_yaml)
         self.assertIn("plan: free", render_yaml)
+        self.assertIn("region: singapore", render_yaml)
         self.assertIn("autoDeploy: true", render_yaml)
         self.assertIn("healthCheckPath: /api/health", render_yaml)
         self.assertIn("SONIFY_HOST", render_yaml)

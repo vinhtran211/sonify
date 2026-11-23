@@ -339,8 +339,22 @@ _COOKIES_B64_HASH: str = ""
 _COOKIES_FILE_PATH: Path = Path("/tmp/sonify/yt_cookies.txt")
 
 
+def has_cloud_youtube_credentials() -> bool:
+    """Return True when authenticated/proxied YouTube access is configured for cloud deployments."""
+    if os.environ.get("SONIFY_FORCE_CLOUD_YOUTUBE", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    if os.environ.get("YTDLP_COOKIES_B64", "").strip():
+        return True
+    cookies_path = os.environ.get("YTDLP_COOKIES_PATH", "").strip()
+    if cookies_path and Path(cookies_path).is_file():
+        return True
+    if os.environ.get("YTDLP_PROXY", "").strip():
+        return True
+    return False
+
+
 def _get_ytdlp_extra_args() -> List[str]:
-    """Return optional --cookies and --proxy arguments when YTDLP_COOKIES_B64 / YTDLP_PROXY are set."""
+    """Return optional --cookies and --proxy arguments when YTDLP_COOKIES_B64 / YTDLP_COOKIES_PATH / YTDLP_PROXY are set."""
     global _COOKIES_B64_HASH
     extra_args: List[str] = []
 
@@ -360,6 +374,10 @@ def _get_ytdlp_extra_args() -> List[str]:
                 extra_args.extend(["--cookies", str(_COOKIES_FILE_PATH)])
             except Exception:
                 pass
+    else:
+        cookies_path = os.environ.get("YTDLP_COOKIES_PATH", "").strip()
+        if cookies_path and Path(cookies_path).is_file():
+            extra_args.extend(["--cookies", cookies_path])
 
     proxy_val = os.environ.get("YTDLP_PROXY", "").strip()
     if proxy_val:
@@ -373,10 +391,7 @@ def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str
         return None
     # On cloud datacenter IPs without cookies or proxy, anonymous yt-dlp hits LOGIN_REQUIRED
     # and wastes 7-10s before reaching SoundCloud/JioSaavn — skip immediately unless configured.
-    if config.is_cloud_env() and not (
-        os.environ.get("YTDLP_COOKIES_B64", "").strip()
-        or os.environ.get("YTDLP_PROXY", "").strip()
-    ):
+    if config.is_cloud_env() and not has_cloud_youtube_credentials():
         return None
     try:
         cmd = [

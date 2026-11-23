@@ -119,7 +119,8 @@ export function initPlayer() {
   });
 
   audioEl.addEventListener('error', () => {
-    if (!audioEl.getAttribute('src')) return;
+    const src = audioEl.getAttribute('src') || '';
+    if (!src || !src.includes(`?s=${playbackSeq}`)) return;
     const cur = getState().currentTrack;
     if (!cur) return;
     setState({ isLoading: false, isPlaying: false, streamMode: 'error', streamSource: '' });
@@ -199,6 +200,7 @@ async function startTrackPlayback(track) {
   setState({
     streamMode: info?.streamMode || 'full',
     streamSource: info?.streamSource || '',
+    isLoading: true,
   });
 
   const streamUrl = `/api/stream/${encodeURIComponent(track.id)}?s=${seq}`;

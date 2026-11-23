@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import signal
 import sys
 import threading
@@ -15,7 +16,7 @@ from typing import Any, Dict, Optional
 
 from backend import config, http_client, offline_catalog
 from backend.db import Database
-from backend.providers import lyrics as lyrics_provider
+from backend.providers import lyrics as lyrics_provider, youtube_music
 from backend.services.catalog_service import CatalogService
 from backend.services.library_service import LibraryError, LibraryService
 from backend.services.stream_service import StreamService, StreamUnavailableError
@@ -204,6 +205,7 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                 if method != "GET":
                     self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET for /api/health")
                     return
+                cloud_mode = config.is_cloud_env()
                 self._send_json(
                     {
                         "status": "ok",
@@ -211,6 +213,9 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         "adFree": True,
                         "dbReady": self.server.db.is_ready(),
                         "ytDlpAvailable": config.has_yt_dlp(),
+                        "ytDlpConfigured": youtube_music.has_cloud_youtube_credentials(),
+                        "cloudMode": cloud_mode,
+                        "renderRegion": os.environ.get("RENDER_REGION") or ("cloud" if cloud_mode else "local"),
                         "offlineMode": http_client.is_offline_mode(),
                         "timestamp": int(time.time()),
                     }
@@ -295,7 +300,8 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     if not track_id:
                         self._send_error_json(400, "INVALID_TRACK", "Missing trackId")
                         return
-                    self._send_json(self.server.stream.get_stream_info(track_id))
+                    debug = self._qparam(qs, "debug", "0").strip().lower() in ("1", "true", "yes")
+                    self._send_json(self.server.stream.get_stream_info(track_id, debug=debug))
                     return
                 track_id = urllib.parse.unquote(rest).strip("/")
                 if not track_id:
