@@ -64,13 +64,52 @@ final class QueueLogicTests: XCTestCase {
             streamSource: "monochrome",
             contentType: "audio/x-flac",
             adFree: true,
+            hlsUrl: nil,
+            directUrl: nil,
             diagnostics: nil,
             cloudMode: true
         )
         let url = client.streamURL(for: info)
         XCTAssertEqual(url?.absoluteString, "https://sonify-music.onrender.com/api/stream/dz%3A908604612.flac")
+        XCTAssertEqual(info.preferredPlaybackRoute(proxyURL: url), url.map { .proxy($0) })
         XCTAssertEqual(StreamInfoResponse.normalizedMIME("audio/x-m4p"), "audio/mp4")
         XCTAssertEqual(StreamInfoResponse.extensionForMIME("audio/x-m4p"), ".m4a")
         XCTAssertEqual(StreamInfoResponse.extensionForMIME("video/mp4"), ".mp4")
+
+        // Verify route priority: hlsUrl > directUrl > proxy
+        let hlsInfo = StreamInfoResponse(
+            trackId: "dz:1",
+            streamUrl: "/api/stream/dz:1",
+            streamUrlWithExt: "/api/stream/dz:1.m4a",
+            streamMode: "full",
+            streamSource: "soundcloud",
+            contentType: "audio/mp4",
+            adFree: true,
+            hlsUrl: "https://playback.media-streaming.soundcloud.cloud/a.m3u8",
+            directUrl: "https://cdn.example.com/fallback.m4a",
+            diagnostics: nil,
+            cloudMode: true
+        )
+        let hlsRoute = hlsInfo.preferredPlaybackRoute(proxyURL: url)
+        XCTAssertEqual(hlsRoute?.isHLS, true)
+        XCTAssertEqual(hlsRoute?.url.absoluteString, "https://playback.media-streaming.soundcloud.cloud/a.m3u8")
+
+        let directInfo = StreamInfoResponse(
+            trackId: "js:1",
+            streamUrl: "/api/stream/js:1",
+            streamUrlWithExt: "/api/stream/js:1.m4a",
+            streamMode: "full",
+            streamSource: "jiosaavn",
+            contentType: "audio/mp4",
+            adFree: true,
+            hlsUrl: nil,
+            directUrl: "https://aac.saavncdn.com/track_320.mp4",
+            diagnostics: nil,
+            cloudMode: true
+        )
+        let directRoute = directInfo.preferredPlaybackRoute(proxyURL: url)
+        XCTAssertEqual(directRoute?.isProxy, false)
+        XCTAssertEqual(directRoute?.isHLS, false)
+        XCTAssertEqual(directRoute?.url.absoluteString, "https://aac.saavncdn.com/track_320.mp4")
     }
 }

@@ -515,6 +515,14 @@ def run_server(
         )
         print("Press Ctrl+C to stop.", flush=True)
 
+    # Pre-warm shared Home catalog in background on container boot so first page load is instant
+    if not http_client.is_offline_mode():
+        threading.Thread(
+            target=lambda: httpd.catalog.get_home("global"),
+            name="home-boot-prewarm",
+            daemon=True,
+        ).start()
+
     try:
         httpd.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

@@ -34,18 +34,23 @@ _SEARCH_NOISE_PATTERNS = [
 ]
 
 
+HOME_SWR_TTL = 3600.0          # Serve stale Home snapshot up to 1h while refreshing in background
+HOME_FETCH_DEADLINE = 3.5      # Cap Home parallel provider wait at 3.5s
+
+
 class CatalogService:
     """Aggregates live music providers with TTL caching, SQLite upsert, and offline fallback."""
 
     def __init__(self, db: Database) -> None:
         self.db = db
         self._lock = threading.Lock()
-        self._home_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._home_base_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        self._home_refreshing: bool = False
         self._search_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     def clear_caches(self) -> None:
         with self._lock:
-            self._home_cache.clear()
+            self._home_base_cache = None
             self._search_cache.clear()
 
     def _annotate_sections(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -114,39 +119,61 @@ class CatalogService:
             "sections": sections,
         }
 
-    def get_home(self, region: str = "global", refresh: bool = False) -> Dict[str, Any]:
-        region_key = "vn" if (region or "").lower() == "vn" else "global"
-        now = time.time()
+    @staticmethod
+    def _project_home_region(base_payload: Dict[str, Any], region_key: str) -> Dict[str, Any]:
+        sections = [dict(s) for s in (base_payload.get("sections") or [])]
+        if region_key == "vn":
+            vn_idx = next((i for i, s in enumerate(sections) if s.get("id") == "trending-vn"), -1)
+            if vn_idx > 0:
+                vn_sec = sections.pop(vn_idx)
+                sections.insert(0, vn_sec)
+        else:
+            gl_idx = next((i for i, s in enumerate(sections) if s.get("id") == "trending-global"), -1)
+            if gl_idx > 0:
+                gl_sec = sections.pop(gl_idx)
+                sections.insert(0, gl_sec)
+        return {
+            "mode": base_payload.get("mode", "online"),
+            "region": region_key,
+            "generatedAt": base_payload.get("generatedAt", int(time.time())),
+            "sections": sections,
+        }
 
-        if not refresh:
-            with self._lock:
-                entry = self._home_cache.get(region_key)
-                if entry and (now - entry[0]) < config.HOME_CACHE_TTL:
-                    return self._annotate_sections(entry[1])
-
-        if http_client.is_offline_mode():
-            offline_payload = self._build_offline_home(region_key)
-            return self._annotate_sections(offline_payload)
-
-        # Fetch multiple live providers concurrently
+    def _fetch_home_base(self) -> Optional[Dict[str, Any]]:
+        """Fetch live Home providers concurrently with a 3.5s deadline and store shared base cache."""
         def _safe(fn, *args, **kwargs):
             try:
                 return fn(*args, **kwargs)
             except Exception:
                 return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        try:
             f_dz_chart = pool.submit(_safe, deezer.get_chart, 20)
             f_dz_releases = pool.submit(_safe, deezer.get_new_releases, 16)
             f_vn_songs = pool.submit(_safe, apple_itunes.get_top_songs, "vn", 20)
             f_us_albums = pool.submit(_safe, apple_itunes.get_top_albums, "us", 16)
             f_audius = pool.submit(_safe, audius.get_trending, 15)
 
-            dz_chart = f_dz_chart.result() or {}
-            dz_releases = f_dz_releases.result() or []
-            vn_songs = f_vn_songs.result() or []
-            us_albums = f_us_albums.result() or []
-            audius_tracks = f_audius.result() or []
+            all_futs = [f_dz_chart, f_dz_releases, f_vn_songs, f_us_albums, f_audius]
+            concurrent.futures.wait(all_futs, timeout=HOME_FETCH_DEADLINE)
+
+            def _done_result(fut, default):
+                if fut.done():
+                    try:
+                        val = fut.result()
+                        return val if val is not None else default
+                    except Exception:
+                        return default
+                return default
+
+            dz_chart = _done_result(f_dz_chart, {})
+            dz_releases = _done_result(f_dz_releases, [])
+            vn_songs = _done_result(f_vn_songs, [])
+            us_albums = _done_result(f_us_albums, [])
+            audius_tracks = _done_result(f_audius, [])
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         global_tracks = dz_chart.get("tracks") or []
         if not global_tracks and (vn_songs or audius_tracks or us_albums):
@@ -207,10 +234,9 @@ class CatalogService:
                 if len(new_releases) >= 16:
                     break
 
-        # If every live upstream failed, switch seamlessly to offline fallback
+        # If every live upstream failed, signal offline fallback
         if not global_tracks and not vn_songs and not audius_tracks and not new_releases:
-            offline_payload = self._build_offline_home(region_key)
-            return self._annotate_sections(offline_payload)
+            return None
 
         # If Apple RSS Vietnam chart timed out while online, populate Vietnam/V-Pop via live search
         if not vn_songs:
@@ -271,18 +297,61 @@ class CatalogService:
                 }
             )
 
-        if region_key == "vn" and len(sections) >= 2 and sections[1]["id"] == "trending-vn":
-            sections[0], sections[1] = sections[1], sections[0]
-
-        payload = {
+        now = time.time()
+        base_payload = {
             "mode": "online",
-            "region": region_key,
-            "generatedAt": int(time.time()),
+            "region": "global",
+            "generatedAt": int(now),
             "sections": sections,
         }
         with self._lock:
-            self._home_cache[region_key] = (now, payload)
-        return self._annotate_sections(payload)
+            self._home_base_cache = (now, base_payload)
+        return base_payload
+
+    def _trigger_background_home_refresh(self) -> None:
+        with self._lock:
+            if self._home_refreshing:
+                return
+            self._home_refreshing = True
+
+        def _bg() -> None:
+            try:
+                if not http_client.is_offline_mode():
+                    self._fetch_home_base()
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._home_refreshing = False
+
+        threading.Thread(target=_bg, name="home-swr-refresh", daemon=True).start()
+
+    def get_home(self, region: str = "global", refresh: bool = False) -> Dict[str, Any]:
+        region_key = "vn" if (region or "").lower() == "vn" else "global"
+        now = time.time()
+
+        if http_client.is_offline_mode():
+            offline_payload = self._build_offline_home(region_key)
+            return self._annotate_sections(offline_payload)
+
+        if not refresh:
+            with self._lock:
+                entry = self._home_base_cache
+            if entry is not None:
+                age = now - entry[0]
+                if age < config.HOME_CACHE_TTL:
+                    return self._annotate_sections(self._project_home_region(entry[1], region_key))
+                if age < HOME_SWR_TTL:
+                    # Stale-while-revalidate: instant response + background refresh
+                    self._trigger_background_home_refresh()
+                    return self._annotate_sections(self._project_home_region(entry[1], region_key))
+
+        base_payload = self._fetch_home_base()
+        if base_payload is None:
+            offline_payload = self._build_offline_home(region_key)
+            return self._annotate_sections(offline_payload)
+
+        return self._annotate_sections(self._project_home_region(base_payload, region_key))
 
     def _dedup_and_rank_tracks(
         self, tracks: List[Dict[str, Any]], query: str, limit: int

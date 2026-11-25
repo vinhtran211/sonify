@@ -76,6 +76,24 @@ _CACHED_CLIENT_ID_AT: float = 0.0
 _HLS_LOCK = threading.Lock()
 _HLS_CACHE: "OrderedDict[str, Tuple[bytes, str]]" = OrderedDict()
 _MAX_HLS_CACHE_ITEMS = 8
+_HLS_KEY_LOCKS_GUARD = threading.Lock()
+_HLS_KEY_LOCKS: Dict[str, threading.Lock] = {}
+_HLS_PREWARM_ACTIVE: set[str] = set()
+
+
+def _get_hls_key_lock(cache_key: str) -> threading.Lock:
+    with _HLS_KEY_LOCKS_GUARD:
+        lock = _HLS_KEY_LOCKS.get(cache_key)
+        if lock is None:
+            if len(_HLS_KEY_LOCKS) > 128:
+                for k in list(_HLS_KEY_LOCKS.keys()):
+                    if not _HLS_KEY_LOCKS[k].locked():
+                        _HLS_KEY_LOCKS.pop(k, None)
+                        if len(_HLS_KEY_LOCKS) <= 64:
+                            break
+            lock = threading.Lock()
+            _HLS_KEY_LOCKS[cache_key] = lock
+        return lock
 
 
 def _noise_penalty(cand_text: str, target_text: str) -> float:
@@ -338,7 +356,7 @@ def parse_hls_m3u8_urls(m3u8_text: str, base_url: str = "") -> List[str]:
 def assemble_hls_segments(
     m3u8_url: str, cache_key: str = "", mime_hint: str = "audio/mp4"
 ) -> Optional[Tuple[bytes, str]]:
-    """Download an HLS audio playlist's init map + segments concurrently into a single seekable buffer."""
+    """Download an HLS audio playlist's init map + segments concurrently into a single seekable buffer (single-flight)."""
     if cache_key:
         with _HLS_LOCK:
             cached = _HLS_CACHE.get(cache_key)
@@ -346,40 +364,84 @@ def assemble_hls_segments(
                 _HLS_CACHE.move_to_end(cache_key)
                 return cached
 
-    m3u8_text = http_client.fetch_text(m3u8_url, timeout=config.PROVIDER_TIMEOUT)
-    seg_urls = parse_hls_m3u8_urls(m3u8_text, base_url=m3u8_url)
-    if not seg_urls or len(seg_urls) > 400:
-        return None
+    def _do_assemble() -> Optional[Tuple[bytes, str]]:
+        if cache_key:
+            with _HLS_LOCK:
+                cached = _HLS_CACHE.get(cache_key)
+                if cached is not None:
+                    _HLS_CACHE.move_to_end(cache_key)
+                    return cached
 
-    def _fetch_seg(idx_and_url: Tuple[int, str]) -> Tuple[int, bytes]:
-        idx, u = idx_and_url
-        _, _, raw = http_client.fetch_bytes(u, timeout=config.PROVIDER_TIMEOUT)
-        return idx, raw
+        m3u8_text = http_client.fetch_text(m3u8_url, timeout=config.PROVIDER_TIMEOUT)
+        seg_urls = parse_hls_m3u8_urls(m3u8_text, base_url=m3u8_url)
+        if not seg_urls or len(seg_urls) > 400:
+            return None
 
-    ordered: List[Optional[bytes]] = [None] * len(seg_urls)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-        futures = [pool.submit(_fetch_seg, (i, u)) for i, u in enumerate(seg_urls)]
-        for fut in concurrent.futures.as_completed(futures):
-            idx, chunk = fut.result()
-            ordered[idx] = chunk
+        def _fetch_seg(idx_and_url: Tuple[int, str]) -> Tuple[int, bytes]:
+            idx, u = idx_and_url
+            _, _, raw = http_client.fetch_bytes(u, timeout=config.PROVIDER_TIMEOUT)
+            return idx, raw
 
-    if any(c is None or len(c) == 0 for c in ordered):
-        return None
+        ordered: List[Optional[bytes]] = [None] * len(seg_urls)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            futures = [pool.submit(_fetch_seg, (i, u)) for i, u in enumerate(seg_urls)]
+            for fut in concurrent.futures.as_completed(futures):
+                idx, chunk = fut.result()
+                ordered[idx] = chunk
 
-    full_bytes = b"".join(c for c in ordered if c)
-    if len(full_bytes) < 200_000:
-        return None
+        if any(c is None or len(c) == 0 for c in ordered):
+            return None
 
-    sniffed = http_client.sniff_media_mime(full_bytes[:16], mime_hint)
-    ctype = sniffed or mime_hint or "audio/mp4"
+        full_bytes = b"".join(c for c in ordered if c)
+        if len(full_bytes) < 200_000:
+            return None
+
+        sniffed = http_client.sniff_media_mime(full_bytes[:16], mime_hint)
+        ctype = sniffed or mime_hint or "audio/mp4"
+
+        if cache_key:
+            with _HLS_LOCK:
+                _HLS_CACHE[cache_key] = (full_bytes, ctype)
+                while len(_HLS_CACHE) > _MAX_HLS_CACHE_ITEMS:
+                    _HLS_CACHE.popitem(last=False)
+
+        return full_bytes, ctype
 
     if cache_key:
-        with _HLS_LOCK:
-            _HLS_CACHE[cache_key] = (full_bytes, ctype)
-            while len(_HLS_CACHE) > _MAX_HLS_CACHE_ITEMS:
-                _HLS_CACHE.popitem(last=False)
+        with _get_hls_key_lock(cache_key):
+            return _do_assemble()
+    return _do_assemble()
 
-    return full_bytes, ctype
+
+def start_background_hls_assembly(
+    m3u8_url: str, cache_key: str, mime_hint: str = "audio/mp4"
+) -> None:
+    """Non-blocking single-flight pre-warm of SoundCloud HLS segments triggered on /info."""
+    if not m3u8_url or not cache_key:
+        return
+    with _HLS_LOCK:
+        if cache_key in _HLS_CACHE:
+            _HLS_CACHE.move_to_end(cache_key)
+            return
+    with _HLS_KEY_LOCKS_GUARD:
+        if cache_key in _HLS_PREWARM_ACTIVE:
+            return
+        _HLS_PREWARM_ACTIVE.add(cache_key)
+
+    def _worker() -> None:
+        try:
+            assemble_hls_segments(m3u8_url, cache_key=cache_key, mime_hint=mime_hint)
+        except Exception:
+            pass
+        finally:
+            with _HLS_KEY_LOCKS_GUARD:
+                _HLS_PREWARM_ACTIVE.discard(cache_key)
+
+    threading.Thread(
+        target=_worker,
+        name=f"sc-hls-{cache_key[:16]}",
+        daemon=True,
+    ).start()
 
 
 def _resolve_item_stream(

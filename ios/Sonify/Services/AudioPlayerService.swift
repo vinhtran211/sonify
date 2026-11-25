@@ -142,6 +142,11 @@ final class AudioPlayerService: ObservableObject {
     private var playbackSeq: Int = 0
     private var loadTask: Task<Void, Never>?
     private var artworkTask: Task<Void, Never>?
+    private var prefetchTask: Task<Void, Never>?
+    private var prefetchedInfo: [String: (info: StreamInfoResponse, fetchedAt: Date)] = [:]
+    private var prefetchedOrder: [String] = []
+    private var currentRoute: PlaybackRoute?
+    private var didFallbackToProxy: Bool = false
     private var timeObserverToken: Any?
     private var itemStatusObserver: NSKeyValueObservation?
     private var timeControlObserver: NSKeyValueObservation?
@@ -150,6 +155,9 @@ final class AudioPlayerService: ObservableObject {
     private var routeChangeObserver: NSObjectProtocol?
     private var wasPlayingBeforeInterruption: Bool = false
     private var cachedArtwork: MPMediaItemArtwork?
+
+    private static let prefetchTTL: TimeInterval = 600.0
+    private static let maxPrefetchedEntries: Int = 12
 
     init(api: APIClient) {
         self.api = api
@@ -271,12 +279,64 @@ final class AudioPlayerService: ObservableObject {
 
     // MARK: - Internal Stream Resolution & AVPlayer Setup
 
+    private func cachedPrefetchInfo(for trackId: String) -> StreamInfoResponse? {
+        guard let entry = prefetchedInfo[trackId] else { return nil }
+        if Date().timeIntervalSince(entry.fetchedAt) > Self.prefetchTTL {
+            prefetchedInfo.removeValue(forKey: trackId)
+            prefetchedOrder.removeAll { $0 == trackId }
+            return nil
+        }
+        return entry.info
+    }
+
+    private func storePrefetchInfo(_ info: StreamInfoResponse, for trackId: String) {
+        guard !info.isPreview else { return }
+        prefetchedInfo[trackId] = (info: info, fetchedAt: Date())
+        prefetchedOrder.removeAll { $0 == trackId }
+        prefetchedOrder.append(trackId)
+        while prefetchedOrder.count > Self.maxPrefetchedEntries {
+            let oldest = prefetchedOrder.removeFirst()
+            prefetchedInfo.removeValue(forKey: oldest)
+        }
+    }
+
+    private func scheduleNextTrackPrefetch(seq: Int) {
+        prefetchTask?.cancel()
+        guard let nextTrack = queueEngine.upcomingTracks.first else { return }
+        let nextId = nextTrack.id
+        if cachedPrefetchInfo(for: nextId) != nil { return }
+
+        prefetchTask = Task(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled, let self, seq == self.playbackSeq else { return }
+            if let info = try? await self.api.getStreamInfo(trackId: nextId) {
+                guard !Task.isCancelled else { return }
+                self.storePrefetchInfo(info, for: nextId)
+            }
+        }
+    }
+
+    private func makePlayerItem(for route: PlaybackRoute, contentType: String) -> AVPlayerItem {
+        var assetOptions: [String: Any] = [:]
+        // Never override MIME on native HLS .m3u8 playlists so AVPlayer parses the manifest natively
+        if !route.isHLS {
+            if #available(iOS 17.0, *) {
+                assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(contentType)
+            }
+        }
+        let asset = AVURLAsset(url: route.url, options: assetOptions)
+        let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 2.0
+        return item
+    }
+
     private func startPlayback(for track: Track) {
         playbackSeq += 1
         let seq = playbackSeq
 
         loadTask?.cancel()
         artworkTask?.cancel()
+        prefetchTask?.cancel()
         itemStatusObserver?.invalidate()
         itemStatusObserver = nil
 
@@ -285,6 +345,8 @@ final class AudioPlayerService: ObservableObject {
 
         currentTrack = track
         streamInfo = nil
+        currentRoute = nil
+        didFallbackToProxy = false
         currentTime = 0
         duration = Double(max(track.duration, 0))
         isPlaying = false
@@ -299,25 +361,28 @@ final class AudioPlayerService: ObservableObject {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let info = try await self.api.getStreamInfo(trackId: track.id)
+                let info: StreamInfoResponse
+                if let cached = self.cachedPrefetchInfo(for: track.id) {
+                    info = cached
+                } else {
+                    let fetched = try await self.api.getStreamInfo(trackId: track.id)
+                    self.storePrefetchInfo(fetched, for: track.id)
+                    info = fetched
+                }
                 guard !Task.isCancelled, seq == self.playbackSeq else { return }
-                guard let url = self.api.streamURL(for: info) else {
+
+                let proxyURL = self.api.streamURL(for: info)
+                guard let route = info.preferredPlaybackRoute(proxyURL: proxyURL) else {
                     self.isLoading = false
                     self.errorMessage = "Invalid audio stream URL"
                     return
                 }
 
                 self.streamInfo = info
+                self.currentRoute = route
                 self.activateAudioSession()
 
-                var assetOptions: [String: Any] = [:]
-                if #available(iOS 17.0, *) {
-                    assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(info.contentType)
-                }
-                let asset = AVURLAsset(url: url, options: assetOptions)
-                let item = AVPlayerItem(asset: asset)
-                item.preferredForwardBufferDuration = 5.0
-
+                let item = self.makePlayerItem(for: route, contentType: info.contentType)
                 self.observePlayerItem(item, seq: seq)
                 self.player.replaceCurrentItem(with: item)
                 self.player.play()
@@ -350,7 +415,25 @@ final class AudioPlayerService: ObservableObject {
                     }
                     self.isLoading = false
                     self.updateNowPlayingInfo()
+                    self.scheduleNextTrackPrefetch(seq: seq)
                 case .failed:
+                    // Automatic 1-shot fallback to backend proxy if direct edge / HLS URL failed
+                    if !self.didFallbackToProxy,
+                       let route = self.currentRoute,
+                       !route.isProxy,
+                       let info = self.streamInfo,
+                       let proxyURL = self.api.streamURL(for: info) {
+                        self.didFallbackToProxy = true
+                        let proxyRoute = PlaybackRoute.proxy(proxyURL)
+                        self.currentRoute = proxyRoute
+                        self.itemStatusObserver?.invalidate()
+                        self.itemStatusObserver = nil
+                        let fallbackItem = self.makePlayerItem(for: proxyRoute, contentType: info.contentType)
+                        self.observePlayerItem(fallbackItem, seq: seq)
+                        self.player.replaceCurrentItem(with: fallbackItem)
+                        self.player.play()
+                        return
+                    }
                     self.isLoading = false
                     self.isPlaying = false
                     let msg = observedItem.error?.localizedDescription ?? "Unable to play this track"

@@ -27,7 +27,9 @@ MAX_CACHE_FILES = 12
 MAX_CACHE_BYTES = 300 * 1024 * 1024  # 300 MiB disk cap on Render /tmp
 MIN_TRACK_BYTES = 200_000
 READY_THRESHOLD_BYTES = 65_536       # Stream headers+bytes immediately after first 64 KiB
-PACE_INTERVAL_SEC = 1.0
+PRODUCER_BULK_CHUNK_SIZE = 262_144   # 256 KiB reads after initial 64 KiB ready chunk
+PRODUCER_FLUSH_INTERVAL = 524_288    # Flush every 512 KiB for high throughput
+PACE_INTERVAL_SEC = 0.6
 
 _NOISE_KEYWORDS = (
     "remix",
@@ -226,7 +228,7 @@ def search_tracks(query: str, limit: int = 8) -> List[Dict[str, Any]]:
 
     for attempt in range(2):
         try:
-            data = http_client.fetch_json(url, timeout=10.0)
+            data = http_client.fetch_json(url, timeout=5.0)
             items = (data.get("tracks") if isinstance(data, dict) else None) or []
             return [t for t in (_normalize_track(x) for x in items if isinstance(x, dict)) if t]
         except urllib.error.HTTPError as exc:
@@ -293,51 +295,115 @@ def _read_cached_mime(clean_id: str, bin_path: Path) -> str:
     return ctype
 
 
+MAX_RESUME_ATTEMPTS = 8
+
+
+def _parse_content_range_start(content_range: str) -> Optional[int]:
+    """Extract start byte from 'bytes START-END/TOTAL', or None if absent/invalid."""
+    raw = str(content_range or "").strip()
+    if not raw.lower().startswith("bytes "):
+        return None
+    spec = raw[6:].split("/", 1)[0].strip()
+    if "-" not in spec:
+        return None
+    start_str = spec.split("-", 1)[0].strip()
+    return int(start_str) if start_str.isdigit() else None
+
+
 def _run_producer(entry: ProgressiveCacheEntry) -> None:
-    """Background producer thread: downloads tracks.monochrome.st/track/{id} once into .part -> .bin."""
+    """Background producer thread: downloads tracks.monochrome.st/track/{id} once into .part -> .bin.
+
+    Automatically resumes with HTTP Range: bytes={total_written}- if upstream closes early
+    (e.g. edge transfer cap on large 30-80 MiB Hi-Res FLAC files) and NEVER promotes a
+    truncated .part file to .bin when Content-Length is known.
+    """
     url = get_stream_url(entry.clean_id)
     hdrs = {"User-Agent": config.BROWSER_USER_AGENT}
-    backoffs = (1.5, 3.0, 4.5)
+    backoffs = (1.0, 2.0, 3.5)
     succeeded = False
 
     try:
         entry.final_path.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(4):
+        total_written = 0
+        known_total = 0
+        header_ct = "audio/flac"
+        head_bytes = bytearray()
+        sniffed_ct = "audio/flac"
+        sniffed_done = False
+        is_ready_signaled = False
+
+        initial_attempt = 0
+        resume_attempt = 0
+        zero_progress_resumes = 0
+
+        while True:
             resp = None
-            total_written = 0
+            is_resume = total_written > 0
+            range_hdr = f"bytes={total_written}-" if is_resume else None
+            written_this_leg = 0
+            leg_error = False
+
             try:
                 _pace_upstream_request()
                 status, up_headers, resp = http_client.open_stream(
                     url,
                     headers=hdrs,
-                    range_header=None,
+                    range_header=range_hdr,
                     method="GET",
                     timeout=max(45.0, float(config.STREAM_READ_TIMEOUT)),
                 )
                 if status not in (200, 206):
-                    if status == 429 and attempt < len(backoffs):
-                        time.sleep(backoffs[attempt])
-                        continue
+                    if status == 429:
+                        if not is_resume and initial_attempt < len(backoffs):
+                            time.sleep(backoffs[initial_attempt])
+                            initial_attempt += 1
+                            continue
+                        if is_resume and resume_attempt < MAX_RESUME_ATTEMPTS:
+                            time.sleep(backoffs[min(resume_attempt, len(backoffs) - 1)])
+                            resume_attempt += 1
+                            continue
                     break
 
-                raw_cl = str(up_headers.get("content-length") or "").strip()
-                known_total = int(raw_cl) if raw_cl.isdigit() and int(raw_cl) > 0 else 0
-                header_ct = up_headers.get("content-type", "audio/flac")
+                skip_bytes = 0
+                if not is_resume:
+                    raw_cl = str(up_headers.get("content-length") or "").strip()
+                    known_total = int(raw_cl) if raw_cl.isdigit() and int(raw_cl) > 0 else 0
+                    header_ct = up_headers.get("content-type", "audio/flac")
+                    with entry.cond:
+                        entry.total_size = known_total
+                        entry.bytes_written = 0
+                        entry.ready = False
+                else:
+                    if status == 206:
+                        cr_start = _parse_content_range_start(up_headers.get("content-range", ""))
+                        if cr_start is not None:
+                            if cr_start > total_written:
+                                break
+                            skip_bytes = total_written - cr_start
+                    elif status == 200:
+                        skip_bytes = total_written
 
-                with entry.cond:
-                    entry.total_size = known_total
-                    entry.bytes_written = 0
-                    entry.ready = False
+                file_mode = "r+b" if (is_resume and entry.part_path.is_file()) else "wb"
+                with entry.part_path.open(file_mode) as out_f:
+                    if file_mode == "r+b":
+                        out_f.seek(total_written)
+                        out_f.truncate(total_written)
 
-                head_bytes = bytearray()
-                sniffed_ct = "audio/flac"
-                sniffed_done = False
-
-                with entry.part_path.open("wb") as out_f:
                     while True:
-                        chunk = resp.read(config.STREAM_CHUNK_SIZE)
+                        read_size = (
+                            PRODUCER_BULK_CHUNK_SIZE
+                            if is_ready_signaled
+                            else config.STREAM_CHUNK_SIZE
+                        )
+                        chunk = resp.read(read_size)
                         if not chunk:
                             break
+                        if skip_bytes > 0:
+                            if len(chunk) <= skip_bytes:
+                                skip_bytes -= len(chunk)
+                                continue
+                            chunk = chunk[skip_bytes:]
+                            skip_bytes = 0
                         if len(head_bytes) < 16:
                             head_bytes.extend(chunk[: 16 - len(head_bytes)])
                         if not sniffed_done and (len(head_bytes) >= 12 or total_written == 0):
@@ -350,55 +416,95 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                         out_f.write(chunk)
                         out_f.flush()
                         total_written += len(chunk)
+                        written_this_leg += len(chunk)
+
+                        if not is_ready_signaled and total_written >= READY_THRESHOLD_BYTES:
+                            is_ready_signaled = True
 
                         with entry.cond:
                             entry.bytes_written = total_written
                             entry.content_type = sniffed_ct
-                            if total_written >= READY_THRESHOLD_BYTES:
+                            if is_ready_signaled:
                                 entry.ready = True
                             entry.cond.notify_all()
-
-                if total_written < MIN_TRACK_BYTES:
-                    entry.part_path.unlink(missing_ok=True)
-                    break
-
-                final_ct = http_client.sniff_media_mime(bytes(head_bytes), header_ct) or sniffed_ct
-                entry.part_path.replace(entry.final_path)
-                _MIME_CACHE[entry.clean_id] = final_ct
-                with entry.cond:
-                    entry.content_type = final_ct
-                    entry.bytes_written = total_written
-                    entry.total_size = total_written
-                    entry.ready = True
-                    entry.failed = False
-                    entry.done = True
-                    entry.cond.notify_all()
-                succeeded = True
-                _evict_lru_cache_files()
-                break
             except urllib.error.HTTPError as exc:
                 code = exc.code
                 try:
                     exc.close()
                 except Exception:
                     pass
-                entry.part_path.unlink(missing_ok=True)
-                if code == 429 and total_written == 0 and attempt < len(backoffs):
-                    time.sleep(backoffs[attempt])
+                leg_error = True
+                if not is_resume:
+                    entry.part_path.unlink(missing_ok=True)
+                    if code == 429 and initial_attempt < len(backoffs):
+                        time.sleep(backoffs[initial_attempt])
+                        initial_attempt += 1
+                        continue
+                    break
+                if code == 429 and resume_attempt < MAX_RESUME_ATTEMPTS:
+                    time.sleep(backoffs[min(resume_attempt, len(backoffs) - 1)])
+                    resume_attempt += 1
                     continue
                 break
             except Exception:
-                entry.part_path.unlink(missing_ok=True)
-                if total_written == 0 and attempt == 0:
-                    time.sleep(1.0)
-                    continue
-                break
+                leg_error = True
+                if not is_resume and total_written == 0:
+                    entry.part_path.unlink(missing_ok=True)
+                    if initial_attempt == 0:
+                        time.sleep(1.0)
+                        initial_attempt += 1
+                        continue
+                    break
+                # Mid-stream read error after partial data: try Range resume below
             finally:
                 if resp is not None:
                     try:
                         resp.close()
                     except Exception:
                         pass
+
+            # Check if download is complete
+            if known_total > 0 and total_written >= known_total:
+                break
+            if known_total == 0 and not leg_error:
+                break
+
+            # Partial transfer (early EOF or mid-stream socket error): resume with Range header
+            if total_written > 0 and known_total > 0 and total_written < known_total:
+                if written_this_leg == 0:
+                    zero_progress_resumes += 1
+                    if zero_progress_resumes >= 2:
+                        break
+                else:
+                    zero_progress_resumes = 0
+                if resume_attempt < MAX_RESUME_ATTEMPTS:
+                    resume_attempt += 1
+                    time.sleep(0.35 if not leg_error else 0.75)
+                    continue
+            break
+
+        # Strict completeness check: NEVER cache a truncated track when Content-Length is known
+        is_complete_size = (
+            total_written >= MIN_TRACK_BYTES
+            and (known_total == 0 or total_written >= known_total)
+            and entry.part_path.is_file()
+        )
+        if not is_complete_size:
+            entry.part_path.unlink(missing_ok=True)
+        else:
+            final_ct = http_client.sniff_media_mime(bytes(head_bytes), header_ct) or sniffed_ct
+            entry.part_path.replace(entry.final_path)
+            _MIME_CACHE[entry.clean_id] = final_ct
+            with entry.cond:
+                entry.content_type = final_ct
+                entry.bytes_written = total_written
+                entry.total_size = total_written
+                entry.ready = True
+                entry.failed = False
+                entry.done = True
+                entry.cond.notify_all()
+            succeeded = True
+            _evict_lru_cache_files()
     finally:
         if not succeeded:
             try:
@@ -630,9 +736,9 @@ def find_best_stream(
     ascii_q = lrc_parser.normalize_key(primary_query).strip()
     if ascii_q and ascii_q.lower() != primary_query.lower():
         queries.append(ascii_q)
-    if clean_title and len(clean_title.strip()) >= 4 and primary_artist:
+    elif clean_title and len(clean_title.strip()) >= 4 and primary_artist:
         ct_q = clean_title.strip()
-        if all(ct_q.lower() != existing.lower() for existing in queries):
+        if ct_q.lower() != primary_query.lower():
             queries.append(ct_q)
 
     scored: List[Tuple[float, Dict[str, Any]]] = []

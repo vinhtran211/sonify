@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import ssl
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +19,41 @@ try:
     import certifi  # type: ignore
 except ImportError:  # pragma: no cover
     certifi = None
+
+try:
+    import requests  # type: ignore
+    from requests.adapters import HTTPAdapter  # type: ignore
+except ImportError:  # pragma: no cover
+    requests = None
+    HTTPAdapter = None
+
+
+_POOLED_SESSION_LOCK = threading.Lock()
+_POOLED_SESSION: Any = None
+
+
+def _get_pooled_session() -> Any:
+    """Return a thread-safe Keep-Alive requests.Session if available and enabled."""
+    global _POOLED_SESSION
+    if requests is None or HTTPAdapter is None:
+        return None
+    if os.environ.get("SONIFY_USE_POOLED_HTTP", "1").strip().lower() in ("0", "false", "no"):
+        return None
+    if _POOLED_SESSION is not None:
+        return _POOLED_SESSION
+    with _POOLED_SESSION_LOCK:
+        if _POOLED_SESSION is None:
+            sess = requests.Session()
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=0)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+            if certifi is not None:
+                try:
+                    sess.verify = certifi.where()
+                except Exception:
+                    pass
+            _POOLED_SESSION = sess
+        return _POOLED_SESSION
 
 
 class OfflineModeError(OSError):
@@ -99,6 +136,29 @@ def fetch_bytes(
     if json_body is not None:
         body = json.dumps(json_body).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
+
+    sess = _get_pooled_session()
+    if sess is not None:
+        try:
+            resp = sess.request(
+                method=method,
+                url=url,
+                headers=req_headers,
+                data=body,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status = int(resp.status_code)
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            if status >= 400:
+                raise urllib.error.HTTPError(
+                    url, status, resp.reason or f"HTTP {status}", resp.headers, None
+                )
+            return status, resp_headers, resp.content
+        except urllib.error.HTTPError:
+            raise
+        except Exception as exc:
+            raise urllib.error.URLError(str(exc)) from exc
 
     req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:

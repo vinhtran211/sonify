@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 import sys
@@ -29,6 +30,9 @@ _RANGE_RE = re.compile(r"^\s*bytes=(\d*)-(\d*)\s*$", re.IGNORECASE)
 _YT_SOURCES = frozenset({"youtube-innertube", "yt-dlp", "piped", "invidious", "youtube"})
 _VALID_STREAM_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
 PREVIEW_CACHE_TTL = 12.0
+TAIL_PASSTHROUGH_GAP = 512 * 1024        # 512 KiB ahead of sequential producer
+TAIL_PASSTHROUGH_MAX_LEN = 2 * 1024 * 1024  # 2 MiB cap for direct tail/seek Range pass-through
+MONOCHROME_PARALLEL_GRACE_SEC = 2.8      # Wait up to 2.8s for studio master FLAC before instant SC fallback
 
 ALLOWED_STREAM_EXTENSIONS = frozenset(
     {".flac", ".m4a", ".mp4", ".mp3", ".wav", ".aac", ".ogg", ".webm"}
@@ -303,6 +307,7 @@ class StreamService:
         extra: Dict[str, Any],
         excluded: Set[str],
         force_refresh: bool = False,
+        store_cache: bool = True,
     ) -> Optional[ResolvedStream]:
         if "monochrome" in excluded or prefix == "mc":
             return None
@@ -318,21 +323,15 @@ class StreamService:
                 url=monochrome.get_stream_url(cached_mc_id),
                 headers={"User-Agent": config.BROWSER_USER_AGENT},
             )
-            self._store_cache(resolved)
+            if store_cache:
+                self._store_cache(resolved)
             return resolved
 
         if not title:
             return None
 
+        # Use already-cached ISRC if present in SQLite; never burn 400-600ms on a blocking deezer.get_track() call.
         isrc = str(extra.get("isrc") or "").strip().upper()
-        if not isrc and prefix == "dz" and raw_id:
-            try:
-                dz_info = deezer.get_track(raw_id)
-                if dz_info:
-                    self.db.upsert_track(dz_info)
-                    isrc = str((dz_info.get("_extra") or {}).get("isrc") or "").strip().upper()
-            except Exception:
-                pass
 
         try:
             mc_match = monochrome.find_best_stream(
@@ -353,7 +352,8 @@ class StreamService:
                     url=stream_url,
                     headers={"User-Agent": config.BROWSER_USER_AGENT},
                 )
-                self._store_cache(resolved)
+                if store_cache:
+                    self._store_cache(resolved)
                 return resolved
         except Exception:
             pass
@@ -457,6 +457,7 @@ class StreamService:
         duration: int,
         excluded: Set[str],
         attempts: List[Dict[str, Any]],
+        store_cache: bool = True,
     ) -> Optional[ResolvedStream]:
         if not title or "soundcloud" in excluded:
             return None
@@ -514,7 +515,8 @@ class StreamService:
                         headers={"User-Agent": config.BROWSER_USER_AGENT},
                         diagnostics=list(attempts),
                     )
-                self._store_cache(resolved)
+                if store_cache:
+                    self._store_cache(resolved)
                 return resolved
 
             outcome = (
@@ -711,49 +713,154 @@ class StreamService:
         # ------------------------------------------------------------------
         # Environment-Aware Primary Full-Track Waterfall:
         # - On Cloud (Render/AWS datacenter IP):
-        #     Monochrome -> [YouTube ONLY when YTDLP_COOKIES_B64/PATH/PROXY set]
-        #     -> SoundCloud -> JioSaavn -> Audius -> Preview
+        #     * Fast-path cached monochromeTrackId (0ms)
+        #     * When no YouTube credentials: parallel race Monochrome + SoundCloud
+        #       (Monochrome studio master gets 2.8s priority grace; instant SoundCloud win on miss!)
+        #       -> JioSaavn -> Audius -> Preview
+        #     * When YouTube credentials set: Monochrome -> YouTube -> SoundCloud -> JioSaavn -> Audius -> Preview
         # - On Local / Residential IP:
         #     YouTube ANDROID itag=18 -> Monochrome -> JioSaavn -> SoundCloud -> Audius -> Preview
         # ------------------------------------------------------------------
         if config.is_cloud_env():
-            # Tier 1 (Cloud): Monochrome Lossless FLAC (progressive <1s TTFB cache)
-            if "monochrome" not in excluded and prefix != "mc":
-                t0 = time.monotonic()
+            mc_allowed = "monochrome" not in excluded and prefix != "mc"
+            sc_allowed = bool(title) and "soundcloud" not in excluded
+            has_yt_creds = youtube_music.has_cloud_youtube_credentials()
+
+            # Zero-probe cached monochromeTrackId fast-path (0 network calls, 0ms)
+            cached_mc_id = str(extra.get("monochromeTrackId") or "").strip()
+            if mc_allowed and cached_mc_id and not force_refresh:
                 mc_resolved = self._try_resolve_monochrome(
-                    track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
+                    track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=False
                 )
-                ms = int((time.monotonic() - t0) * 1000)
                 if mc_resolved:
-                    attempts.append({"provider": "monochrome", "outcome": "ok", "ms": ms})
+                    attempts.append({"provider": "monochrome", "outcome": "ok", "ms": 0, "detail": "cached_id"})
                     mc_resolved.diagnostics = list(attempts)
                     return mc_resolved
-                attempts.append({"provider": "monochrome", "outcome": "no_match", "ms": ms})
 
-            # Tier 2 (Cloud): YouTube ONLY when authenticated/proxied credentials are configured
-            if not yt_excluded and prefix != "yt":
-                if youtube_music.has_cloud_youtube_credentials():
-                    t0 = time.monotonic()
-                    yt_resolved = self._try_resolve_youtube(
-                        track_id, prefix, track, title, artist, duration, extra, excluded
-                    )
-                    ms = int((time.monotonic() - t0) * 1000)
-                    if yt_resolved:
-                        attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
-                        yt_resolved.diagnostics = list(attempts)
-                        return yt_resolved
-                    attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
-                else:
+            if mc_allowed and sc_allowed and not has_yt_creds:
+                # Parallel race: Monochrome + SoundCloud concurrently (eliminates 2.6-4.2s serial miss tax!)
+                if not yt_excluded and prefix != "yt":
                     attempts.append(
                         {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
                     )
 
-            # Tier 3 (Cloud): SoundCloud Public API v2 (promoted ahead of JioSaavn on cloud)
-            sc_resolved = self._try_resolve_soundcloud(
-                track_id, title, artist, duration, excluded, attempts
-            )
-            if sc_resolved:
-                return sc_resolved
+                def _race_mc():
+                    t_start = time.monotonic()
+                    res = self._try_resolve_monochrome(
+                        track_id, prefix, raw_id, track, title, artist, duration, extra, excluded,
+                        force_refresh=force_refresh, store_cache=False,
+                    )
+                    return res, int((time.monotonic() - t_start) * 1000)
+
+                def _race_sc():
+                    t_start = time.monotonic()
+                    local_attempts: List[Dict[str, Any]] = []
+                    res = self._try_resolve_soundcloud(
+                        track_id, title, artist, duration, excluded, local_attempts, store_cache=False
+                    )
+                    return res, int((time.monotonic() - t_start) * 1000), local_attempts
+
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+                f_mc = pool.submit(_race_mc)
+                f_sc = pool.submit(_race_sc)
+                try:
+                    mc_res: Optional[ResolvedStream] = None
+                    mc_ms = 0
+                    mc_timed_out = False
+                    try:
+                        mc_res, mc_ms = f_mc.result(timeout=MONOCHROME_PARALLEL_GRACE_SEC)
+                    except concurrent.futures.TimeoutError:
+                        mc_timed_out = True
+                        mc_ms = int(MONOCHROME_PARALLEL_GRACE_SEC * 1000)
+                    except Exception:
+                        mc_res = None
+
+                    if mc_res is not None:
+                        attempts.append(
+                            {"provider": "monochrome", "outcome": "ok", "ms": mc_ms, "parallel": True}
+                        )
+                        mc_res.diagnostics = list(attempts)
+                        self._store_cache(mc_res)
+                        return mc_res
+
+                    attempts.append(
+                        {
+                            "provider": "monochrome",
+                            "outcome": "timeout" if mc_timed_out else "no_match",
+                            "ms": mc_ms,
+                            "parallel": True,
+                        }
+                    )
+
+                    # SoundCloud has already been running in parallel — take its result immediately!
+                    sc_res: Optional[ResolvedStream] = None
+                    sc_local_attempts: List[Dict[str, Any]] = []
+                    try:
+                        sc_res, _, sc_local_attempts = f_sc.result(timeout=8.0)
+                    except Exception:
+                        sc_res = None
+
+                    for entry in sc_local_attempts:
+                        entry["parallel"] = True
+                        attempts.append(entry)
+
+                    if sc_res is not None:
+                        sc_res.diagnostics = list(attempts)
+                        self._store_cache(sc_res)
+                        return sc_res
+
+                    # If Monochrome only timed out (and SoundCloud missed), give Monochrome one last quick check if done
+                    if mc_timed_out and f_mc.done():
+                        try:
+                            late_mc, late_ms = f_mc.result(timeout=0.1)
+                            if late_mc is not None:
+                                attempts.append(
+                                    {"provider": "monochrome", "outcome": "ok", "ms": late_ms, "parallel": True}
+                                )
+                                late_mc.diagnostics = list(attempts)
+                                self._store_cache(late_mc)
+                                return late_mc
+                        except Exception:
+                            pass
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                # Serial cloud path (when YouTube creds are enabled, or one of Monochrome/SoundCloud is excluded)
+                if mc_allowed:
+                    t0 = time.monotonic()
+                    mc_resolved = self._try_resolve_monochrome(
+                        track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=force_refresh
+                    )
+                    ms = int((time.monotonic() - t0) * 1000)
+                    if mc_resolved:
+                        attempts.append({"provider": "monochrome", "outcome": "ok", "ms": ms})
+                        mc_resolved.diagnostics = list(attempts)
+                        return mc_resolved
+                    attempts.append({"provider": "monochrome", "outcome": "no_match", "ms": ms})
+
+                if not yt_excluded and prefix != "yt":
+                    if has_yt_creds:
+                        t0 = time.monotonic()
+                        yt_resolved = self._try_resolve_youtube(
+                            track_id, prefix, track, title, artist, duration, extra, excluded
+                        )
+                        ms = int((time.monotonic() - t0) * 1000)
+                        if yt_resolved:
+                            attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
+                            yt_resolved.diagnostics = list(attempts)
+                            return yt_resolved
+                        attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
+                    else:
+                        attempts.append(
+                            {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
+                        )
+
+                if sc_allowed:
+                    sc_resolved = self._try_resolve_soundcloud(
+                        track_id, title, artist, duration, excluded, attempts
+                    )
+                    if sc_resolved:
+                        return sc_resolved
 
             # Tier 4 (Cloud): JioSaavn 320kbps
             js_resolved = self._try_resolve_jiosaavn(
@@ -907,16 +1014,28 @@ class StreamService:
 
     def get_stream_info(self, track_id: str, debug: bool = False) -> Dict[str, Any]:
         resolved = self.resolve_stream(track_id)
-        # Proactive non-blocking pre-warm for Monochrome tracks so the first 64 KB
-        # is already on disk before the browser fires GET /api/stream/{track_id}.
+        norm_mime = normalize_stream_mime(resolved.content_type)
+        ext = mime_to_extension(norm_mime)
+
+        # Proactive non-blocking pre-warm for Monochrome & SoundCloud HLS tracks so
+        # audio is already warming on disk/memory before the browser requests /api/stream/{id}.
         mc_id = _extract_monochrome_id(resolved)
         if mc_id:
             try:
                 monochrome.start_background_cache(mc_id)
             except Exception:
                 pass
-        norm_mime = normalize_stream_mime(resolved.content_type)
-        ext = mime_to_extension(norm_mime)
+
+        sc_m3u8 = resolved.headers.get("X-SC-M3U8") if resolved.source == "soundcloud" else None
+        if sc_m3u8:
+            cache_key = resolved.headers.get("X-SC-Cache-Key") or f"sc:{track_id}"
+            try:
+                soundcloud.start_background_hls_assembly(
+                    sc_m3u8, cache_key=cache_key, mime_hint=norm_mime
+                )
+            except Exception:
+                pass
+
         payload: Dict[str, Any] = {
             "trackId": track_id,
             "streamUrl": f"/api/stream/{track_id}",
@@ -926,6 +1045,16 @@ class StreamService:
             "contentType": norm_mime,
             "adFree": True,
         }
+
+        # Expose IP-agnostic direct edge CDN URLs for fast client playback (NEVER Monochrome or YouTube)
+        if sc_m3u8 and sc_m3u8.startswith("https://"):
+            payload["hlsUrl"] = sc_m3u8
+        elif (
+            resolved.source in ("jiosaavn", "audius", "deezer-preview", "itunes-preview")
+            or (resolved.source == "soundcloud" and not sc_m3u8)
+        ) and resolved.url.startswith("https://"):
+            payload["directUrl"] = resolved.url
+
         if debug:
             payload["diagnostics"] = list(resolved.diagnostics)
             payload["cloudMode"] = config.is_cloud_env()
@@ -1100,6 +1229,65 @@ class StreamService:
             handler.send_header("Content-Length", "0")
             handler.end_headers()
             return True
+
+        # Speedup 1: Direct upstream Range pass-through for small tail / far-seek metadata probes
+        # (eliminates 13-35s stalls waiting for full 25-82 MB sequential FLAC download!).
+        if not head_only and byte_range is not None:
+            start, end = byte_range
+            length = end - start + 1
+            if (
+                start > handle.bytes_written + TAIL_PASSTHROUGH_GAP
+                and length <= TAIL_PASSTHROUGH_MAX_LEN
+            ):
+                tail_resp = None
+                tail_headers_sent = False
+                try:
+                    t_status, _, tail_resp = http_client.open_stream(
+                        monochrome.get_stream_url(mc_id),
+                        headers={"User-Agent": config.BROWSER_USER_AGENT},
+                        range_header=f"bytes={start}-{end}",
+                        method="GET",
+                        timeout=8.0,
+                    )
+                    if t_status == 206:
+                        first_chunk = tail_resp.read(min(config.STREAM_CHUNK_SIZE, length))
+                        if first_chunk:
+                            handler.send_response(206)
+                            self._send_common_stream_headers(handler, resolved)
+                            handler.send_header("Content-Range", f"bytes {start}-{end}/{known_total}")
+                            handler.send_header("Content-Length", str(length))
+                            handler.end_headers()
+                            tail_headers_sent = True
+                            handler.wfile.write(first_chunk)
+                            rem = length - len(first_chunk)
+                            while rem > 0:
+                                buf = tail_resp.read(min(config.STREAM_CHUNK_SIZE, rem))
+                                if not buf:
+                                    break
+                                handler.wfile.write(buf)
+                                rem -= len(buf)
+                            return True
+                except urllib.error.HTTPError as exc:
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                    if tail_headers_sent:
+                        return True
+                    # Upstream 429/non-206 before headers -> fall back cleanly to cond.wait() below
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    if tail_headers_sent:
+                        return True
+                except Exception:
+                    if tail_headers_sent:
+                        return True
+                    # Upstream timeout/error before headers -> fall back cleanly to cond.wait() below
+                finally:
+                    if tail_resp is not None:
+                        try:
+                            tail_resp.close()
+                        except Exception:
+                            pass
 
         if byte_range is not None:
             start, end = byte_range

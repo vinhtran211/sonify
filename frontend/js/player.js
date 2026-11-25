@@ -10,6 +10,71 @@ let infoController = null;
 let playbackSeq = 0;
 let lastHistoryTrackId = null;
 let lastHistoryTime = 0;
+let activeProxyUrl = '';
+let activeUsingDirect = false;
+let didFallbackToProxy = false;
+let prefetchTimer = null;
+const PREFETCH_INFO_TTL_MS = 10 * 60 * 1000;
+const prefetchedInfoCache = new Map();
+
+function getCachedStreamInfo(trackId) {
+  const entry = prefetchedInfoCache.get(trackId);
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > PREFETCH_INFO_TTL_MS) {
+    prefetchedInfoCache.delete(trackId);
+    return null;
+  }
+  return entry.info;
+}
+
+function setCachedStreamInfo(trackId, info) {
+  if (!trackId || !info || info.streamMode === 'preview') return;
+  if (prefetchedInfoCache.size >= 12) {
+    const oldestKey = prefetchedInfoCache.keys().next().value;
+    if (oldestKey) prefetchedInfoCache.delete(oldestKey);
+  }
+  prefetchedInfoCache.set(trackId, { info, fetchedAt: Date.now() });
+}
+
+function peekNextTrackForPrefetch() {
+  const st = getState();
+  if (Array.isArray(st.userQueue) && st.userQueue.length > 0) {
+    return st.userQueue[0];
+  }
+  if (!st.shuffle && Array.isArray(st.queue) && st.queueIndex >= 0 && st.queueIndex + 1 < st.queue.length) {
+    return st.queue[st.queueIndex + 1];
+  }
+  return null;
+}
+
+function scheduleNextTrackPrefetch(seq) {
+  clearTimeout(prefetchTimer);
+  prefetchTimer = setTimeout(() => {
+    if (seq !== playbackSeq) return;
+    const nextTrack = peekNextTrackForPrefetch();
+    if (!nextTrack || !nextTrack.id || getCachedStreamInfo(nextTrack.id)) return;
+    api
+      .getStreamInfo(nextTrack.id)
+      .then((info) => {
+        if (info) setCachedStreamInfo(nextTrack.id, info);
+      })
+      .catch(() => {});
+  }, 2000);
+}
+
+function attemptProxyFallback(seq) {
+  if (!audioEl || !activeUsingDirect || didFallbackToProxy || !activeProxyUrl || seq !== playbackSeq) {
+    return false;
+  }
+  didFallbackToProxy = true;
+  activeUsingDirect = false;
+  setState({ isLoading: true });
+  audioEl.src = activeProxyUrl;
+  audioEl.currentTime = 0;
+  syncAudioSettings();
+  audioEl.play().catch(() => {});
+  return true;
+}
 
 function updateMediaSession(track) {
   if (!('mediaSession' in navigator) || !track) return;
@@ -63,6 +128,10 @@ export function initPlayer() {
     if ('mediaSession' in navigator) {
       navigator.mediaSession.playbackState = 'playing';
     }
+  });
+
+  audioEl.addEventListener('playing', () => {
+    scheduleNextTrackPrefetch(playbackSeq);
   });
 
   audioEl.addEventListener('pause', () => {
@@ -120,7 +189,10 @@ export function initPlayer() {
 
   audioEl.addEventListener('error', () => {
     const src = audioEl.getAttribute('src') || '';
-    if (!src || !src.includes(`?s=${playbackSeq}`)) return;
+    if (!src) return;
+    const isCurrentProxy = src.includes(`?s=${playbackSeq}`);
+    if (!isCurrentProxy && !activeUsingDirect) return;
+    if (attemptProxyFallback(playbackSeq)) return;
     const cur = getState().currentTrack;
     if (!cur) return;
     setState({ isLoading: false, isPlaying: false, streamMode: 'error', streamSource: '' });
@@ -150,6 +222,10 @@ async function startTrackPlayback(track) {
   if (!track || !track.id || !audioEl) return;
 
   const seq = ++playbackSeq;
+  clearTimeout(prefetchTimer);
+  activeProxyUrl = '';
+  activeUsingDirect = false;
+  didFallbackToProxy = false;
   if (infoController) infoController.abort();
   infoController = new AbortController();
   const signal = infoController.signal;
@@ -172,25 +248,27 @@ async function startTrackPlayback(track) {
 
   updateMediaSession(track);
 
-  // Resolve and verify stream metadata FIRST so single-flight cache warms cleanly
-  // and the UI badge always matches the real audio stream served by /api/stream/{id}.
-  let info;
-  try {
-    info = await api.getStreamInfo(track.id, signal);
-  } catch (err) {
-    if (err.name === 'AbortError' || seq !== playbackSeq) return;
-    setState({
-      isPlaying: false,
-      isLoading: false,
-      streamMode: 'error',
-      streamSource: '',
-    });
-    showToast(
-      err.message || `Could not stream "${track.title}" right now — try another result`,
-      'error',
-      3600
-    );
-    return;
+  // Resolve and verify stream metadata FIRST (or use instant prefetched info cache)
+  let info = getCachedStreamInfo(track.id);
+  if (!info) {
+    try {
+      info = await api.getStreamInfo(track.id, signal);
+      if (info) setCachedStreamInfo(track.id, info);
+    } catch (err) {
+      if (err.name === 'AbortError' || seq !== playbackSeq) return;
+      setState({
+        isPlaying: false,
+        isLoading: false,
+        streamMode: 'error',
+        streamSource: '',
+      });
+      showToast(
+        err.message || `Could not stream "${track.title}" right now — try another result`,
+        'error',
+        3600
+      );
+      return;
+    }
   }
 
   if (seq !== playbackSeq || signal.aborted || getState().currentTrack?.id !== track.id) {
@@ -203,8 +281,22 @@ async function startTrackPlayback(track) {
     isLoading: true,
   });
 
-  const streamUrl = `/api/stream/${encodeURIComponent(track.id)}?s=${seq}`;
-  audioEl.src = streamUrl;
+  const proxyUrl = `/api/stream/${encodeURIComponent(track.id)}?s=${seq}`;
+  activeProxyUrl = proxyUrl;
+
+  // Prefer IP-agnostic edge CDN (Safari native HLS or direct JioSaavn/Audius/SC progressive)
+  // with automatic 1-shot silent fallback to our backend proxy on error.
+  let chosenUrl = proxyUrl;
+  const canPlayNativeHls = Boolean(audioEl.canPlayType && audioEl.canPlayType('application/vnd.apple.mpegurl'));
+  if (info?.hlsUrl && canPlayNativeHls) {
+    chosenUrl = info.hlsUrl;
+    activeUsingDirect = true;
+  } else if (info?.directUrl) {
+    chosenUrl = info.directUrl;
+    activeUsingDirect = true;
+  }
+
+  audioEl.src = chosenUrl;
   audioEl.currentTime = 0;
   syncAudioSettings();
   recordPlay(track);
@@ -218,6 +310,7 @@ async function startTrackPlayback(track) {
       setState({ isPlaying: false, isLoading: false });
       return;
     }
+    if (attemptProxyFallback(seq)) return;
     setState({
       isPlaying: false,
       isLoading: false,

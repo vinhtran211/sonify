@@ -29,6 +29,29 @@ struct StreamDiagnostic: Decodable, Equatable {
     let detail: String?
 }
 
+enum PlaybackRoute: Equatable {
+    case hls(URL)
+    case direct(URL)
+    case proxy(URL)
+
+    var url: URL {
+        switch self {
+        case .hls(let u), .direct(let u), .proxy(let u):
+            return u
+        }
+    }
+
+    var isProxy: Bool {
+        if case .proxy = self { return true }
+        return false
+    }
+
+    var isHLS: Bool {
+        if case .hls = self { return true }
+        return false
+    }
+}
+
 struct StreamInfoResponse: Decodable, Equatable {
     let trackId: String
     let streamUrl: String
@@ -37,6 +60,8 @@ struct StreamInfoResponse: Decodable, Equatable {
     let streamSource: String
     let contentType: String
     let adFree: Bool
+    let hlsUrl: String?
+    let directUrl: String?
     let diagnostics: [StreamDiagnostic]?
     let cloudMode: Bool?
 
@@ -70,6 +95,24 @@ struct StreamInfoResponse: Decodable, Equatable {
             return streamUrl
         }
         return streamUrl + ext
+    }
+
+    /// Selects the fastest playback route: native edge HLS -> direct IP-agnostic CDN -> backend proxy.
+    func preferredPlaybackRoute(proxyURL: URL?) -> PlaybackRoute? {
+        if let rawHls = hlsUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           rawHls.lowercased().hasPrefix("https://"),
+           let u = URL(string: rawHls) {
+            return .hls(u)
+        }
+        if let rawDirect = directUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           rawDirect.lowercased().hasPrefix("https://"),
+           let u = URL(string: rawDirect) {
+            return .direct(u)
+        }
+        if let proxyURL {
+            return .proxy(proxyURL)
+        }
+        return nil
     }
 
     static func normalizedMIME(_ contentType: String) -> String {

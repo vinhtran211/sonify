@@ -119,6 +119,39 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertTrue(info.isFullTrack)
         XCTAssertEqual(info.qualityBadgeLabel, "Lossless FLAC")
         XCTAssertEqual(info.resolvedRelativeStreamPath(), "/api/stream/dz:908604612.flac")
+        XCTAssertNil(info.hlsUrl)
+        XCTAssertNil(info.directUrl)
+
+        let scStreamJson = """
+        {
+          "trackId": "dz:4045817471",
+          "streamUrl": "/api/stream/dz:4045817471",
+          "streamUrlWithExt": "/api/stream/dz:4045817471.m4a",
+          "streamMode": "full",
+          "streamSource": "soundcloud",
+          "contentType": "audio/mp4",
+          "adFree": true,
+          "hlsUrl": "https://playback.media-streaming.soundcloud.cloud/playlist.m3u8"
+        }
+        """
+        let scInfo = try decoder.decode(StreamInfoResponse.self, from: Data(scStreamJson.utf8))
+        XCTAssertEqual(scInfo.hlsUrl, "https://playback.media-streaming.soundcloud.cloud/playlist.m3u8")
+        XCTAssertNil(scInfo.directUrl)
+
+        let jsStreamJson = """
+        {
+          "trackId": "js:123",
+          "streamUrl": "/api/stream/js:123",
+          "streamUrlWithExt": "/api/stream/js:123.m4a",
+          "streamMode": "full",
+          "streamSource": "jiosaavn",
+          "contentType": "audio/mp4",
+          "adFree": true,
+          "directUrl": "https://aac.saavncdn.com/track_320.mp4"
+        }
+        """
+        let jsInfo = try decoder.decode(StreamInfoResponse.self, from: Data(jsStreamJson.utf8))
+        XCTAssertEqual(jsInfo.directUrl, "https://aac.saavncdn.com/track_320.mp4")
 
         let lyricsJson = """
         {
