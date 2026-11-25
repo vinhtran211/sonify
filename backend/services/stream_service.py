@@ -273,27 +273,40 @@ class StreamService:
         track_id: str,
         force_refresh: bool = False,
         exclude_sources: Optional[Iterable[str]] = None,
+        quality: str = "auto",
     ) -> ResolvedStream:
         excluded: Set[str] = set(exclude_sources or ())
+        qual = (quality or "auto").strip().lower()
+        if qual not in ("auto", "lossless", "fast"):
+            qual = "auto"
+        cache_key = track_id if qual == "auto" else f"{track_id}::{qual}"
         now = time.time()
 
         if not force_refresh and not excluded:
             with self._cache_lock:
-                cached = self._get_valid_cached(track_id, now)
+                cached = self._get_valid_cached(cache_key, now)
                 if cached:
                     return cached
 
         # Single-flight per track_id so concurrent /info + /stream share one resolution
-        track_lock = self._get_track_lock(track_id)
+        track_lock = self._get_track_lock(cache_key)
         with track_lock:
             now = time.time()
             if not force_refresh and not excluded:
                 with self._cache_lock:
-                    cached = self._get_valid_cached(track_id, now)
+                    cached = self._get_valid_cached(cache_key, now)
                     if cached:
                         return cached
 
-            return self._resolve_stream_unlocked(track_id, excluded, force_refresh=force_refresh)
+            resolved = self._resolve_stream_unlocked(
+                track_id, excluded, force_refresh=force_refresh, quality=qual
+            )
+            if qual != "auto":
+                # Store under both quality key and default track_id so subsequent /api/stream/{id}
+                # serves the exact quality-selected stream cleanly.
+                self._store_cache(resolved, cache_key=cache_key)
+                self._store_cache(resolved, cache_key=track_id)
+            return resolved
 
     def _try_resolve_monochrome(
         self,
@@ -598,7 +611,11 @@ class StreamService:
             pass
 
     def _resolve_stream_unlocked(
-        self, track_id: str, excluded: Set[str], force_refresh: bool = False
+        self,
+        track_id: str,
+        excluded: Set[str],
+        force_refresh: bool = False,
+        quality: str = "auto",
     ) -> ResolvedStream:
         prefix, _, raw_id = track_id.partition(":")
         track = self._load_track_metadata(track_id)
@@ -726,9 +743,9 @@ class StreamService:
             sc_allowed = bool(title) and "soundcloud" not in excluded
             has_yt_creds = youtube_music.has_cloud_youtube_credentials()
 
-            # Zero-probe cached monochromeTrackId fast-path (0 network calls, 0ms)
+            # Zero-probe cached monochromeTrackId fast-path (0 network calls, 0ms) — skip when quality=="fast"
             cached_mc_id = str(extra.get("monochromeTrackId") or "").strip()
-            if mc_allowed and cached_mc_id and not force_refresh:
+            if mc_allowed and cached_mc_id and not force_refresh and quality != "fast":
                 mc_resolved = self._try_resolve_monochrome(
                     track_id, prefix, raw_id, track, title, artist, duration, extra, excluded, force_refresh=False
                 )
@@ -764,64 +781,98 @@ class StreamService:
                 f_mc = pool.submit(_race_mc)
                 f_sc = pool.submit(_race_sc)
                 try:
-                    mc_res: Optional[ResolvedStream] = None
-                    mc_ms = 0
-                    mc_timed_out = False
-                    try:
-                        mc_res, mc_ms = f_mc.result(timeout=MONOCHROME_PARALLEL_GRACE_SEC)
-                    except concurrent.futures.TimeoutError:
-                        mc_timed_out = True
-                        mc_ms = int(MONOCHROME_PARALLEL_GRACE_SEC * 1000)
-                    except Exception:
-                        mc_res = None
-
-                    if mc_res is not None:
-                        attempts.append(
-                            {"provider": "monochrome", "outcome": "ok", "ms": mc_ms, "parallel": True}
-                        )
-                        mc_res.diagnostics = list(attempts)
-                        self._store_cache(mc_res)
-                        return mc_res
-
-                    attempts.append(
-                        {
-                            "provider": "monochrome",
-                            "outcome": "timeout" if mc_timed_out else "no_match",
-                            "ms": mc_ms,
-                            "parallel": True,
-                        }
-                    )
-
-                    # SoundCloud has already been running in parallel — take its result immediately!
-                    sc_res: Optional[ResolvedStream] = None
-                    sc_local_attempts: List[Dict[str, Any]] = []
-                    try:
-                        sc_res, _, sc_local_attempts = f_sc.result(timeout=8.0)
-                    except Exception:
-                        sc_res = None
-
-                    for entry in sc_local_attempts:
-                        entry["parallel"] = True
-                        attempts.append(entry)
-
-                    if sc_res is not None:
-                        sc_res.diagnostics = list(attempts)
-                        self._store_cache(sc_res)
-                        return sc_res
-
-                    # If Monochrome only timed out (and SoundCloud missed), give Monochrome one last quick check if done
-                    if mc_timed_out and f_mc.done():
+                    if quality == "fast":
+                        # Fast Standard preference: take SoundCloud compact stream immediately when it matches
+                        sc_res: Optional[ResolvedStream] = None
+                        sc_local_attempts: List[Dict[str, Any]] = []
                         try:
-                            late_mc, late_ms = f_mc.result(timeout=0.1)
-                            if late_mc is not None:
-                                attempts.append(
-                                    {"provider": "monochrome", "outcome": "ok", "ms": late_ms, "parallel": True}
-                                )
-                                late_mc.diagnostics = list(attempts)
-                                self._store_cache(late_mc)
-                                return late_mc
+                            sc_res, _, sc_local_attempts = f_sc.result(timeout=3.5)
                         except Exception:
-                            pass
+                            sc_res = None
+                        for entry in sc_local_attempts:
+                            entry["parallel"] = True
+                            attempts.append(entry)
+                        if sc_res is not None:
+                            sc_res.diagnostics = list(attempts)
+                            self._store_cache(sc_res)
+                            return sc_res
+
+                        mc_res_fast: Optional[ResolvedStream] = None
+                        mc_fast_ms = 0
+                        try:
+                            mc_res_fast, mc_fast_ms = f_mc.result(timeout=4.0)
+                        except Exception:
+                            mc_res_fast = None
+                        if mc_res_fast is not None:
+                            attempts.append(
+                                {"provider": "monochrome", "outcome": "ok", "ms": mc_fast_ms, "parallel": True}
+                            )
+                            mc_res_fast.diagnostics = list(attempts)
+                            self._store_cache(mc_res_fast)
+                            return mc_res_fast
+                        attempts.append(
+                            {"provider": "monochrome", "outcome": "no_match", "ms": mc_fast_ms, "parallel": True}
+                        )
+                    else:
+                        mc_grace = 4.5 if quality == "lossless" else MONOCHROME_PARALLEL_GRACE_SEC
+                        mc_res: Optional[ResolvedStream] = None
+                        mc_ms = 0
+                        mc_timed_out = False
+                        try:
+                            mc_res, mc_ms = f_mc.result(timeout=mc_grace)
+                        except concurrent.futures.TimeoutError:
+                            mc_timed_out = True
+                            mc_ms = int(mc_grace * 1000)
+                        except Exception:
+                            mc_res = None
+
+                        if mc_res is not None:
+                            attempts.append(
+                                {"provider": "monochrome", "outcome": "ok", "ms": mc_ms, "parallel": True}
+                            )
+                            mc_res.diagnostics = list(attempts)
+                            self._store_cache(mc_res)
+                            return mc_res
+
+                        attempts.append(
+                            {
+                                "provider": "monochrome",
+                                "outcome": "timeout" if mc_timed_out else "no_match",
+                                "ms": mc_ms,
+                                "parallel": True,
+                            }
+                        )
+
+                        # SoundCloud has already been running in parallel — take its result immediately!
+                        sc_res = None
+                        sc_local_attempts = []
+                        try:
+                            sc_res, _, sc_local_attempts = f_sc.result(timeout=8.0)
+                        except Exception:
+                            sc_res = None
+
+                        for entry in sc_local_attempts:
+                            entry["parallel"] = True
+                            attempts.append(entry)
+
+                        if sc_res is not None:
+                            sc_res.diagnostics = list(attempts)
+                            self._store_cache(sc_res)
+                            return sc_res
+
+                        # If Monochrome only timed out (and SoundCloud missed), give Monochrome one last quick check if done
+                        if mc_timed_out and f_mc.done():
+                            try:
+                                late_mc, late_ms = f_mc.result(timeout=0.1)
+                                if late_mc is not None:
+                                    attempts.append(
+                                        {"provider": "monochrome", "outcome": "ok", "ms": late_ms, "parallel": True}
+                                    )
+                                    late_mc.diagnostics = list(attempts)
+                                    self._store_cache(late_mc)
+                                    return late_mc
+                            except Exception:
+                                pass
                 finally:
                     pool.shutdown(wait=False, cancel_futures=True)
             else:
@@ -997,11 +1048,12 @@ class StreamService:
             f"Unable to stream '{title or track_id}' right now. Please try again or pick another result."
         )
 
-    def _store_cache(self, resolved: ResolvedStream) -> None:
+    def _store_cache(self, resolved: ResolvedStream, cache_key: Optional[str] = None) -> None:
+        key = cache_key or resolved.track_id
         with self._cache_lock:
             # Never poison an existing valid "full" cache entry with a "preview" fallback
             if resolved.mode == "preview":
-                existing = self._cache.get(resolved.track_id)
+                existing = self._cache.get(key)
                 if (
                     existing
                     and existing.mode == "full"
@@ -1010,10 +1062,12 @@ class StreamService:
                     return
             if len(self._cache) > 256:
                 self._cache.pop(next(iter(self._cache)))
-            self._cache[resolved.track_id] = resolved
+            self._cache[key] = resolved
 
-    def get_stream_info(self, track_id: str, debug: bool = False) -> Dict[str, Any]:
-        resolved = self.resolve_stream(track_id)
+    def get_stream_info(
+        self, track_id: str, debug: bool = False, quality: str = "auto"
+    ) -> Dict[str, Any]:
+        resolved = self.resolve_stream(track_id, quality=quality)
         norm_mime = normalize_stream_mime(resolved.content_type)
         ext = mime_to_extension(norm_mime)
 

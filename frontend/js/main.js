@@ -1,6 +1,7 @@
-// Sonify Frontend Bootstrap — Wires Router, Store, Player, Drawer, Views & Keyboard Shortcuts
+// Sonify Frontend Bootstrap — Wires Router, Store, Player, 3-Tab Drawer, Full-Screen Overlay, Views & Keyboard Shortcuts
 
 import { closeContextMenu, initContextMenuGlobalClose, isContextMenuOpen } from './components/contextMenu.js';
+import { renderFullScreenPlayer, syncFullScreenProgress } from './components/fullScreenPlayer.js';
 import {
   detectClientEnvironment,
   isStandaloneApp,
@@ -15,6 +16,7 @@ import {
   syncActiveLineDOM,
 } from './components/lyricsPanel.js';
 import { closeModal, isModalOpen } from './components/modals.js';
+import { renderNowPlayingDrawer } from './components/nowPlayingDrawer.js';
 import { initPlayerBar, updatePlayerBar } from './components/playerBar.js';
 import { renderQueueBody } from './components/queuePanel.js';
 import { renderSidebar } from './components/sidebar.js';
@@ -36,16 +38,28 @@ import {
   closeDrawer,
   getState,
   hydrateFromBackend,
+  setFullScreenMode,
   setRegion,
   setState,
   subscribe,
   toggleDrawer,
 } from './store.js';
-import { renderAlbumView, renderArtistView } from './views/detailView.js';
+import {
+  renderAlbumView,
+  renderArtistView,
+  renderMixView,
+  renderTrackView,
+} from './views/detailView.js';
+import { renderGenreView } from './views/genreView.js';
 import { renderHistoryView } from './views/historyView.js';
 import { loadHomeData, renderHomeView } from './views/homeView.js';
-import { renderLikedView, renderPlaylistView } from './views/libraryView.js';
+import {
+  renderDownloadsView,
+  renderLikedView,
+  renderPlaylistView,
+} from './views/libraryView.js';
 import { renderSearchView } from './views/searchView.js';
+import { renderStatsView } from './views/statsView.js';
 
 let searchDebounce = null;
 let lastRenderedTrackId = null;
@@ -199,6 +213,7 @@ function renderRightDrawer() {
   drawer.innerHTML = `
     <div class="drawer-header">
       <div class="drawer-tabs">
+        <button class="pill-btn ${st.drawerMode === 'now-playing' ? 'active' : ''}" data-drawer-tab="now-playing">Now Playing</button>
         <button class="pill-btn ${st.drawerMode === 'queue' ? 'active' : ''}" data-drawer-tab="queue">Queue</button>
         <button class="pill-btn ${st.drawerMode === 'lyrics' ? 'active' : ''}" data-drawer-tab="lyrics">Lyrics</button>
       </div>
@@ -224,7 +239,9 @@ function renderRightDrawer() {
   });
 
   const bodySlot = drawer.querySelector('#drawer-body-slot');
-  if (st.drawerMode === 'queue') {
+  if (st.drawerMode === 'now-playing') {
+    renderNowPlayingDrawer(bodySlot);
+  } else if (st.drawerMode === 'queue') {
     renderQueueBody(bodySlot);
   } else if (st.drawerMode === 'lyrics') {
     renderLyricsDrawer(bodySlot);
@@ -244,12 +261,22 @@ function renderMainView() {
     renderSearchView(main);
   } else if (route.name === 'liked') {
     renderLikedView(main);
+  } else if (route.name === 'downloads') {
+    renderDownloadsView(main);
   } else if (route.name === 'playlist') {
     renderPlaylistView(main, route.params.id);
   } else if (route.name === 'artist') {
     renderArtistView(main, route.params.id);
   } else if (route.name === 'album') {
     renderAlbumView(main, route.params.id);
+  } else if (route.name === 'track') {
+    renderTrackView(main, route.params.id);
+  } else if (route.name === 'mix') {
+    renderMixView(main, route.params.id);
+  } else if (route.name === 'genre') {
+    renderGenreView(main, route.params.slug);
+  } else if (route.name === 'stats') {
+    renderStatsView(main);
   } else if (route.name === 'history') {
     renderHistoryView(main);
   } else if (route.name === 'lyrics') {
@@ -266,7 +293,8 @@ function initKeyboardShortcuts() {
 
     if (e.key === 'Escape') {
       if (isModalOpen()) closeModal();
-      if (isContextMenuOpen()) closeContextMenu();
+      else if (isContextMenuOpen()) closeContextMenu();
+      else if (getState().fullScreenMode) setFullScreenMode(false);
       return;
     }
 
@@ -299,6 +327,10 @@ function initKeyboardShortcuts() {
       toggleDrawer('lyrics');
     } else if (e.key === 'q' || e.key === 'Q') {
       toggleDrawer('queue');
+    } else if (e.key === 'f' || e.key === 'F') {
+      if (getState().currentTrack) {
+        setFullScreenMode(!getState().fullScreenMode);
+      }
     } else if (e.key === '/') {
       e.preventDefault();
       const inp = document.getElementById('global-search-input');
@@ -324,12 +356,18 @@ async function bootstrap() {
       updateTopbar();
     }
 
-    // Update sidebar when library/route/filter changes
+    // Update sidebar when library/route/filter/sort/search/pins/follows/albums/downloads change
     if (
       changed.has('route') ||
       changed.has('playlists') ||
       changed.has('likedIds') ||
-      changed.has('libraryFilter')
+      changed.has('followedArtists') ||
+      changed.has('savedAlbums') ||
+      changed.has('pinnedItems') ||
+      changed.has('downloadedIds') ||
+      changed.has('libraryFilter') ||
+      changed.has('librarySort') ||
+      changed.has('librarySearch')
     ) {
       renderSidebar();
     }
@@ -347,17 +385,44 @@ async function bootstrap() {
     }
     if (changed.has('currentTime')) {
       syncActiveLineDOM(false);
+      syncFullScreenProgress();
     }
 
-    // Re-render right drawer only on changes relevant to its active tab (avoid resetting lyrics scroll on play/pause)
+    // Full-Screen Player overlay
+    if (
+      changed.has('fullScreenMode') ||
+      (st.fullScreenMode &&
+        (changed.has('currentTrack') ||
+          changed.has('isPlaying') ||
+          changed.has('likedIds') ||
+          changed.has('lyricsData') ||
+          changed.has('lyricsLoading') ||
+          changed.has('sleepTimer')))
+    ) {
+      renderFullScreenPlayer();
+    }
+
+    // Re-render right drawer only on changes relevant to its active tab
     const shouldRenderDrawer =
       changed.has('drawerMode') ||
-      (st.drawerMode === 'queue' &&
+      (st.drawerMode === 'now-playing' &&
         (changed.has('currentTrack') ||
+          changed.has('likedIds') ||
+          changed.has('followedArtistIds') ||
+          changed.has('downloadedIds') ||
+          changed.has('queue') ||
+          changed.has('queueIndex') ||
+          changed.has('userQueue') ||
+          changed.has('streamMode') ||
+          changed.has('streamSource'))) ||
+      (st.drawerMode === 'queue' &&
+        (changed.has('queueSubTab') ||
+          changed.has('currentTrack') ||
           changed.has('isPlaying') ||
           changed.has('queue') ||
           changed.has('queueIndex') ||
-          changed.has('userQueue'))) ||
+          changed.has('userQueue') ||
+          changed.has('history'))) ||
       (st.drawerMode === 'lyrics' &&
         (changed.has('currentTrack') ||
           changed.has('lyricsData') ||
@@ -367,7 +432,7 @@ async function bootstrap() {
       renderRightDrawer();
     }
 
-    // Re-render active main view on relevant data/route changes (skip pure time/volume ticks & keep lyrics/search inputs stable)
+    // Re-render active main view on relevant data/route changes
     const routeName = st.route?.name || 'home';
     let shouldRenderMain = changed.has('route');
     if (!shouldRenderMain) {
@@ -382,25 +447,52 @@ async function bootstrap() {
           !filterFocused &&
           (changed.has('likedIds') ||
             changed.has('likedTracks') ||
+            changed.has('downloadedIds') ||
             changed.has('currentTrack') ||
             changed.has('isPlaying'));
+      } else if (routeName === 'downloads') {
+        shouldRenderMain =
+          changed.has('downloadedIds') ||
+          changed.has('likedIds') ||
+          changed.has('currentTrack') ||
+          changed.has('isPlaying');
       } else if (routeName === 'playlist') {
         const inlineFocused = document.activeElement?.id === 'pl-add-search';
         shouldRenderMain =
           !inlineFocused &&
           (changed.has('likedIds') ||
             changed.has('playlists') ||
+            changed.has('downloadedIds') ||
             changed.has('currentTrack') ||
             changed.has('isPlaying'));
+      } else if (routeName === 'artist') {
+        shouldRenderMain =
+          changed.has('followedArtistIds') ||
+          changed.has('likedIds') ||
+          changed.has('currentTrack') ||
+          changed.has('isPlaying');
+      } else if (routeName === 'album') {
+        shouldRenderMain =
+          changed.has('savedAlbumIds') ||
+          changed.has('likedIds') ||
+          changed.has('currentTrack') ||
+          changed.has('isPlaying');
       } else if (routeName === 'history') {
         shouldRenderMain =
           changed.has('history') ||
           changed.has('likedIds') ||
           changed.has('currentTrack') ||
           changed.has('isPlaying');
+      } else if (routeName === 'stats' || routeName === 'genre' || routeName === 'track' || routeName === 'mix') {
+        shouldRenderMain =
+          changed.has('likedIds') ||
+          changed.has('downloadedIds') ||
+          changed.has('currentTrack') ||
+          changed.has('isPlaying');
       } else {
         shouldRenderMain =
           changed.has('homeData') ||
+          changed.has('madeForYou') ||
           changed.has('region') ||
           changed.has('likedIds') ||
           changed.has('likedTracks') ||

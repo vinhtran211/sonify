@@ -1,7 +1,7 @@
 // Persistent Bottom Player Bar (DOM mounted once, updated incrementally for silky scrubbing)
 
 import { ICONS } from '../icons.js';
-import { coverUrlFor, escapeHtml, formatTime } from '../lrc.js';
+import { coverUrlFor, formatTime } from '../lrc.js';
 import {
   cycleRepeat,
   playNextTrack,
@@ -13,7 +13,8 @@ import {
   toggleShuffle,
 } from '../player.js';
 import { navigate } from '../router.js';
-import { getState, toggleDrawer, toggleLike } from '../store.js';
+import { getState, setFullScreenMode, toggleDrawer, toggleLike } from '../store.js';
+import { openAudioSettingsModal } from './audioSettingsModal.js';
 import { showToast } from './modals.js';
 
 let mounted = false;
@@ -92,9 +93,12 @@ export function initPlayerBar() {
     </div>
 
     <div class="player-right">
+      <button id="pb-sleep-badge" class="sleep-pill hidden" title="Sleep Timer Active"></button>
+      <button id="pb-nowplaying-btn" class="icon-btn" title="Now Playing View" aria-label="Now Playing View">${ICONS.nowPlaying}</button>
       <button id="pb-lyrics-btn" class="icon-btn" title="Synced Lyrics Drawer (L)" aria-label="Toggle lyrics drawer">${ICONS.lyrics}</button>
-      <button id="pb-lyrics-stage" class="icon-btn" title="Full-Stage Lyrics View" aria-label="Full-stage lyrics">${ICONS.expand}</button>
       <button id="pb-queue-btn" class="icon-btn" title="Queue (Q)" aria-label="Toggle queue drawer">${ICONS.queue}</button>
+      <button id="pb-audio-btn" class="icon-btn" title="Equalizer, Crossfade, Speed & Sleep Timer" aria-label="Audio Settings">${ICONS.sliders}</button>
+      <button id="pb-fullscreen-btn" class="icon-btn" title="Full-Screen Mode (F)" aria-label="Full-Screen Mode">${ICONS.expand}</button>
       <div class="volume-wrap">
         <button id="pb-mute-btn" class="icon-btn" title="Mute / Unmute (M)" aria-label="Mute or unmute">${ICONS.volumeHigh}</button>
         <div id="pb-vol-bar" class="range-bar" role="slider" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80">
@@ -114,12 +118,19 @@ export function initPlayerBar() {
   bar.querySelector('#pb-shuffle').addEventListener('click', () => toggleShuffle());
   bar.querySelector('#pb-repeat').addEventListener('click', () => cycleRepeat());
   bar.querySelector('#pb-mute-btn').addEventListener('click', () => toggleMute());
+  bar.querySelector('#pb-nowplaying-btn').addEventListener('click', () => toggleDrawer('now-playing'));
   bar.querySelector('#pb-lyrics-btn').addEventListener('click', () => toggleDrawer('lyrics'));
   bar.querySelector('#pb-queue-btn').addEventListener('click', () => toggleDrawer('queue'));
+  bar.querySelector('#pb-audio-btn').addEventListener('click', () => openAudioSettingsModal());
+  bar.querySelector('#pb-sleep-badge').addEventListener('click', () => openAudioSettingsModal());
 
-  bar.querySelector('#pb-lyrics-stage').addEventListener('click', () => {
-    const isAlreadyStage = getState().route?.name === 'lyrics';
-    navigate(isAlreadyStage ? '#/' : '#/lyrics');
+  bar.querySelector('#pb-fullscreen-btn').addEventListener('click', () => {
+    const st = getState();
+    if (!st.currentTrack) {
+      showToast('Play a track first to open Full-Screen Mode', 'info');
+      return;
+    }
+    setFullScreenMode(!st.fullScreenMode);
   });
 
   bar.querySelector('#pb-cover').addEventListener('click', () => {
@@ -128,6 +139,13 @@ export function initPlayerBar() {
       navigate(`#/album/${encodeURIComponent(tr.albumId)}`);
     } else if (tr) {
       navigate('#/lyrics');
+    }
+  });
+
+  bar.querySelector('#pb-title').addEventListener('click', () => {
+    const tr = getState().currentTrack;
+    if (tr?.id) {
+      navigate(`#/track/${encodeURIComponent(tr.id)}`);
     }
   });
 
@@ -217,9 +235,12 @@ export function updatePlayerBar() {
   const shuffleBtn = document.getElementById('pb-shuffle');
   const repeatBtn = document.getElementById('pb-repeat');
   const repeatOneDot = document.getElementById('pb-repeat-one');
+  const nowBtn = document.getElementById('pb-nowplaying-btn');
   const lyricsBtn = document.getElementById('pb-lyrics-btn');
-  const stageBtn = document.getElementById('pb-lyrics-stage');
   const queueBtn = document.getElementById('pb-queue-btn');
+  const audioBtn = document.getElementById('pb-audio-btn');
+  const fsBtn = document.getElementById('pb-fullscreen-btn');
+  const sleepBadge = document.getElementById('pb-sleep-badge');
   const muteBtn = document.getElementById('pb-mute-btn');
   const volFill = document.getElementById('pb-vol-fill');
   const volThumb = document.getElementById('pb-vol-thumb');
@@ -237,7 +258,10 @@ export function updatePlayerBar() {
       likeBtn.disabled = false;
     }
     if (badgeEl) {
-      if (st.streamMode === 'full') {
+      if (st.streamMode === 'offline-download') {
+        badgeEl.textContent = 'Offline Download';
+        badgeEl.className = 'stream-badge full';
+      } else if (st.streamMode === 'full') {
         const srcLabel =
           st.streamSource === 'monochrome'
             ? 'Lossless FLAC'
@@ -282,9 +306,28 @@ export function updatePlayerBar() {
   }
   if (repeatOneDot) repeatOneDot.classList.toggle('hidden', st.repeat !== 'one');
 
+  if (nowBtn) nowBtn.classList.toggle('active', st.drawerMode === 'now-playing');
   if (lyricsBtn) lyricsBtn.classList.toggle('active', st.drawerMode === 'lyrics');
-  if (stageBtn) stageBtn.classList.toggle('active', st.route?.name === 'lyrics');
   if (queueBtn) queueBtn.classList.toggle('active', st.drawerMode === 'queue');
+  if (fsBtn) fsBtn.classList.toggle('active', Boolean(st.fullScreenMode));
+
+  const eqActive =
+    (Array.isArray(st.eqBands) && st.eqBands.some((b) => Math.abs(Number(b) || 0) >= 0.5)) ||
+    (st.crossfade || 0) > 0 ||
+    Math.abs((st.playbackRate || 1) - 1) > 0.01;
+  if (audioBtn) audioBtn.classList.toggle('active', eqActive);
+
+  if (sleepBadge) {
+    if (st.sleepTimer?.mode === 'countdown') {
+      sleepBadge.textContent = `⏱ ${formatTime(st.sleepTimer.remainingSec)}`;
+      sleepBadge.classList.remove('hidden');
+    } else if (st.sleepTimer?.mode === 'end-of-track') {
+      sleepBadge.textContent = '⏱ End';
+      sleepBadge.classList.remove('hidden');
+    } else {
+      sleepBadge.classList.add('hidden');
+    }
+  }
 
   if (!isDraggingSeek) {
     updateSeekVisuals(st.currentTime, st.duration, st.buffered);

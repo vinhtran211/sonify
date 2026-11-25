@@ -102,6 +102,12 @@ DEFAULT_SETTINGS = {
     "region": "global",
     "lastTrackId": None,
     "lastPosition": 0,
+    "autoplay": True,
+    "crossfade": 0,
+    "playbackRate": 1.0,
+    "audioQuality": "auto",
+    "eqPreset": "flat",
+    "eqBands": [0, 0, 0, 0, 0],
 }
 
 

@@ -352,7 +352,10 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         self._send_error_json(400, "INVALID_TRACK", "Missing trackId")
                         return
                     debug = self._qparam(qs, "debug", "0").strip().lower() in ("1", "true", "yes")
-                    self._send_json(self.server.stream.get_stream_info(track_id, debug=debug))
+                    quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
+                    self._send_json(
+                        self.server.stream.get_stream_info(track_id, debug=debug, quality=quality)
+                    )
                     return
                 track_id = strip_known_stream_extension(urllib.parse.unquote(rest).strip("/"))
                 if not track_id:
@@ -387,6 +390,66 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(payload)
                 return
 
+            # /api/radio (Song / Artist Radio & Autoplay seed)
+            if path == "/api/radio":
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                track_id = self._qparam(qs, "trackId", "")
+                artist_id = self._qparam(qs, "artistId", "")
+                try:
+                    limit = int(self._qparam(qs, "limit", "25") or "25")
+                except ValueError:
+                    limit = 25
+                self._send_json(
+                    self.server.catalog.get_radio(track_id=track_id, artist_id=artist_id, limit=limit)
+                )
+                return
+
+            # /api/made-for-you (Daily Mix 1/2, Discover Weekly, Release Radar)
+            if path == "/api/made-for-you":
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                region = self._qparam(qs, "region", "global")
+                self._send_json(self.server.catalog.get_made_for_you(region=region))
+                return
+
+            # /api/genre/{slug} (12 Spotify Browse Genre/Mood Hubs)
+            if path.startswith("/api/genre/"):
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                slug = urllib.parse.unquote(path[len("/api/genre/") :]).strip("/")
+                region = self._qparam(qs, "region", "global")
+                data = self.server.catalog.get_genre_hub(slug, region=region)
+                if not data:
+                    self._send_error_json(404, "NOT_FOUND", f"Genre '{slug}' not found")
+                    return
+                self._send_json(data)
+                return
+
+            # /api/track/{track_id} (Shareable Single-Track Deep Link + Related Radio)
+            if path.startswith("/api/track/"):
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                track_id = urllib.parse.unquote(path[len("/api/track/") :]).strip("/")
+                data = self.server.catalog.get_track_detail(track_id)
+                if not data:
+                    self._send_error_json(404, "NOT_FOUND", f"Track '{track_id}' not found")
+                    return
+                self._send_json(data)
+                return
+
+            # /api/stats (Listening Stats / Sound Capsule)
+            if path == "/api/stats":
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                self._send_json(self.server.library.get_stats())
+                return
+
             # /api/library/likes & /api/library/likes/{track_id}
             if path == "/api/library/likes":
                 if method == "GET":
@@ -405,6 +468,84 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     return
                 track_id = urllib.parse.unquote(path[len("/api/library/likes/") :]).strip("/")
                 self._send_json(self.server.library.unlike_track(track_id))
+                return
+
+            # /api/library/artists & /api/library/artists/{artist_id}
+            if path == "/api/library/artists":
+                if method == "GET":
+                    self._send_json(self.server.library.get_followed_artists())
+                    return
+                if method == "POST":
+                    body = self._read_json_body()
+                    self._send_json(self.server.library.follow_artist(body), status=201)
+                    return
+                self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET or POST")
+                return
+
+            if path.startswith("/api/library/artists/"):
+                if method != "DELETE":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use DELETE")
+                    return
+                artist_id = urllib.parse.unquote(path[len("/api/library/artists/") :]).strip("/")
+                self._send_json(self.server.library.unfollow_artist(artist_id))
+                return
+
+            # /api/library/albums & /api/library/albums/{album_id}
+            if path == "/api/library/albums":
+                if method == "GET":
+                    self._send_json(self.server.library.get_saved_albums())
+                    return
+                if method == "POST":
+                    body = self._read_json_body()
+                    self._send_json(self.server.library.save_album(body), status=201)
+                    return
+                self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET or POST")
+                return
+
+            if path.startswith("/api/library/albums/"):
+                if method != "DELETE":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use DELETE")
+                    return
+                album_id = urllib.parse.unquote(path[len("/api/library/albums/") :]).strip("/")
+                self._send_json(self.server.library.unsave_album(album_id))
+                return
+
+            # /api/library/pins & /api/library/pins/{item_type}/{item_id}
+            if path == "/api/library/pins":
+                if method == "GET":
+                    self._send_json(self.server.library.get_pins())
+                    return
+                if method == "POST":
+                    body = self._read_json_body()
+                    self._send_json(self.server.library.pin_item(body), status=201)
+                    return
+                self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET or POST")
+                return
+
+            if path.startswith("/api/library/pins/"):
+                if method != "DELETE":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use DELETE")
+                    return
+                sub_pin = path[len("/api/library/pins/") :].strip("/")
+                pin_parts = sub_pin.split("/", 1)
+                if len(pin_parts) != 2:
+                    self._send_error_json(400, "INVALID_PIN", "Use /api/library/pins/{itemType}/{itemId}")
+                    return
+                item_type = urllib.parse.unquote(pin_parts[0])
+                item_id = urllib.parse.unquote(pin_parts[1])
+                self._send_json(self.server.library.unpin_item(item_type, item_id))
+                return
+
+            # /api/playlists/import
+            if path == "/api/playlists/import":
+                if method != "POST":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use POST")
+                    return
+                body = self._read_json_body()
+                self._send_json(
+                    self.server.library.import_playlist(body, catalog_service=self.server.catalog),
+                    status=201,
+                )
                 return
 
             # /api/playlists
@@ -435,6 +576,31 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         self._send_json(self.server.library.delete_playlist(pid))
                         return
                     self._send_error_json(405, "METHOD_NOT_ALLOWED", "Method not allowed")
+                    return
+
+                if len(parts) == 2 and parts[1] == "recommendations":
+                    pid = parts[0]
+                    if method != "GET":
+                        self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                        return
+                    try:
+                        limit = int(self._qparam(qs, "limit", "10") or "10")
+                    except ValueError:
+                        limit = 10
+                    recs = self.server.catalog.get_playlist_recommendations(pid, limit=limit)
+                    if recs is None:
+                        self._send_error_json(404, "NOT_FOUND", f"Playlist '{pid}' not found")
+                        return
+                    self._send_json(recs)
+                    return
+
+                if len(parts) == 2 and parts[1] == "duplicate":
+                    pid = parts[0]
+                    if method != "POST":
+                        self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use POST")
+                        return
+                    body = self._read_json_body()
+                    self._send_json(self.server.library.duplicate_playlist(pid, body), status=201)
                     return
 
                 if len(parts) == 2 and parts[1] == "tracks":

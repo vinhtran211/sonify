@@ -107,7 +107,11 @@ A complete Spotify-like native SwiftUI iOS application lives in `ios/`:
   - Available both in the **Right Side Drawer** and as an **Immersive Full-Stage Lyrics View** (`#/lyrics`).
   - Binary-search active line highlighting synced via `requestAnimationFrame`, smooth auto-scroll centering, automatic 4-second pause with floating **Re-sync** button on manual scroll, **click any lyric line to seek**, plus clean **Unsynced**, **Instrumental**, and **Manual Search Override** states.
 - **SQLite Persistence (`data/music.db`) + Ephemeral-Cloud Auto-Restore**
-  - Automatically initialized in WAL mode on first start (with automatic `/tmp/sonify/music.db` fallback if `data/` is non-writable); persists Playlists, Liked Songs, Listening History, Track Metadata Cache, Lyrics Cache, and Player Settings across restarts, plus browser `localStorage` backup & auto-restore on ephemeral free-tier cloud containers.
+  - Automatically initialized in WAL mode on first start (with automatic `/tmp/sonify/music.db` fallback if `data/` is non-writable); persists Playlists (including custom cover colors/emojis/URLs), Liked Songs, Followed Artists, Saved Albums, Pinned Library items, Listening History, Track Metadata Cache, Lyrics Cache, and extended Audio Settings across restarts, plus browser `localStorage` backup & auto-restore on ephemeral free-tier cloud containers.
+- **Full Spotify Parity (Web, PWA & Native SwiftUI iOS)**
+  - **Discovery & Personalization**: **Made For You** dynamic mixes (`Daily Mix 1 & 2`, `Discover Weekly`, `Release Radar` with 1-click Save as Playlist), **Song Radio & Artist Radio** (`/api/radio`), **Autoplay Similar Songs** when queues end, **12 dedicated Genre & Mood Hubs** (`#/genre/:slug`), and **Playlist Recommendations** (`+ Add` directly inside playlists).
+  - **Audio Controls & Listening Experience**: **5-Band Web Audio Equalizer** with Spotify presets (`Flat`, `Bass Booster`, `Vocal Booster`, `Pop`, `Rock`, `Hip-Hop`, `Electronic`, `Acoustic`, `Late Night`), **Crossfade** (`0–12s`), **Playback Speed** (`0.5x–2.0x`), **Audio Quality selector** (`Auto`, `Lossless FLAC`, `Fast Standard`), **Sleep Timer** (`5m–1h` or `End of Track`), **Now Playing 3rd-Pane Drawer** (artwork, About the Artist + Follow, Credits, Next in Queue), **Ambient Full-Screen Player** (`F` shortcut), and **Offline Downloads** via Cache API (`#/downloads`).
+  - **Library Power Tools & Insights**: Filter (`All | Playlists | Artists | Albums | Offline`), Sort (`Recents | A–Z`), inline library search, **Pin/Unpin**, **Follow Artists & Save Albums**, **Custom Playlist Covers**, **Duplicate**, **Export JSON/M3U & Import JSON/M3U**, **Drag-and-Drop Reordering** (playlists & queue), **Sortable Track Table Columns**, **Queue | Recently Played** sub-tabs, **Track Share Deep-Links** (`#/track/:id`), and **Sound Capsule Listening Stats** (`#/stats`).
 
 ---
 
@@ -124,8 +128,9 @@ A complete Spotify-like native SwiftUI iOS application lives in `ios/`:
 | `R` | Cycle Repeat (`off` -> `all` -> `one`) |
 | `L` | Toggle Synced Lyrics Drawer |
 | `Q` | Toggle Queue Drawer |
+| `F` | Toggle Ambient Full-Screen Player |
 | `/` | Focus Global Search |
-| `Escape` | Close Modals & Context Menus |
+| `Escape` | Close Modals, Context Menus & Full-Screen Player |
 
 ---
 

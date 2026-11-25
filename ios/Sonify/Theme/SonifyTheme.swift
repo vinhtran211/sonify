@@ -45,4 +45,14 @@ extension Color {
         let b = Double(hex & 0xFF) / 255.0
         self.init(.sRGB, red: r, green: g, blue: b, opacity: opacity)
     }
+
+    init(hexString: String, fallback: UInt32 = 0x1E3264) {
+        let cleaned = hexString.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var val: UInt64 = 0
+        if cleaned.count == 6, Scanner(string: cleaned).scanHexInt64(&val) {
+            self.init(hex: UInt32(val))
+        } else {
+            self.init(hex: fallback)
+        }
+    }
 }

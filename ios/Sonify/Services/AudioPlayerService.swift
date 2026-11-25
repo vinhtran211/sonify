@@ -4,6 +4,12 @@ import Foundation
 import MediaPlayer
 import UIKit
 
+enum SleepTimerMode: Equatable {
+    case off
+    case countdown
+    case endOfTrack
+}
+
 /// Pure value-type queue state machine for deterministic playback navigation and unit testing.
 struct PlaybackQueueEngine: Equatable {
     private(set) var queue: [Track] = []
@@ -41,6 +47,16 @@ struct PlaybackQueueEngine: Equatable {
             currentIndex = queue.count - 1
         }
         return queue[currentIndex]
+    }
+
+    mutating func appendQueueTracks(_ tracks: [Track]) -> Track? {
+        let existingIds = Set(queue.map(\.id))
+        let fresh = tracks.filter { !existingIds.contains($0.id) }
+        guard !fresh.isEmpty else { return nil }
+        let startIdx = queue.count
+        queue.append(contentsOf: fresh)
+        currentIndex = startIdx
+        return queue[startIdx]
     }
 
     mutating func enqueueNext(_ track: Track) {
@@ -128,6 +144,9 @@ final class AudioPlayerService: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var queueEngine = PlaybackQueueEngine()
     @Published var showNowPlayingSheet: Bool = false
+    @Published private(set) var playbackRate: Float = 1.0
+    @Published private(set) var sleepTimerMode: SleepTimerMode = .off
+    @Published private(set) var sleepTimerRemainingSec: Int = 0
 
     private let api: APIClient
     private weak var libraryStore: LibraryStore?
@@ -143,6 +162,7 @@ final class AudioPlayerService: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var artworkTask: Task<Void, Never>?
     private var prefetchTask: Task<Void, Never>?
+    private var sleepTimerTask: Task<Void, Never>?
     private var prefetchedInfo: [String: (info: StreamInfoResponse, fetchedAt: Date)] = [:]
     private var prefetchedOrder: [String] = []
     private var currentRoute: PlaybackRoute?
@@ -172,6 +192,7 @@ final class AudioPlayerService: ObservableObject {
     }
 
     deinit {
+        sleepTimerTask?.cancel()
         if let token = timeObserverToken {
             player.removeTimeObserver(token)
         }
@@ -191,6 +212,88 @@ final class AudioPlayerService: ObservableObject {
     func play(track: Track, context: [Track]? = nil) {
         let active = queueEngine.play(track: track, context: context)
         startPlayback(for: active)
+    }
+
+    func startRadio(for track: Track) {
+        libraryStore?.showToast("Starting \(track.title) Radio...")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let res = try await self.api.getRadio(trackId: track.id, limit: 20)
+                let list = [track] + res.tracks.filter { $0.id != track.id }
+                self.play(track: list[0], context: list)
+                self.libraryStore?.showToast("\(track.title) Radio (\(list.count) songs)")
+            } catch {
+                self.libraryStore?.showToast("Could not start radio")
+            }
+        }
+    }
+
+    func startArtistRadio(artistId: String, name: String) {
+        libraryStore?.showToast("Starting \(name) Radio...")
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let res = try await self.api.getRadio(artistId: artistId, limit: 20)
+                guard let first = res.tracks.first else {
+                    self.libraryStore?.showToast("No radio tracks available")
+                    return
+                }
+                self.play(track: first, context: res.tracks)
+                self.libraryStore?.showToast("\(name) Radio (\(res.tracks.count) songs)")
+            } catch {
+                self.libraryStore?.showToast("Could not start artist radio")
+            }
+        }
+    }
+
+    func setPlaybackRate(_ rate: Float) {
+        let clamped = max(0.5, min(2.0, rate))
+        playbackRate = clamped
+        if isPlaying {
+            player.rate = clamped
+        }
+        updateNowPlayingInfo()
+        Task { [weak self] in
+            await self?.libraryStore?.updateAudioSettings(playbackRate: Double(clamped))
+        }
+    }
+
+    func setSleepTimer(minutes: Int) {
+        sleepTimerTask?.cancel()
+        let totalSec = max(60, minutes * 60)
+        sleepTimerMode = .countdown
+        sleepTimerRemainingSec = totalSec
+        libraryStore?.showToast("Sleep timer set for \(minutes) min")
+        let endDate = Date().addingTimeInterval(TimeInterval(totalSec))
+        sleepTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                let rem = max(0, Int(ceil(endDate.timeIntervalSinceNow)))
+                self.sleepTimerRemainingSec = rem
+                if rem <= 0 {
+                    self.sleepTimerMode = .off
+                    self.pause()
+                    self.libraryStore?.showToast("Sleep timer ended — playback paused")
+                    return
+                }
+            }
+        }
+    }
+
+    func setSleepTimerEndOfTrack() {
+        sleepTimerTask?.cancel()
+        sleepTimerMode = .endOfTrack
+        sleepTimerRemainingSec = 0
+        libraryStore?.showToast("Sleep timer: End of current track")
+    }
+
+    func cancelSleepTimer() {
+        sleepTimerTask?.cancel()
+        sleepTimerMode = .off
+        sleepTimerRemainingSec = 0
+        libraryStore?.showToast("Sleep timer turned off")
     }
 
     func enqueueNext(_ track: Track) {
@@ -224,11 +327,21 @@ final class AudioPlayerService: ObservableObject {
         guard currentTrack != nil else { return }
         activateAudioSession()
         player.play()
+        if abs(playbackRate - 1.0) > 0.01 {
+            player.rate = playbackRate
+        }
         isPlaying = true
         updateNowPlayingInfo()
     }
 
     func nextTrack(fromAutoEnd: Bool = false) {
+        if fromAutoEnd && sleepTimerMode == .endOfTrack {
+            sleepTimerMode = .off
+            sleepTimerRemainingSec = 0
+            pause()
+            libraryStore?.showToast("Sleep timer paused at end of track")
+            return
+        }
         if fromAutoEnd && queueEngine.repeatMode == .one, currentTrack != nil {
             seek(to: 0)
             resume()
@@ -236,6 +349,17 @@ final class AudioPlayerService: ObservableObject {
         }
         if let next = queueEngine.nextTrack(fromAutoEnd: fromAutoEnd) {
             startPlayback(for: next)
+        } else if fromAutoEnd && (libraryStore?.settings.autoplay ?? true), let seed = currentTrack {
+            Task { [weak self] in
+                guard let self else { return }
+                if let res = try? await self.api.getRadio(trackId: seed.id, limit: 15),
+                   let nextTrack = self.queueEngine.appendQueueTracks(res.tracks) {
+                    self.libraryStore?.showToast("Autoplay queued similar songs")
+                    self.startPlayback(for: nextTrack)
+                } else {
+                    self.pause()
+                }
+            }
         } else {
             pause()
         }
@@ -279,11 +403,17 @@ final class AudioPlayerService: ObservableObject {
 
     // MARK: - Internal Stream Resolution & AVPlayer Setup
 
+    private func prefetchCacheKey(trackId: String) -> String {
+        let qual = libraryStore?.settings.audioQuality ?? "auto"
+        return "\(trackId)::\(qual)"
+    }
+
     private func cachedPrefetchInfo(for trackId: String) -> StreamInfoResponse? {
-        guard let entry = prefetchedInfo[trackId] else { return nil }
+        let key = prefetchCacheKey(trackId: trackId)
+        guard let entry = prefetchedInfo[key] else { return nil }
         if Date().timeIntervalSince(entry.fetchedAt) > Self.prefetchTTL {
-            prefetchedInfo.removeValue(forKey: trackId)
-            prefetchedOrder.removeAll { $0 == trackId }
+            prefetchedInfo.removeValue(forKey: key)
+            prefetchedOrder.removeAll { $0 == key }
             return nil
         }
         return entry.info
@@ -291,9 +421,10 @@ final class AudioPlayerService: ObservableObject {
 
     private func storePrefetchInfo(_ info: StreamInfoResponse, for trackId: String) {
         guard !info.isPreview else { return }
-        prefetchedInfo[trackId] = (info: info, fetchedAt: Date())
-        prefetchedOrder.removeAll { $0 == trackId }
-        prefetchedOrder.append(trackId)
+        let key = prefetchCacheKey(trackId: trackId)
+        prefetchedInfo[key] = (info: info, fetchedAt: Date())
+        prefetchedOrder.removeAll { $0 == key }
+        prefetchedOrder.append(key)
         while prefetchedOrder.count > Self.maxPrefetchedEntries {
             let oldest = prefetchedOrder.removeFirst()
             prefetchedInfo.removeValue(forKey: oldest)
@@ -305,11 +436,12 @@ final class AudioPlayerService: ObservableObject {
         guard let nextTrack = queueEngine.upcomingTracks.first else { return }
         let nextId = nextTrack.id
         if cachedPrefetchInfo(for: nextId) != nil { return }
+        let qual = libraryStore?.settings.audioQuality ?? "auto"
 
         prefetchTask = Task(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard !Task.isCancelled, let self, seq == self.playbackSeq else { return }
-            if let info = try? await self.api.getStreamInfo(trackId: nextId) {
+            if let info = try? await self.api.getStreamInfo(trackId: nextId, quality: qual) {
                 guard !Task.isCancelled else { return }
                 self.storePrefetchInfo(info, for: nextId)
             }
@@ -318,7 +450,6 @@ final class AudioPlayerService: ObservableObject {
 
     private func makePlayerItem(for route: PlaybackRoute, contentType: String) -> AVPlayerItem {
         var assetOptions: [String: Any] = [:]
-        // Never override MIME on native HLS .m3u8 playlists so AVPlayer parses the manifest natively
         if !route.isHLS {
             if #available(iOS 17.0, *) {
                 assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(contentType)
@@ -358,6 +489,8 @@ final class AudioPlayerService: ObservableObject {
         loadNowPlayingArtwork(for: track)
         lyricsStore?.loadLyrics(for: track)
 
+        let qual = libraryStore?.settings.audioQuality ?? "auto"
+
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -365,7 +498,7 @@ final class AudioPlayerService: ObservableObject {
                 if let cached = self.cachedPrefetchInfo(for: track.id) {
                     info = cached
                 } else {
-                    let fetched = try await self.api.getStreamInfo(trackId: track.id)
+                    let fetched = try await self.api.getStreamInfo(trackId: track.id, quality: qual)
                     self.storePrefetchInfo(fetched, for: track.id)
                     info = fetched
                 }
@@ -386,6 +519,9 @@ final class AudioPlayerService: ObservableObject {
                 self.observePlayerItem(item, seq: seq)
                 self.player.replaceCurrentItem(with: item)
                 self.player.play()
+                if abs(self.playbackRate - 1.0) > 0.01 {
+                    self.player.rate = self.playbackRate
+                }
                 self.updateNowPlayingInfo()
 
                 Task { [weak self] in
@@ -417,7 +553,6 @@ final class AudioPlayerService: ObservableObject {
                     self.updateNowPlayingInfo()
                     self.scheduleNextTrackPrefetch(seq: seq)
                 case .failed:
-                    // Automatic 1-shot fallback to backend proxy if direct edge / HLS URL failed
                     if !self.didFallbackToProxy,
                        let route = self.currentRoute,
                        !route.isProxy,
@@ -432,6 +567,9 @@ final class AudioPlayerService: ObservableObject {
                         self.observePlayerItem(fallbackItem, seq: seq)
                         self.player.replaceCurrentItem(with: fallbackItem)
                         self.player.play()
+                        if abs(self.playbackRate - 1.0) > 0.01 {
+                            self.player.rate = self.playbackRate
+                        }
                         return
                     }
                     self.isLoading = false
@@ -452,7 +590,7 @@ final class AudioPlayerService: ObservableObject {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [])
         } catch {
-            // Audio session configuration can fail on headless simulator; handled gracefully
+            // Audio session configuration can fail on headless simulator
         }
     }
 
@@ -609,7 +747,7 @@ final class AudioPlayerService: ObservableObject {
             MPMediaItemPropertyAlbumTitle: track.album ?? "Sonify",
             MPMediaItemPropertyPlaybackDuration: max(duration, Double(track.duration)),
             MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(playbackRate) : 0.0,
         ]
         if let cachedArtwork {
             info[MPMediaItemPropertyArtwork] = cachedArtwork

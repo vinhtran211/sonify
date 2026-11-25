@@ -47,8 +47,10 @@ export const api = {
 
   getAlbum: (albumId) => request(`/api/album/${encodeURIComponent(albumId)}`),
 
-  getStreamInfo: (trackId, signal = undefined) =>
-    request(`/api/stream/${encodeURIComponent(trackId)}/info`, { signal }),
+  getStreamInfo: (trackId, signal = undefined, quality = 'auto') => {
+    const q = quality && quality !== 'auto' ? `?quality=${encodeURIComponent(quality)}` : '';
+    return request(`/api/stream/${encodeURIComponent(trackId)}/info${q}`, { signal });
+  },
 
   getLyrics: ({ trackId = '', title = '', artist = '', album = '', duration = 0, refresh = false }, signal = undefined) => {
     const params = new URLSearchParams();
@@ -103,4 +105,48 @@ export const api = {
 
   // iOS Direct Install & Distribution
   getIosInstallInfo: () => request('/api/ios/install-info'),
+
+  // Spotify Parity: Radio, Made For You, Genres, Track Detail, Stats, Follows, Albums, Pins, Duplicate/Import/Recs
+  getRadio: ({ trackId = '', artistId = '', limit = 25 } = {}) => {
+    const params = new URLSearchParams();
+    if (trackId) params.set('trackId', trackId);
+    if (artistId) params.set('artistId', artistId);
+    params.set('limit', String(limit));
+    return request(`/api/radio?${params.toString()}`);
+  },
+  getMadeForYou: (region = 'global') =>
+    request(`/api/made-for-you?region=${encodeURIComponent(region)}`),
+  getGenreHub: (slug, region = 'global') =>
+    request(`/api/genre/${encodeURIComponent(slug)}?region=${encodeURIComponent(region)}`),
+  getTrackDetail: (trackId) => request(`/api/track/${encodeURIComponent(trackId)}`),
+  getStats: () => request('/api/stats'),
+
+  getPlaylistRecommendations: (playlistId, limit = 10) =>
+    request(`/api/playlists/${encodeURIComponent(playlistId)}/recommendations?limit=${limit}`),
+  duplicatePlaylist: (playlistId, name = null) =>
+    request(`/api/playlists/${encodeURIComponent(playlistId)}/duplicate`, {
+      method: 'POST',
+      body: name ? { name } : {},
+    }),
+  importPlaylist: (payload) =>
+    request('/api/playlists/import', { method: 'POST', body: payload }),
+
+  getFollowedArtists: () => request('/api/library/artists'),
+  followArtist: (artist) => request('/api/library/artists', { method: 'POST', body: { artist } }),
+  unfollowArtist: (artistId) =>
+    request(`/api/library/artists/${encodeURIComponent(artistId)}`, { method: 'DELETE' }),
+
+  getSavedAlbums: () => request('/api/library/albums'),
+  saveAlbum: (album) => request('/api/library/albums', { method: 'POST', body: { album } }),
+  unsaveAlbum: (albumId) =>
+    request(`/api/library/albums/${encodeURIComponent(albumId)}`, { method: 'DELETE' }),
+
+  getPins: () => request('/api/library/pins'),
+  pinItem: (itemType, itemId) =>
+    request('/api/library/pins', { method: 'POST', body: { itemType, itemId } }),
+  unpinItem: (itemType, itemId) =>
+    request(
+      `/api/library/pins/${encodeURIComponent(itemType)}/${encodeURIComponent(itemId)}`,
+      { method: 'DELETE' }
+    ),
 };

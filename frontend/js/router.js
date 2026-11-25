@@ -27,6 +27,36 @@ export function parseHash(hashStr = window.location.hash) {
   if (path === '/lyrics') {
     return { name: 'lyrics', path: '/lyrics', params: {}, query };
   }
+  if (path === '/stats') {
+    return { name: 'stats', path: '/stats', params: {}, query };
+  }
+  if (path === '/downloads') {
+    return { name: 'downloads', path: '/downloads', params: {}, query };
+  }
+  if (path.startsWith('/genre/')) {
+    return {
+      name: 'genre',
+      path,
+      params: { slug: decodeURIComponent(path.slice('/genre/'.length)) },
+      query,
+    };
+  }
+  if (path.startsWith('/track/')) {
+    return {
+      name: 'track',
+      path,
+      params: { id: decodeURIComponent(path.slice('/track/'.length)) },
+      query,
+    };
+  }
+  if (path.startsWith('/mix/')) {
+    return {
+      name: 'mix',
+      path,
+      params: { id: decodeURIComponent(path.slice('/mix/'.length)) },
+      query,
+    };
+  }
   if (path.startsWith('/playlist/')) {
     return {
       name: 'playlist',

@@ -47,11 +47,15 @@ class CatalogService:
         self._home_base_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         self._home_refreshing: bool = False
         self._search_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._genre_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._mix_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     def clear_caches(self) -> None:
         with self._lock:
             self._home_base_cache = None
             self._search_cache.clear()
+            self._genre_cache.clear()
+            self._mix_cache.clear()
 
     def _annotate_sections(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(payload)
@@ -743,3 +747,539 @@ class CatalogService:
                 "tracks": cached_tracks,
             }
         return None
+
+    # ------------------------------------------------------------------
+    # Spotify Parity: Genre/Mood Hubs, Song/Artist Radio, Made For You,
+    # Playlist Recommendations & Single Track Deep Link
+    # ------------------------------------------------------------------
+    GENRE_HUBS: Dict[str, Dict[str, Any]] = {
+        "pop": {
+            "slug": "pop",
+            "name": "Pop",
+            "color": "#E8115B",
+            "description": "Chart-topping pop anthems and global hits.",
+            "queries": ["pop hits", "top pop"],
+        },
+        "vpop": {
+            "slug": "vpop",
+            "name": "V-Pop & Vietnam",
+            "color": "#1DB954",
+            "description": "Vietnam's hottest V-Pop, Indie & Rap hits.",
+            "queries": ["sơn tùng m-tp", "v-pop hits"],
+        },
+        "hiphop": {
+            "slug": "hiphop",
+            "name": "Hip-Hop & Rap",
+            "color": "#BC5900",
+            "description": "Hard-hitting hip-hop, trap, and rap essentials.",
+            "queries": ["hip hop rap", "kendrick lamar drake"],
+        },
+        "kpop": {
+            "slug": "kpop",
+            "name": "K-Pop",
+            "color": "#E13300",
+            "description": "Seoul's biggest idols, choreo bangers, and K-R&B.",
+            "queries": ["kpop blackpink bts", "newjeans aespa"],
+        },
+        "indie": {
+            "slug": "indie",
+            "name": "Indie & Alt",
+            "color": "#148A08",
+            "description": "Dreamy guitars, alt-pop, and independent gems.",
+            "queries": ["indie rock alternative", "tame impala arctic monkeys"],
+        },
+        "electronic": {
+            "slug": "electronic",
+            "name": "Electronic & EDM",
+            "color": "#0D73EC",
+            "description": "House, synthwave, and festival-ready electronic.",
+            "queries": ["electronic edm house", "daft punk calvin harris"],
+        },
+        "chill": {
+            "slug": "chill",
+            "name": "Chill & Unwind",
+            "color": "#1E3264",
+            "description": "Laid-back tracks for late nights and easy afternoons.",
+            "queries": ["chill acoustic vibes", "billie eilish frank ocean"],
+        },
+        "workout": {
+            "slug": "workout",
+            "name": "Workout & Energy",
+            "color": "#D84000",
+            "description": "High-tempo motivation to power every rep and run.",
+            "queries": ["workout pump up hits", "gym motivation electronic"],
+        },
+        "focus": {
+            "slug": "focus",
+            "name": "Deep Focus",
+            "color": "#503750",
+            "description": "Ambient, piano, and instrumental flow for deep work.",
+            "queries": ["ambient piano study", "instrumental focus"],
+        },
+        "rnb": {
+            "slug": "rnb",
+            "name": "R&B & Soul",
+            "color": "#8D67AB",
+            "description": "Silky vocals, neo-soul grooves, and midnight R&B.",
+            "queries": ["r&b soul sza", "the weeknd bruno mars"],
+        },
+        "acoustic": {
+            "slug": "acoustic",
+            "name": "Acoustic & Ballad",
+            "color": "#7358FF",
+            "description": "Stripped-back ballads, warm strings, and pure vocals.",
+            "queries": ["acoustic ballad", "ed sheeran adele"],
+        },
+        "lofi": {
+            "slug": "lofi",
+            "name": "Lo-Fi Beats",
+            "color": "#27856A",
+            "description": "Dusty beats to study, code, and relax to.",
+            "queries": ["lofi chill beats", "lo-fi hip hop"],
+        },
+    }
+
+    def _dedup_tracks_keep_order(
+        self, tracks: List[Dict[str, Any]], exclude_ids: Optional[set[str]] = None, limit: int = 25
+    ) -> List[Dict[str, Any]]:
+        excluded = exclude_ids or set()
+        seen_ids: set[str] = set()
+        seen_keys: set[str] = set()
+        out: List[Dict[str, Any]] = []
+        for tr in tracks:
+            if not isinstance(tr, dict):
+                continue
+            tid = str(tr.get("id") or "").strip()
+            if not tid or tid in excluded or tid in seen_ids:
+                continue
+            key = f"{lrc_parser.normalize_key(tr.get('title', ''))}::{lrc_parser.normalize_key(tr.get('artist', ''))}"
+            if key in seen_keys:
+                continue
+            seen_ids.add(tid)
+            seen_keys.add(key)
+            out.append(tr)
+            if len(out) >= limit:
+                break
+        return out
+
+    def get_genre_hub(self, slug: str, region: str = "global") -> Optional[Dict[str, Any]]:
+        clean_slug = (slug or "").strip().lower()
+        meta = self.GENRE_HUBS.get(clean_slug)
+        if not meta:
+            return None
+        region_key = "vn" if (region or "").lower() == "vn" else "global"
+        cache_key = f"{clean_slug}::{region_key}"
+        now = time.time()
+
+        if not http_client.is_offline_mode():
+            with self._lock:
+                cached = self._genre_cache.get(cache_key)
+                if cached and (now - cached[0]) < config.HOME_CACHE_TTL:
+                    payload = dict(cached[1])
+                    payload["tracks"] = self.db.annotate_tracks(payload.get("tracks") or [])
+                    return payload
+
+        if http_client.is_offline_mode():
+            tracks = [dict(t) for t in offline_catalog.OFFLINE_TRACKS]
+            self.db.upsert_tracks(tracks)
+            return {
+                "genre": {
+                    "slug": meta["slug"],
+                    "name": meta["name"],
+                    "color": meta["color"],
+                    "description": meta["description"],
+                },
+                "tracks": self.db.annotate_tracks(tracks),
+                "albums": [dict(a) for a in offline_catalog.OFFLINE_ALBUMS],
+                "artists": [dict(a) for a in offline_catalog.OFFLINE_ARTISTS],
+            }
+
+        queries = list(meta["queries"])
+        if clean_slug == "vpop" or region_key == "vn":
+            country = "vn" if clean_slug == "vpop" else "us"
+        else:
+            country = "us"
+
+        def _safe(fn, *args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                return []
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        try:
+            f_dz_t = pool.submit(_safe, deezer.search_tracks, queries[0], 20)
+            f_dz_a = pool.submit(_safe, deezer.search_albums, queries[0], 10)
+            f_dz_art = pool.submit(_safe, deezer.search_artists, queries[0], 10)
+            f_it_t = pool.submit(_safe, apple_itunes.search_songs, queries[-1], country, 16)
+            concurrent.futures.wait([f_dz_t, f_dz_a, f_dz_art, f_it_t], timeout=4.0)
+
+            dz_tracks = f_dz_t.result() if f_dz_t.done() else []
+            dz_albums = f_dz_a.result() if f_dz_a.done() else []
+            dz_artists = f_dz_art.result() if f_dz_art.done() else []
+            it_tracks = f_it_t.result() if f_it_t.done() else []
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        merged_tracks = self._dedup_tracks_keep_order(
+            (dz_tracks or []) + (it_tracks or []), limit=24
+        )
+        if not merged_tracks:
+            merged_tracks = [dict(t) for t in offline_catalog.OFFLINE_TRACKS]
+        self.db.upsert_tracks(merged_tracks)
+
+        payload = {
+            "genre": {
+                "slug": meta["slug"],
+                "name": meta["name"],
+                "color": meta["color"],
+                "description": meta["description"],
+            },
+            "tracks": merged_tracks,
+            "albums": (dz_albums or [])[:12],
+            "artists": (dz_artists or [])[:12],
+        }
+        with self._lock:
+            self._genre_cache[cache_key] = (now, payload)
+
+        out = dict(payload)
+        out["tracks"] = self.db.annotate_tracks(merged_tracks)
+        return out
+
+    def get_radio(
+        self, track_id: str = "", artist_id: str = "", limit: int = 25
+    ) -> Dict[str, Any]:
+        max_items = max(1, min(int(limit or 25), 40))
+        seed_type = "track" if track_id else "artist"
+        seed_title = ""
+        seed_artist = ""
+        resolved_artist_id = (artist_id or "").strip()
+        exclude_ids: set[str] = set()
+
+        if track_id:
+            exclude_ids.add(track_id)
+            tr = self.db.get_track(track_id)
+            if not tr and not http_client.is_offline_mode():
+                prefix, _, raw_id = track_id.partition(":")
+                try:
+                    if prefix == "dz" and raw_id:
+                        tr = deezer.get_track(raw_id)
+                    elif prefix == "it" and raw_id:
+                        tr = apple_itunes.get_track(raw_id)
+                    elif prefix == "au" and raw_id:
+                        tr = audius.get_track(raw_id)
+                except Exception:
+                    tr = None
+                if tr:
+                    self.db.upsert_track(tr)
+            if not tr and track_id.startswith("local:"):
+                tr = offline_catalog.get_offline_track(track_id)
+            if tr:
+                seed_title = str(tr.get("title") or "")
+                seed_artist = str(tr.get("artist") or "")
+                if not resolved_artist_id:
+                    resolved_artist_id = str(tr.get("artistId") or "")
+
+        if not seed_artist and resolved_artist_id:
+            cached_art_tracks = self.db.get_tracks_by_artist_id(resolved_artist_id, limit=1)
+            if cached_art_tracks:
+                seed_artist = str(cached_art_tracks[0].get("artist") or "")
+
+        candidates: List[Dict[str, Any]] = []
+
+        if not http_client.is_offline_mode():
+            # 1. Deezer native artist top + related artists' top tracks (true Spotify Radio feel)
+            dz_artist_raw = ""
+            if resolved_artist_id.startswith("dz:"):
+                dz_artist_raw = resolved_artist_id.split(":", 1)[1]
+            elif seed_artist:
+                try:
+                    primary = lrc_parser.extract_primary_artist(seed_artist)
+                    found_arts = deezer.search_artists(primary, limit=1)
+                    if found_arts:
+                        dz_artist_raw = str(found_arts[0]["id"]).split(":", 1)[-1]
+                except Exception:
+                    dz_artist_raw = ""
+
+            if dz_artist_raw:
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+                try:
+                    f_top = pool.submit(deezer.get_artist_top, dz_artist_raw, 10)
+                    f_rel = pool.submit(deezer.get_artist_related, dz_artist_raw, 6)
+                    concurrent.futures.wait([f_top, f_rel], timeout=3.5)
+                    if f_top.done():
+                        candidates.extend(f_top.result() or [])
+                    rel_artists = f_rel.result() if f_rel.done() else []
+                    rel_futs = [
+                        pool.submit(deezer.get_artist_top, str(ra["id"]).split(":", 1)[-1], 5)
+                        for ra in (rel_artists or [])[:4]
+                        if ra.get("id")
+                    ]
+                    if rel_futs:
+                        concurrent.futures.wait(rel_futs, timeout=3.0)
+                        for rf in rel_futs:
+                            if rf.done():
+                                try:
+                                    candidates.extend(rf.result() or [])
+                                except Exception:
+                                    pass
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+
+            # 2. Search fallback if related artists didn't yield enough tracks
+            if len(candidates) < max_items // 2 and (seed_artist or seed_title):
+                q = lrc_parser.extract_primary_artist(seed_artist) or seed_title
+                try:
+                    candidates.extend(deezer.search_tracks(q, limit=18) or [])
+                except Exception:
+                    pass
+                if len(candidates) < 8:
+                    try:
+                        candidates.extend(apple_itunes.search_songs(q, "us", 12) or [])
+                    except Exception:
+                        pass
+
+        # 3. Graceful offline / cached fallback so Radio & Autoplay ALWAYS work
+        if len(candidates) < 5:
+            home = self.get_home("global")
+            for sec in home.get("sections") or []:
+                if sec.get("type") == "tracks":
+                    candidates.extend(sec.get("items") or [])
+            if len(candidates) < 5:
+                candidates.extend(dict(t) for t in offline_catalog.OFFLINE_TRACKS)
+
+        final_tracks = self._dedup_tracks_keep_order(
+            candidates, exclude_ids=exclude_ids, limit=max_items
+        )
+        if final_tracks:
+            self.db.upsert_tracks(final_tracks)
+
+        return {
+            "seedType": seed_type,
+            "seedTitle": seed_title or seed_artist or "Sonify Radio",
+            "seedArtist": seed_artist,
+            "tracks": self.db.annotate_tracks(final_tracks),
+        }
+
+    def get_made_for_you(self, region: str = "global") -> Dict[str, Any]:
+        region_key = "vn" if (region or "").lower() == "vn" else "global"
+        now = time.time()
+
+        history_items = self.db.get_history(limit=30)
+        liked_tracks, _ = self.db.get_liked_tracks()
+        followed_artists, _ = self.db.get_followed_artists()
+
+        fingerprint = (
+            f"{region_key}:{len(history_items)}:{len(liked_tracks)}:{len(followed_artists)}:"
+            f"{history_items[0]['track']['id'] if history_items else ''}"
+        )
+
+        if not http_client.is_offline_mode():
+            with self._lock:
+                cached = self._mix_cache.get(fingerprint)
+                if cached and (now - cached[0]) < config.HOME_CACHE_TTL:
+                    mixes_copy = []
+                    for m in cached[1].get("mixes") or []:
+                        mc = dict(m)
+                        mc["tracks"] = self.db.annotate_tracks(mc.get("tracks") or [])
+                        mixes_copy.append(mc)
+                    return {"mixes": mixes_copy}
+
+        home = self.get_home(region_key)
+        home_global: List[Dict[str, Any]] = []
+        home_vn: List[Dict[str, Any]] = []
+        home_indie: List[Dict[str, Any]] = []
+        for sec in home.get("sections") or []:
+            if sec.get("id") == "trending-global":
+                home_global = list(sec.get("items") or [])
+            elif sec.get("id") == "trending-vn":
+                home_vn = list(sec.get("items") or [])
+            elif sec.get("id") == "audius-trending":
+                home_indie = list(sec.get("items") or [])
+
+        played_tracks = [h["track"] for h in history_items if h.get("track")]
+        played_ids = {t["id"] for t in played_tracks if t.get("id")}
+        user_seed_tracks = self._dedup_tracks_keep_order(played_tracks + liked_tracks, limit=20)
+
+        # Daily Mix 1: top played/liked artists + radio expansion
+        dm1_pool: List[Dict[str, Any]] = list(user_seed_tracks[:8])
+        if user_seed_tracks:
+            radio1 = self.get_radio(track_id=user_seed_tracks[0]["id"], limit=14)
+            dm1_pool.extend(radio1.get("tracks") or [])
+        elif followed_artists:
+            radio1 = self.get_radio(artist_id=followed_artists[0]["id"], limit=16)
+            dm1_pool.extend(radio1.get("tracks") or [])
+        dm1_pool.extend(home_global if region_key == "global" else home_vn)
+        dm1_tracks = self._dedup_tracks_keep_order(dm1_pool, limit=18)
+
+        # Daily Mix 2: secondary artist/vibe + regional blend
+        dm2_pool: List[Dict[str, Any]] = []
+        if len(user_seed_tracks) >= 2:
+            dm2_pool.extend(user_seed_tracks[1:6])
+            radio2 = self.get_radio(track_id=user_seed_tracks[1]["id"], limit=12)
+            dm2_pool.extend(radio2.get("tracks") or [])
+        dm2_pool.extend(home_vn if region_key == "global" else home_global)
+        dm2_pool.extend(home_indie)
+        dm2_tracks = self._dedup_tracks_keep_order(dm2_pool, limit=18)
+
+        # Discover Weekly: tracks user hasn't played yet from related artists / indie / charts
+        dw_pool: List[Dict[str, Any]] = []
+        if len(followed_artists) >= 1:
+            dw_radio = self.get_radio(artist_id=followed_artists[-1]["id"], limit=15)
+            dw_pool.extend(dw_radio.get("tracks") or [])
+        dw_pool.extend(home_indie)
+        dw_pool.extend(home_global)
+        dw_pool.extend(home_vn)
+        dw_tracks = self._dedup_tracks_keep_order(dw_pool, exclude_ids=played_ids, limit=18)
+        if not dw_tracks:
+            dw_tracks = self._dedup_tracks_keep_order(dw_pool, limit=18)
+
+        # Release Radar: newest releases + followed artists + fresh charts
+        rr_pool: List[Dict[str, Any]] = []
+        if followed_artists and not http_client.is_offline_mode():
+            for fa in followed_artists[:2]:
+                if str(fa["id"]).startswith("dz:"):
+                    rr_pool.extend(deezer.get_artist_top(str(fa["id"]).split(":", 1)[1], limit=6))
+        rr_pool.extend(home_global[:10])
+        rr_pool.extend(home_vn[:10])
+        rr_tracks = self._dedup_tracks_keep_order(rr_pool, limit=18)
+
+        def _artist_preview(tr_list: List[Dict[str, Any]], fallback: str) -> str:
+            names: List[str] = []
+            for t in tr_list:
+                a = str(t.get("artist") or "").strip()
+                if a and a not in names:
+                    names.append(a)
+                if len(names) >= 3:
+                    break
+            return ", ".join(names) + " and more" if names else fallback
+
+        def _first_cover(tr_list: List[Dict[str, Any]]) -> str:
+            for t in tr_list:
+                c = t.get("coverLarge") or t.get("coverSmall") or ""
+                if c:
+                    return str(c)
+            return ""
+
+        mixes = [
+            {
+                "id": "daily-mix-1",
+                "title": "Daily Mix 1",
+                "subtitle": _artist_preview(dm1_tracks, "Your favorite tracks and artists"),
+                "description": "Made for you from your recent listens, liked songs, and similar artists.",
+                "gradient": ["#1DB954", "#0D3B22"],
+                "cover": _first_cover(dm1_tracks),
+                "tracks": dm1_tracks,
+            },
+            {
+                "id": "daily-mix-2",
+                "title": "Daily Mix 2",
+                "subtitle": _artist_preview(dm2_tracks, "Fresh global & V-Pop rotation"),
+                "description": "A second personalized vibe mixing regional favorites and indie gems.",
+                "gradient": ["#7C3AED", "#1E1B4B"],
+                "cover": _first_cover(dm2_tracks),
+                "tracks": dm2_tracks,
+            },
+            {
+                "id": "discover-weekly",
+                "title": "Discover Weekly",
+                "subtitle": _artist_preview(dw_tracks, "Fresh discoveries you haven't played yet"),
+                "description": "Your weekly mixtape of fresh music and related artists you haven't heard yet.",
+                "gradient": ["#E11D48", "#3B0A1F"],
+                "cover": _first_cover(dw_tracks),
+                "tracks": dw_tracks,
+            },
+            {
+                "id": "release-radar",
+                "title": "Release Radar",
+                "subtitle": _artist_preview(rr_tracks, "Catch all the latest releases"),
+                "description": "New music from artists you follow plus fresh chart singles picked for you.",
+                "gradient": ["#0284C7", "#0C2D48"],
+                "cover": _first_cover(rr_tracks),
+                "tracks": rr_tracks,
+            },
+        ]
+
+        payload = {"mixes": mixes}
+        with self._lock:
+            if len(self._mix_cache) > 16:
+                self._mix_cache.pop(next(iter(self._mix_cache)))
+            self._mix_cache[fingerprint] = (now, payload)
+
+        annotated_mixes = []
+        for m in mixes:
+            mc = dict(m)
+            mc["tracks"] = self.db.annotate_tracks(m["tracks"])
+            annotated_mixes.append(mc)
+        return {"mixes": annotated_mixes}
+
+    def get_playlist_recommendations(
+        self, playlist_id: str, limit: int = 10
+    ) -> Optional[Dict[str, Any]]:
+        pl_data = self.db.get_playlist(playlist_id)
+        if not pl_data:
+            return None
+        max_items = max(1, min(int(limit or 10), 25))
+        existing_tracks = pl_data.get("tracks") or []
+        existing_ids = {t["id"] for t in existing_tracks if t.get("id")}
+
+        candidates: List[Dict[str, Any]] = []
+        if existing_tracks:
+            # Seed radio from up to 2 distinct artists inside the playlist
+            seen_seed_artists: set[str] = set()
+            for tr in existing_tracks:
+                art_key = lrc_parser.normalize_key(tr.get("artist", ""))
+                if art_key in seen_seed_artists:
+                    continue
+                seen_seed_artists.add(art_key)
+                radio = self.get_radio(track_id=tr["id"], limit=max_items + 4)
+                candidates.extend(radio.get("tracks") or [])
+                if len(seen_seed_artists) >= 2:
+                    break
+        else:
+            home = self.get_home("global")
+            for sec in home.get("sections") or []:
+                if sec.get("type") == "tracks":
+                    candidates.extend(sec.get("items") or [])
+
+        recs = self._dedup_tracks_keep_order(
+            candidates, exclude_ids=existing_ids, limit=max_items
+        )
+        if recs:
+            self.db.upsert_tracks(recs)
+        return {
+            "playlistId": playlist_id,
+            "tracks": self.db.annotate_tracks(recs),
+        }
+
+    def get_track_detail(self, track_id: str) -> Optional[Dict[str, Any]]:
+        if not track_id:
+            return None
+        track = self.db.get_track(track_id)
+        if not track:
+            prefix, _, raw_id = track_id.partition(":")
+            if prefix == "local":
+                track = offline_catalog.get_offline_track(track_id)
+            elif not http_client.is_offline_mode():
+                try:
+                    if prefix == "dz" and raw_id:
+                        track = deezer.get_track(raw_id)
+                    elif prefix == "it" and raw_id:
+                        track = apple_itunes.get_track(raw_id)
+                    elif prefix == "au" and raw_id:
+                        track = audius.get_track(raw_id)
+                    elif prefix == "js" and raw_id:
+                        track = jiosaavn.get_song_details(raw_id)
+                except Exception:
+                    track = None
+            if track:
+                self.db.upsert_track(track)
+                track = self.db.get_track(track_id) or track
+        if not track:
+            return None
+
+        radio = self.get_radio(track_id=track_id, limit=10)
+        return {
+            "track": track,
+            "relatedTracks": radio.get("tracks") or [],
+        }

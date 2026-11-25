@@ -1,4 +1,4 @@
-// Live Search View — Debounced search, Recent Searches, Genre Tiles, Top Result, Tabs
+// Live Search View — Debounced search, Recent Searches, 12 Dedicated Genre/Mood Hubs, Top Result, Tabs
 
 import { api } from '../api.js';
 import { renderTrackTable } from '../components/trackList.js';
@@ -9,16 +9,18 @@ import { navigate } from '../router.js';
 import { addRecentSearch, clearRecentSearches, getState, setState } from '../store.js';
 
 const GENRE_TILES = [
-  { label: 'Pop', query: 'Pop Hits', bg: 'linear-gradient(135deg, #e13300, #f59b23)' },
-  { label: 'V-Pop', query: 'V-Pop Sơn Tùng', bg: 'linear-gradient(135deg, #dc148c, #ff6b9d)' },
-  { label: 'Hip-Hop', query: 'Hip Hop Rap', bg: 'linear-gradient(135deg, #ba5d07, #e89b3c)' },
-  { label: 'K-Pop', query: 'K-Pop', bg: 'linear-gradient(135deg, #148a08, #1db954)' },
-  { label: 'Electronic', query: 'Electronic Dance', bg: 'linear-gradient(135deg, #0d73ec, #48a9ff)' },
-  { label: 'Lo-Fi & Chill', query: 'Lofi Chill', bg: 'linear-gradient(135deg, #503750, #8c67ac)' },
-  { label: 'Indie', query: 'Indie Pop', bg: 'linear-gradient(135deg, #e91429, #ff6437)' },
-  { label: 'Rock', query: 'Rock Classics', bg: 'linear-gradient(135deg, #1e3264, #477d95)' },
-  { label: 'R&B / Soul', query: 'R&B Soul', bg: 'linear-gradient(135deg, #7d4b32, #d84000)' },
-  { label: 'Acoustic', query: 'Acoustic Guitar', bg: 'linear-gradient(135deg, #006450, #1db954)' },
+  { slug: 'pop', label: 'Pop', bg: 'linear-gradient(135deg, #e13300, #f59b23)' },
+  { slug: 'vpop', label: 'V-Pop', bg: 'linear-gradient(135deg, #dc148c, #ff6b9d)' },
+  { slug: 'hiphop', label: 'Hip-Hop', bg: 'linear-gradient(135deg, #ba5d07, #e89b3c)' },
+  { slug: 'kpop', label: 'K-Pop', bg: 'linear-gradient(135deg, #148a08, #1db954)' },
+  { slug: 'indie', label: 'Indie', bg: 'linear-gradient(135deg, #e91429, #ff6437)' },
+  { slug: 'electronic', label: 'Electronic', bg: 'linear-gradient(135deg, #0d73ec, #48a9ff)' },
+  { slug: 'chill', label: 'Chill', bg: 'linear-gradient(135deg, #477d95, #1e3264)' },
+  { slug: 'workout', label: 'Workout', bg: 'linear-gradient(135deg, #777777, #2e2e2e)' },
+  { slug: 'focus', label: 'Focus', bg: 'linear-gradient(135deg, #503750, #8c67ac)' },
+  { slug: 'rnb', label: 'R&B / Soul', bg: 'linear-gradient(135deg, #7d4b32, #d84000)' },
+  { slug: 'acoustic', label: 'Acoustic', bg: 'linear-gradient(135deg, #006450, #1db954)' },
+  { slug: 'lofi', label: 'Lo-Fi Beats', bg: 'linear-gradient(135deg, #1e3264, #5c4b8a)' },
 ];
 
 let searchAbort = null;
@@ -82,7 +84,7 @@ export function renderSearchView(container) {
     isSearching = false;
   }
 
-  // Empty search -> Recent Searches + Browse Genres
+  // Empty search -> Recent Searches + Browse 12 Genre/Mood Hubs
   if (!lastQuery) {
     const recents = st.recentSearches || [];
     const recentHtml = recents.length
@@ -106,7 +108,7 @@ export function renderSearchView(container) {
 
     const genresHtml = GENRE_TILES.map(
       (g) => `
-      <div class="genre-tile" style="background: ${g.bg};" data-genre-q="${escapeHtml(g.query)}">
+      <div class="genre-tile" style="background: ${g.bg};" data-genre-slug="${escapeHtml(g.slug)}">
         <div class="genre-tile-title">${escapeHtml(g.label)}</div>
         <div class="genre-tile-badge"></div>
       </div>
@@ -119,7 +121,7 @@ export function renderSearchView(container) {
         <div class="shelf-header">
           <div>
             <h2 class="shelf-title">Browse Genres &amp; Moods</h2>
-            <p class="shelf-subtitle">Discover trending songs across Global Pop, V-Pop, K-Pop, Indie, and Electronic</p>
+            <p class="shelf-subtitle">Explore curated hubs across Pop, V-Pop, Hip-Hop, K-Pop, Chill, Focus, and Lo-Fi</p>
           </div>
         </div>
         <div class="genre-grid">${genresHtml}</div>
@@ -136,7 +138,7 @@ export function renderSearchView(container) {
     });
 
     container.querySelectorAll('.genre-tile').forEach((tile) => {
-      tile.addEventListener('click', () => navigate(`#/search?q=${encodeURIComponent(tile.dataset.genreQ)}`));
+      tile.addEventListener('click', () => navigate(`#/genre/${encodeURIComponent(tile.dataset.genreSlug)}`));
     });
     return;
   }
@@ -306,6 +308,7 @@ export function renderSearchView(container) {
       showHeader: activeTab === 'tracks',
       showAlbum: activeTab === 'tracks',
       compact: activeTab === 'all',
+      sortable: activeTab === 'tracks',
     });
   }
 

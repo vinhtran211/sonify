@@ -19,15 +19,19 @@ struct SearchView: View {
         ("albums", "Albums"),
     ]
 
-    private let moodTiles: [(String, String, Color)] = [
-        ("V-Pop Hits", "Sơn Tùng M-TP", Color(hex: 0xE8115B)),
-        ("Pop Essentials", "Taylor Swift", Color(hex: 0x1E3264)),
-        ("R&B & Chill", "The Weeknd", Color(hex: 0x8D67AB)),
-        ("K-Pop", "BLACKPINK", Color(hex: 0xE13300)),
-        ("Indie & Synth", "Tame Impala", Color(hex: 0x148A08)),
-        ("Vietnam Rap", "HIEUTHUHAI", Color(hex: 0xBC5900)),
-        ("Ballad", "Bruno Mars", Color(hex: 0x503750)),
-        ("Electronic", "Daft Punk", Color(hex: 0x0D73EC)),
+    private let genreHubs: [(String, String, Color)] = [
+        ("pop", "Pop", Color(hex: 0xE13300)),
+        ("vpop", "V-Pop", Color(hex: 0xDC148C)),
+        ("hiphop", "Hip-Hop", Color(hex: 0xBA5D07)),
+        ("kpop", "K-Pop", Color(hex: 0x148A08)),
+        ("indie", "Indie", Color(hex: 0xE91429)),
+        ("electronic", "Electronic", Color(hex: 0x0D73EC)),
+        ("chill", "Chill", Color(hex: 0x477D95)),
+        ("workout", "Workout", Color(hex: 0x555555)),
+        ("focus", "Focus", Color(hex: 0x503750)),
+        ("rnb", "R&B / Soul", Color(hex: 0x7D4B32)),
+        ("acoustic", "Acoustic", Color(hex: 0x006450)),
+        ("lofi", "Lo-Fi Beats", Color(hex: 0x1E3264)),
     ]
 
     var body: some View {
@@ -135,7 +139,7 @@ struct SearchView: View {
 
     private var browseMoodGrid: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Browse All")
+            Text("Browse Genres & Moods")
                 .font(.headline)
                 .foregroundColor(SonifyTheme.textPrimary)
 
@@ -143,10 +147,9 @@ struct SearchView: View {
                 columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
                 spacing: 12
             ) {
-                ForEach(moodTiles, id: \.0) { title, sampleQuery, color in
-                    Button {
-                        queryText = sampleQuery
-                        triggerSearch(immediate: true)
+                ForEach(genreHubs, id: \.0) { slug, title, color in
+                    NavigationLink {
+                        GenreHubView(slug: slug, title: title, accentColor: color)
                     } label: {
                         ZStack(alignment: .topLeading) {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)

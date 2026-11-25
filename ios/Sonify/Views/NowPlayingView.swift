@@ -12,13 +12,14 @@ struct NowPlayingView: View {
     @State private var showQueueSheet = false
     @State private var showAddToPlaylist = false
 
+    private let speeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
     private var displayedTime: Double {
         isDraggingSlider ? dragPosition : player.currentTime
     }
 
     var body: some View {
         ZStack {
-            // Dynamic dark Spotify gradient backdrop
             LinearGradient(
                 colors: [Color(hex: 0x1E3A2A), SonifyTheme.bgSurface, SonifyTheme.bgBase],
                 startPoint: .top,
@@ -94,18 +95,62 @@ struct NowPlayingView: View {
                             .background(info.isPreview ? SonifyTheme.warning : SonifyTheme.accentGreen.opacity(0.18))
                             .clipShape(Capsule())
                     }
-                    Text("Ad-Free")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(SonifyTheme.textSecondary)
+                    if player.sleepTimerMode == .countdown {
+                        Text("⏱ \(SonifyTheme.formatDuration(Double(player.sleepTimerRemainingSec)))")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(SonifyTheme.accentGreen)
+                    } else if player.sleepTimerMode == .endOfTrack {
+                        Text("⏱ End")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(SonifyTheme.accentGreen)
+                    } else {
+                        Text("Ad-Free")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(SonifyTheme.textSecondary)
+                    }
                 }
             }
 
             Spacer()
 
-            Button {
-                showAddToPlaylist = true
+            Menu {
+                Button {
+                    showAddToPlaylist = true
+                } label: {
+                    Label("Add to Playlist", systemImage: "plus.circle")
+                }
+
+                Button {
+                    player.startRadio(for: track)
+                } label: {
+                    Label("Start Song Radio", systemImage: "dot.radiowaves.left.and.right")
+                }
+
+                Menu("Playback Speed (\(String(format: "%.2g", player.playbackRate))x)") {
+                    ForEach(speeds, id: \.self) { spd in
+                        Button {
+                            player.setPlaybackRate(spd)
+                        } label: {
+                            HStack {
+                                Text("\(String(format: "%.2g", spd))x")
+                                if abs(player.playbackRate - spd) < 0.01 {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Menu("Sleep Timer") {
+                    Button("Off") { player.cancelSleepTimer() }
+                    Button("5 minutes") { player.setSleepTimer(minutes: 5) }
+                    Button("15 minutes") { player.setSleepTimer(minutes: 15) }
+                    Button("30 minutes") { player.setSleepTimer(minutes: 30) }
+                    Button("60 minutes") { player.setSleepTimer(minutes: 60) }
+                    Button("End of Track") { player.setSleepTimerEndOfTrack() }
+                }
             } label: {
-                Image(systemName: "plus.circle")
+                Image(systemName: "ellipsis.circle")
                     .font(.title3)
                     .foregroundColor(SonifyTheme.textPrimary)
                     .frame(width: 36, height: 36)
@@ -239,6 +284,17 @@ struct NowPlayingView: View {
         HStack {
             AirPlayButton()
                 .frame(width: 32, height: 32)
+
+            Spacer()
+
+            Button {
+                player.startRadio(for: track)
+            } label: {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.title3)
+                    .foregroundColor(SonifyTheme.textSecondary)
+                    .frame(width: 32, height: 32)
+            }
 
             Spacer()
 

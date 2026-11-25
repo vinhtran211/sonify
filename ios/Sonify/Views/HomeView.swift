@@ -46,6 +46,11 @@ struct HomeView: View {
                                 quickPicksGrid(tracks: Array(firstTracks.prefix(6)), context: firstTracks)
                             }
 
+                            // Made For You personalized mixes carousel
+                            if !library.madeForYouMixes.isEmpty {
+                                madeForYouSection(library.madeForYouMixes)
+                            }
+
                             ForEach(homeData.sections.filter { !$0.isEmpty }) { section in
                                 sectionView(section)
                             }
@@ -58,6 +63,7 @@ struct HomeView: View {
                 }
                 .refreshable {
                     await loadHome(refresh: true)
+                    await library.loadMadeForYou(force: true)
                 }
             }
             .navigationBarHidden(true)
@@ -71,12 +77,19 @@ struct HomeView: View {
                 if homeData == nil {
                     await loadHome(refresh: false)
                 }
+                await library.loadMadeForYou(force: false)
             }
             .onChange(of: library.region) { _ in
-                Task { await loadHome(refresh: false) }
+                Task {
+                    await loadHome(refresh: false)
+                    await library.loadMadeForYou(force: true)
+                }
             }
             .onChange(of: api.baseURLString) { _ in
-                Task { await loadHome(refresh: true) }
+                Task {
+                    await loadHome(refresh: true)
+                    await library.loadMadeForYou(force: true)
+                }
             }
         }
     }
@@ -108,6 +121,18 @@ struct HomeView: View {
             .background(SonifyTheme.bgHighlight)
             .clipShape(Capsule())
 
+            NavigationLink {
+                StatsView()
+            } label: {
+                Image(systemName: "chart.bar.fill")
+                    .font(.system(size: 16))
+                    .foregroundColor(SonifyTheme.accentGreen)
+                    .frame(width: 36, height: 36)
+                    .background(SonifyTheme.bgHighlight)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+
             Button {
                 showSettings = true
             } label: {
@@ -136,6 +161,67 @@ struct HomeView: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+    private func madeForYouSection(_ mixes: [MadeForYouMix]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Made For You")
+                    .font(.title3.weight(.bold))
+                    .foregroundColor(SonifyTheme.textPrimary)
+                Text("Daily Mixes, Discover Weekly & Release Radar")
+                    .font(.caption)
+                    .foregroundColor(SonifyTheme.textSecondary)
+            }
+            .padding(.horizontal)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 14) {
+                    ForEach(mixes) { mix in
+                        NavigationLink {
+                            MixDetailView(mix: mix)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ZStack(alignment: .bottomLeading) {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [Color(hexString: mix.color), SonifyTheme.bgElevated],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                        .frame(width: 148, height: 148)
+                                    if !mix.cover.isEmpty {
+                                        ArtworkView(urlString: mix.cover, size: 148, cornerRadius: 10)
+                                            .opacity(0.82)
+                                    }
+                                    Text(mix.title)
+                                        .font(.caption.weight(.heavy))
+                                        .foregroundColor(.white)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.black.opacity(0.65))
+                                        .cornerRadius(6)
+                                        .padding(8)
+                                }
+                                Text(mix.title)
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                    .lineLimit(1)
+                                Text(mix.subtitle.isEmpty ? "\(mix.tracks.count) songs" : mix.subtitle)
+                                    .font(.caption)
+                                    .foregroundColor(SonifyTheme.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            .frame(width: 148)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
     }
 
     private func quickPicksGrid(tracks: [Track], context: [Track]) -> some View {
@@ -247,6 +333,11 @@ struct HomeView: View {
                 player.enqueueNext(track)
             } label: {
                 Label("Add to Queue", systemImage: "text.badge.plus")
+            }
+            Button {
+                player.startRadio(for: track)
+            } label: {
+                Label("Go to Song Radio", systemImage: "dot.radiowaves.left.and.right")
             }
             Button {
                 Task { await library.toggleLike(track) }

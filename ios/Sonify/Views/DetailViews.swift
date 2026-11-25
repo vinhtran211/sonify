@@ -7,6 +7,7 @@ struct ArtistDetailView: View {
     var initialArtist: Artist?
 
     @EnvironmentObject private var api: APIClient
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
 
     @State private var detail: ArtistDetailResponse?
@@ -28,17 +29,47 @@ struct ArtistDetailView: View {
                                 .font(.title.weight(.bold))
                                 .foregroundColor(SonifyTheme.textPrimary)
                                 .multilineTextAlignment(.center)
-                            if let tracks = detail?.topTracks, let first = tracks.first {
+
+                            HStack(spacing: 10) {
+                                if let tracks = detail?.topTracks, let first = tracks.first {
+                                    Button {
+                                        player.play(track: first, context: tracks)
+                                    } label: {
+                                        Label("Play", systemImage: "play.fill")
+                                            .font(.subheadline.weight(.bold))
+                                            .foregroundColor(.black)
+                                            .padding(.horizontal, 22)
+                                            .padding(.vertical, 10)
+                                            .background(SonifyTheme.accentGreen)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+
+                                let following = library.isFollowing(artist.id)
                                 Button {
-                                    player.play(track: first, context: tracks)
+                                    Task { await library.toggleFollow(artist: artist) }
                                 } label: {
-                                    Label("Play Top Tracks", systemImage: "play.fill")
+                                    Text(following ? "Following" : "Follow")
                                         .font(.subheadline.weight(.bold))
-                                        .foregroundColor(.black)
-                                        .padding(.horizontal, 28)
-                                        .padding(.vertical, 12)
-                                        .background(SonifyTheme.accentGreen)
+                                        .foregroundColor(following ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                        .padding(.horizontal, 18)
+                                        .padding(.vertical, 10)
+                                        .background(SonifyTheme.bgHighlight)
+                                        .overlay(
+                                            Capsule().stroke(following ? SonifyTheme.accentGreen : Color.white.opacity(0.25), lineWidth: 1)
+                                        )
                                         .clipShape(Capsule())
+                                }
+
+                                Button {
+                                    player.startArtistRadio(artistId: artist.id, name: artist.name)
+                                } label: {
+                                    Image(systemName: "dot.radiowaves.left.and.right")
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(SonifyTheme.textPrimary)
+                                        .frame(width: 40, height: 40)
+                                        .background(SonifyTheme.bgHighlight)
+                                        .clipShape(Circle())
                                 }
                             }
                         }
@@ -136,6 +167,7 @@ struct AlbumDetailView: View {
     var initialAlbum: Album?
 
     @EnvironmentObject private var api: APIClient
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
 
     @State private var detail: AlbumDetailResponse?
@@ -160,16 +192,32 @@ struct AlbumDetailView: View {
                             Text(album.artist)
                                 .font(.subheadline)
                                 .foregroundColor(SonifyTheme.textSecondary)
-                            if let tracks = detail?.tracks, let first = tracks.first {
+
+                            HStack(spacing: 12) {
+                                if let tracks = detail?.tracks, let first = tracks.first {
+                                    Button {
+                                        player.play(track: first, context: tracks)
+                                    } label: {
+                                        Label("Play Album", systemImage: "play.fill")
+                                            .font(.subheadline.weight(.bold))
+                                            .foregroundColor(.black)
+                                            .padding(.horizontal, 26)
+                                            .padding(.vertical, 11)
+                                            .background(SonifyTheme.accentGreen)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+
+                                let saved = library.isAlbumSaved(album.id)
                                 Button {
-                                    player.play(track: first, context: tracks)
+                                    Task { await library.toggleSave(album: album) }
                                 } label: {
-                                    Label("Play Album", systemImage: "play.fill")
+                                    Label(saved ? "Saved" : "Save", systemImage: saved ? "heart.fill" : "heart")
                                         .font(.subheadline.weight(.bold))
-                                        .foregroundColor(.black)
-                                        .padding(.horizontal, 32)
-                                        .padding(.vertical, 12)
-                                        .background(SonifyTheme.accentGreen)
+                                        .foregroundColor(saved ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                        .padding(.horizontal, 18)
+                                        .padding(.vertical, 11)
+                                        .background(SonifyTheme.bgHighlight)
                                         .clipShape(Capsule())
                                 }
                             }
@@ -224,7 +272,7 @@ struct AlbumDetailView: View {
     }
 }
 
-// MARK: - Playlist Detail View
+// MARK: - Playlist Detail View (with Duplicate & Recommendations)
 
 struct PlaylistDetailView: View {
     let playlistId: String
@@ -237,6 +285,7 @@ struct PlaylistDetailView: View {
 
     @State private var playlist: Playlist?
     @State private var tracks: [Track] = []
+    @State private var recommendations: [Track] = []
     @State private var isLoading = false
     @State private var showEditSheet = false
     @State private var editName = ""
@@ -289,12 +338,12 @@ struct PlaylistDetailView: View {
                         .frame(maxWidth: .infinity)
                         .listRowBackground(SonifyTheme.bgSurface)
                 } else if tracks.isEmpty {
-                    Text("No songs yet. Tap ••• on any song to add it here.")
+                    Text("No songs yet. Tap ••• on any song or add from Recommended below.")
                         .font(.subheadline)
                         .foregroundColor(SonifyTheme.textSecondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 32)
+                        .padding(.vertical, 24)
                         .listRowBackground(SonifyTheme.bgSurface)
                         .listRowSeparator(.hidden)
                 } else {
@@ -319,6 +368,46 @@ struct PlaylistDetailView: View {
                     }
                 }
 
+                if !recommendations.isEmpty {
+                    Section {
+                        ForEach(recommendations) { rec in
+                            HStack(spacing: 12) {
+                                ArtworkView(urlString: rec.bestCoverURL, size: 44, cornerRadius: 6)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(rec.title)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundColor(SonifyTheme.textPrimary)
+                                        .lineLimit(1)
+                                    Text(rec.artist)
+                                        .font(.caption)
+                                        .foregroundColor(SonifyTheme.textSecondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Button {
+                                    Task {
+                                        await library.addTrack(rec, toPlaylistId: playlistId)
+                                        await reload()
+                                    }
+                                } label: {
+                                    Text("+ Add")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundColor(SonifyTheme.textPrimary)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 6)
+                                        .background(SonifyTheme.bgHighlight)
+                                        .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .listRowBackground(SonifyTheme.bgSurface)
+                        }
+                    } header: {
+                        Text("Recommended Songs")
+                            .foregroundColor(SonifyTheme.textSecondary)
+                    }
+                }
+
                 Color.clear
                     .frame(height: 88)
                     .listRowBackground(Color.clear)
@@ -339,6 +428,11 @@ struct PlaylistDetailView: View {
                         showEditSheet = true
                     } label: {
                         Label("Edit Details", systemImage: "pencil")
+                    }
+                    Button {
+                        Task { _ = await library.duplicatePlaylist(id: playlistId) }
+                    } label: {
+                        Label("Duplicate Playlist", systemImage: "doc.on.doc")
                     }
                     Button(role: .destructive) {
                         Task {
@@ -408,7 +502,366 @@ struct PlaylistDetailView: View {
             playlist = res.playlist
             tracks = res.tracks
         }
+        if let recRes = try? await api.getPlaylistRecommendations(id: playlistId, limit: 8) {
+            recommendations = recRes.tracks
+        }
         isLoading = false
+    }
+}
+
+// MARK: - Made For You Mix Detail View
+
+struct MixDetailView: View {
+    let mix: MadeForYouMix
+
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
+    @State private var playlistTargetTrack: Track?
+
+    var body: some View {
+        ZStack {
+            SonifyTheme.bgSurface.ignoresSafeArea()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    VStack(spacing: 12) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [Color(hexString: mix.color), SonifyTheme.bgElevated],
+                                        startPoint: .topLeading,
+                                        endPoint: .bottomTrailing
+                                    )
+                                )
+                                .frame(width: 200, height: 200)
+                            if !mix.cover.isEmpty {
+                                ArtworkView(urlString: mix.cover, size: 200, cornerRadius: 14)
+                                    .opacity(0.88)
+                            }
+                        }
+                        Text(mix.title)
+                            .font(.title2.weight(.bold))
+                            .foregroundColor(SonifyTheme.textPrimary)
+                        if !mix.subtitle.isEmpty {
+                            Text(mix.subtitle)
+                                .font(.caption)
+                                .foregroundColor(SonifyTheme.textSecondary)
+                                .multilineTextAlignment(.center)
+                        }
+
+                        HStack(spacing: 12) {
+                            if let first = mix.tracks.first {
+                                Button {
+                                    player.play(track: first, context: mix.tracks)
+                                } label: {
+                                    Label("Play Mix", systemImage: "play.fill")
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(.black)
+                                        .padding(.horizontal, 26)
+                                        .padding(.vertical, 11)
+                                        .background(SonifyTheme.accentGreen)
+                                        .clipShape(Capsule())
+                                }
+                            }
+
+                            Button {
+                                Task {
+                                    if let created = await library.createPlaylist(name: mix.title, description: mix.subtitle) {
+                                        for tr in mix.tracks {
+                                            await library.addTrack(tr, toPlaylistId: created.id)
+                                        }
+                                        library.showToast("Saved \(mix.title) as Playlist")
+                                    }
+                                }
+                            } label: {
+                                Label("Save Playlist", systemImage: "plus")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 11)
+                                    .background(SonifyTheme.bgHighlight)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 12)
+
+                    VStack(spacing: 4) {
+                        ForEach(Array(mix.tracks.enumerated()), id: \.element.id) { idx, track in
+                            TrackRowView(
+                                track: track,
+                                indexNumber: idx + 1,
+                                onTap: { player.play(track: track, context: mix.tracks) },
+                                onAddToPlaylist: { playlistTargetTrack = $0 }
+                            )
+                        }
+                    }
+                    .padding(.horizontal)
+
+                    Color.clear.frame(height: 88)
+                }
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $playlistTargetTrack) { track in
+            AddToPlaylistSheet(track: track)
+        }
+    }
+}
+
+// MARK: - Genre & Mood Hub View
+
+struct GenreHubView: View {
+    let slug: String
+    let title: String
+    let accentColor: Color
+
+    @EnvironmentObject private var api: APIClient
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
+
+    @State private var hub: GenreHubResponse?
+    @State private var isLoading = false
+    @State private var playlistTargetTrack: Track?
+
+    var body: some View {
+        ZStack {
+            SonifyTheme.bgSurface.ignoresSafeArea()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("GENRE & MOOD HUB")
+                            .font(.caption2.weight(.bold))
+                            .foregroundColor(.white.opacity(0.8))
+                        Text(hub?.genre.name ?? title)
+                            .font(.largeTitle.weight(.heavy))
+                            .foregroundColor(.white)
+                        if let tracks = hub?.tracks, let first = tracks.first {
+                            Button {
+                                player.play(track: first, context: tracks)
+                            } label: {
+                                Label("Play All", systemImage: "play.fill")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(.black)
+                                    .padding(.horizontal, 24)
+                                    .padding(.vertical, 10)
+                                    .background(SonifyTheme.accentGreen)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(20)
+                    .background(
+                        LinearGradient(
+                            colors: [accentColor, SonifyTheme.bgElevated],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .cornerRadius(14)
+                    .padding(.horizontal)
+
+                    if isLoading && hub == nil {
+                        ProgressView()
+                            .tint(SonifyTheme.accentGreen)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 40)
+                    } else if let hub {
+                        if !hub.tracks.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Popular Tracks")
+                                    .font(.headline)
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                ForEach(Array(hub.tracks.enumerated()), id: \.element.id) { idx, track in
+                                    TrackRowView(
+                                        track: track,
+                                        indexNumber: idx + 1,
+                                        onTap: { player.play(track: track, context: hub.tracks) },
+                                        onAddToPlaylist: { playlistTargetTrack = $0 }
+                                    )
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+
+                        if !hub.albums.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Albums")
+                                    .font(.headline)
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                    .padding(.horizontal)
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(spacing: 14) {
+                                        ForEach(hub.albums) { album in
+                                            NavigationLink {
+                                                AlbumDetailView(albumId: album.id, initialAlbum: album)
+                                            } label: {
+                                                VStack(alignment: .leading, spacing: 6) {
+                                                    ArtworkView(urlString: album.bestCoverURL, size: 128, cornerRadius: 8)
+                                                    Text(album.title)
+                                                        .font(.caption.weight(.semibold))
+                                                        .foregroundColor(SonifyTheme.textPrimary)
+                                                        .lineLimit(1)
+                                                }
+                                                .frame(width: 128)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+                                    }
+                                    .padding(.horizontal)
+                                }
+                            }
+                        }
+                    }
+
+                    Color.clear.frame(height: 88)
+                }
+                .padding(.top, 8)
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $playlistTargetTrack) { track in
+            AddToPlaylistSheet(track: track)
+        }
+        .task {
+            isLoading = true
+            hub = try? await api.getGenreHub(slug: slug, region: library.region)
+            isLoading = false
+        }
+    }
+}
+
+// MARK: - Sound Capsule Stats View
+
+struct StatsView: View {
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
+
+    @State private var playlistTargetTrack: Track?
+
+    var body: some View {
+        ZStack {
+            SonifyTheme.bgSurface.ignoresSafeArea()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    if let stats = library.stats {
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                            spacing: 12
+                        ) {
+                            kpiCard(value: "\(stats.totalMinutes)", label: "Minutes Listened")
+                            kpiCard(value: "\(stats.totalPlays)", label: "Total Plays")
+                            kpiCard(value: "\(stats.streakDays)d", label: "Listening Streak")
+                            kpiCard(value: "\(stats.likedCount)", label: "Liked Songs")
+                        }
+                        .padding(.horizontal)
+
+                        // 24-hour distribution bar chart
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Listening by Hour")
+                                .font(.headline)
+                                .foregroundColor(SonifyTheme.textPrimary)
+                            let maxVal = max(stats.hourlyCounts.max() ?? 1, 1)
+                            HStack(alignment: .bottom, spacing: 3) {
+                                ForEach(0..<min(24, stats.hourlyCounts.count), id: \.self) { hr in
+                                    let count = stats.hourlyCounts[hr]
+                                    let frac = CGFloat(count) / CGFloat(maxVal)
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(count > 0 ? SonifyTheme.accentGreen : SonifyTheme.bgHighlight)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: max(6, frac * 96))
+                                }
+                            }
+                            .frame(height: 100, alignment: .bottom)
+                            .padding(12)
+                            .background(SonifyTheme.bgElevated)
+                            .cornerRadius(12)
+                        }
+                        .padding(.horizontal)
+
+                        if !stats.topArtists.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Top Artists")
+                                    .font(.headline)
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                ForEach(Array(stats.topArtists.prefix(6).enumerated()), id: \.element.id) { idx, ar in
+                                    HStack(spacing: 12) {
+                                        Text("#\(idx + 1)")
+                                            .font(.subheadline.weight(.heavy))
+                                            .foregroundColor(SonifyTheme.accentGreen)
+                                            .frame(width: 28)
+                                        ArtworkView(urlString: ar.coverSmall, size: 42, isCircular: true, symbolName: "person.fill")
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(ar.artist)
+                                                .font(.subheadline.weight(.semibold))
+                                                .foregroundColor(SonifyTheme.textPrimary)
+                                            Text("\(ar.playCount) plays")
+                                                .font(.caption)
+                                                .foregroundColor(SonifyTheme.textSecondary)
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(10)
+                                    .background(SonifyTheme.bgElevated)
+                                    .cornerRadius(10)
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+
+                        if !stats.topTracks.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Top Tracks")
+                                    .font(.headline)
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                ForEach(Array(stats.topTracks.enumerated()), id: \.element.id) { idx, track in
+                                    TrackRowView(
+                                        track: track,
+                                        indexNumber: idx + 1,
+                                        onTap: { player.play(track: track, context: stats.topTracks) },
+                                        onAddToPlaylist: { playlistTargetTrack = $0 }
+                                    )
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    } else {
+                        ProgressView()
+                            .tint(SonifyTheme.accentGreen)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 60)
+                    }
+
+                    Color.clear.frame(height: 88)
+                }
+                .padding(.top, 12)
+            }
+        }
+        .navigationTitle("Sound Capsule")
+        .navigationBarTitleDisplayMode(.large)
+        .sheet(item: $playlistTargetTrack) { track in
+            AddToPlaylistSheet(track: track)
+        }
+        .task {
+            await library.loadStats()
+        }
+    }
+
+    private func kpiCard(value: String, label: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(value)
+                .font(.title.weight(.heavy))
+                .foregroundColor(SonifyTheme.accentGreen)
+            Text(label)
+                .font(.caption)
+                .foregroundColor(SonifyTheme.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(SonifyTheme.bgElevated)
+        .cornerRadius(12)
     }
 }
 

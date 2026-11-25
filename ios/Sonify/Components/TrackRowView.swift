@@ -7,11 +7,17 @@ struct TrackRowView: View {
     var onTap: () -> Void
     var onAddToPlaylist: ((Track) -> Void)? = nil
 
+    @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var player: AudioPlayerService
     @EnvironmentObject private var library: LibraryStore
 
     private var isCurrent: Bool {
         player.currentTrack?.id == track.id
+    }
+
+    private var trackShareURL: URL? {
+        let encoded = APIClient.encodePathSegment(track.id)
+        return URL(string: "\(api.baseURLString)/#/track/\(encoded)")
     }
 
     var body: some View {
@@ -87,6 +93,12 @@ struct TrackRowView: View {
                     }
 
                     Button {
+                        player.startRadio(for: track)
+                    } label: {
+                        Label("Go to Song Radio", systemImage: "dot.radiowaves.left.and.right")
+                    }
+
+                    Button {
                         Task { await library.toggleLike(track) }
                     } label: {
                         Label(
@@ -100,6 +112,12 @@ struct TrackRowView: View {
                             onAddToPlaylist(track)
                         } label: {
                             Label("Add to Playlist", systemImage: "plus.circle")
+                        }
+                    }
+
+                    if let shareURL = trackShareURL {
+                        ShareLink(item: shareURL, subject: Text(track.title), message: Text("\(track.title) by \(track.artist) on Sonify")) {
+                            Label("Share Track", systemImage: "square.and.arrow.up")
                         }
                     }
                 } label: {

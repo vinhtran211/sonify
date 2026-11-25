@@ -2,9 +2,16 @@
 
 import { api } from '../api.js';
 import { escapeHtml } from '../lrc.js';
-import { enqueueLater, enqueueNext, playTrack } from '../player.js';
+import { downloadTrack, isDownloaded, removeDownload } from '../offlineDownloads.js';
+import {
+  enqueueLater,
+  enqueueNext,
+  playTrack,
+  startArtistRadio,
+  startSongRadio,
+} from '../player.js';
 import { navigate } from '../router.js';
-import { getState, refreshPlaylists, setState, toggleLike } from '../store.js';
+import { getState, refreshDownloads, refreshPlaylists, setState, toggleLike } from '../store.js';
 import { openCreatePlaylistModal, showToast } from './modals.js';
 
 let menuOpen = false;
@@ -28,6 +35,7 @@ export function openTrackContextMenu(track, x, y, options = {}) {
 
   const st = getState();
   const isLiked = st.likedIds.has(track.id);
+  const downloaded = isDownloaded(track.id);
   const playlists = st.playlists || [];
   const flipSubmenu = x > window.innerWidth - 440;
 
@@ -49,7 +57,11 @@ export function openTrackContextMenu(track, x, y, options = {}) {
     <button class="ctx-item" data-action="play-next">Play Next</button>
     <button class="ctx-item" data-action="add-queue">Add to Queue</button>
     <div class="ctx-divider"></div>
+    <button class="ctx-item" data-action="song-radio">Go to Song Radio</button>
+    ${track.artistId ? '<button class="ctx-item" data-action="artist-radio">Go to Artist Radio</button>' : ''}
+    <div class="ctx-divider"></div>
     <button class="ctx-item" data-action="toggle-like">${isLiked ? 'Remove from Liked Songs' : 'Save to Liked Songs'}</button>
+    <button class="ctx-item" data-action="toggle-download">${downloaded ? 'Remove Offline Download' : 'Download for Offline'}</button>
     <div class="ctx-submenu-wrap">
       <button class="ctx-item" type="button">
         <span>Add to Playlist</span>
@@ -64,6 +76,7 @@ export function openTrackContextMenu(track, x, y, options = {}) {
     ${removeFromPlHtml}
     <div class="ctx-divider"></div>
     <button class="ctx-item" data-action="view-lyrics">View Lyrics</button>
+    <button class="ctx-item" data-action="copy-link">Copy Song Link</button>
     ${track.artistId ? '<button class="ctx-item" data-action="go-artist">Go to Artist</button>' : ''}
     ${track.albumId ? '<button class="ctx-item" data-action="go-album">Go to Album</button>' : ''}
   `;
@@ -93,9 +106,24 @@ export function openTrackContextMenu(track, x, y, options = {}) {
       } else if (action === 'add-queue') {
         enqueueLater(track);
         showToast(`Added "${track.title}" to queue`, 'info');
+      } else if (action === 'song-radio') {
+        startSongRadio(track);
+      } else if (action === 'artist-radio' && track.artistId) {
+        startArtistRadio(track.artistId, track.artist);
       } else if (action === 'toggle-like') {
         const liked = await toggleLike(track);
         showToast(liked ? 'Saved to Liked Songs' : 'Removed from Liked Songs', liked ? 'success' : 'info');
+      } else if (action === 'toggle-download') {
+        if (isDownloaded(track.id)) {
+          await removeDownload(track.id);
+          refreshDownloads();
+          showToast(`Removed "${track.title}" from offline downloads`, 'info');
+        } else {
+          showToast(`Downloading "${track.title}"...`, 'info', 2200);
+          await downloadTrack(track);
+          refreshDownloads();
+          showToast(`Saved "${track.title}" for offline playback`, 'success');
+        }
       } else if (action === 'new-pl-with-track') {
         openCreatePlaylistModal(track);
       } else if (action === 'add-to-pl') {
@@ -114,6 +142,14 @@ export function openTrackContextMenu(track, x, y, options = {}) {
           playTrack(track, options.contextTracks || null);
         }
         setState({ drawerMode: 'lyrics' });
+      } else if (action === 'copy-link') {
+        const shareUrl = `${window.location.origin}/#/track/${encodeURIComponent(track.id)}`;
+        try {
+          await navigator.clipboard.writeText(shareUrl);
+          showToast('Song link copied to clipboard', 'success');
+        } catch {
+          showToast(shareUrl, 'info', 3500);
+        }
       } else if (action === 'go-artist' && track.artistId) {
         navigate(`#/artist/${encodeURIComponent(track.artistId)}`);
       } else if (action === 'go-album' && track.albumId) {

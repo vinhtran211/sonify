@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
     @Environment(\.dismiss) private var dismiss
 
     @State private var serverInput: String = ""
@@ -15,6 +16,52 @@ struct SettingsView: View {
             ZStack {
                 SonifyTheme.bgSurface.ignoresSafeArea()
                 Form {
+                    Section("Playback & Audio") {
+                        Toggle("Autoplay Similar Songs", isOn: Binding(
+                            get: { library.settings.autoplay },
+                            set: { val in Task { await library.updateAudioSettings(autoplay: val) } }
+                        ))
+                        .tint(SonifyTheme.accentGreen)
+
+                        Picker("Audio Quality", selection: Binding(
+                            get: { library.settings.audioQuality },
+                            set: { val in Task { await library.updateAudioSettings(audioQuality: val) } }
+                        )) {
+                            Text("Auto").tag("auto")
+                            Text("Lossless FLAC").tag("lossless")
+                            Text("Fast").tag("fast")
+                        }
+
+                        Picker("Playback Speed", selection: Binding(
+                            get: { player.playbackRate },
+                            set: { spd in player.setPlaybackRate(spd) }
+                        )) {
+                            Text("0.5x").tag(Float(0.5))
+                            Text("0.75x").tag(Float(0.75))
+                            Text("1.0x").tag(Float(1.0))
+                            Text("1.25x").tag(Float(1.25))
+                            Text("1.5x").tag(Float(1.5))
+                            Text("2.0x").tag(Float(2.0))
+                        }
+
+                        Stepper(
+                            "Crossfade: \(library.settings.crossfade == 0 ? "Off" : "\(library.settings.crossfade)s")",
+                            value: Binding(
+                                get: { library.settings.crossfade },
+                                set: { val in Task { await library.updateAudioSettings(crossfade: val) } }
+                            ),
+                            in: 0...12
+                        )
+
+                        NavigationLink {
+                            StatsView()
+                        } label: {
+                            Label("Sound Capsule Listening Stats", systemImage: "chart.bar.fill")
+                                .foregroundColor(SonifyTheme.accentGreen)
+                        }
+                    }
+                    .listRowBackground(SonifyTheme.bgElevated)
+
                     Section {
                         TextField("https://sonify-music.onrender.com", text: $serverInput)
                             .keyboardType(.URL)

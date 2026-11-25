@@ -209,3 +209,31 @@ def get_album(raw_id: str) -> Optional[Tuple[Dict[str, Any], List[Dict[str, Any]
     ]
     album["totalDuration"] = int(info.get("duration") or sum(t["duration"] for t in tracks))
     return album, tracks
+
+
+def get_artist_top(raw_id: str, limit: int = 15) -> List[Dict[str, Any]]:
+    """Fetch top tracks for a Deezer artist ID."""
+    if not raw_id:
+        return []
+    try:
+        data = http_client.fetch_json(
+            f"{BASE_URL}/artist/{raw_id}/top?limit={max(1, min(limit, 50))}",
+            timeout=config.PROVIDER_TIMEOUT,
+        )
+        return [t for t in (_normalize_track(x) for x in (data.get("data") or [])) if t]
+    except Exception:
+        return []
+
+
+def get_artist_related(raw_id: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Fetch related artists for a Deezer artist ID (powers Song/Artist Radio & Discover Weekly)."""
+    if not raw_id:
+        return []
+    try:
+        data = http_client.fetch_json(
+            f"{BASE_URL}/artist/{raw_id}/related?limit={max(1, min(limit, 25))}",
+            timeout=config.PROVIDER_TIMEOUT,
+        )
+        return [a for a in (_normalize_artist(x) for x in (data.get("data") or [])) if a]
+    except Exception:
+        return []
