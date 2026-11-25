@@ -3,12 +3,18 @@ import SwiftUI
 struct MiniPlayerBar: View {
     @EnvironmentObject private var player: AudioPlayerService
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
 
     var body: some View {
         if let track = player.currentTrack {
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
-                    ArtworkView(urlString: track.bestCoverURL, size: 44, cornerRadius: 6)
+                    ArtworkView(
+                        urlString: track.bestCoverURL,
+                        localImageData: offlineDownloads.localArtworkData(for: track.id),
+                        size: 44,
+                        cornerRadius: 6
+                    )
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(track.title)
@@ -16,6 +22,11 @@ struct MiniPlayerBar: View {
                             .foregroundColor(SonifyTheme.textPrimary)
                             .lineLimit(1)
                         HStack(spacing: 5) {
+                            if player.streamInfo?.isOfflineDownload == true || offlineDownloads.isDownloaded(track.id) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(SonifyTheme.accentGreen)
+                            }
                             Text(track.artist)
                                 .font(.caption)
                                 .foregroundColor(SonifyTheme.textSecondary)

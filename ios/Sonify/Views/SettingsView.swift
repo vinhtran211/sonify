@@ -4,18 +4,59 @@ struct SettingsView: View {
     @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
     @Environment(\.dismiss) private var dismiss
 
     @State private var serverInput: String = ""
     @State private var healthResult: HealthResponse?
     @State private var healthError: String?
     @State private var isTestingHealth = false
+    @State private var showClearDownloadsDialog = false
 
     var body: some View {
         NavigationStack {
             ZStack {
                 SonifyTheme.bgSurface.ignoresSafeArea()
                 Form {
+                    Section {
+                        Toggle("Offline Mode", isOn: $offlineDownloads.offlineModeEnabled)
+                            .tint(SonifyTheme.accentGreen)
+
+                        HStack {
+                            Text("Downloaded Songs")
+                            Spacer()
+                            Text("\(offlineDownloads.downloadedTracks.count)")
+                                .foregroundColor(SonifyTheme.textSecondary)
+                        }
+
+                        HStack {
+                            Text("Storage Used")
+                            Spacer()
+                            Text(offlineDownloads.formattedTotalSize)
+                                .foregroundColor(SonifyTheme.accentGreen)
+                        }
+
+                        NavigationLink {
+                            DownloadsView()
+                        } label: {
+                            Label("Manage Offline Downloads", systemImage: "arrow.down.circle.fill")
+                                .foregroundColor(SonifyTheme.accentGreen)
+                        }
+
+                        if !offlineDownloads.downloadedTracks.isEmpty {
+                            Button(role: .destructive) {
+                                showClearDownloadsDialog = true
+                            } label: {
+                                Label("Clear All Downloads", systemImage: "trash")
+                            }
+                        }
+                    } header: {
+                        Text("Offline Downloads & Storage")
+                    } footer: {
+                        Text("Downloaded tracks store audio, cover artwork, and synced lyrics locally on this iPhone for 100% Airplane-Mode playback (excluded from iCloud Backup).")
+                    }
+                    .listRowBackground(SonifyTheme.bgElevated)
+
                     Section("Playback & Audio") {
                         Toggle("Autoplay Similar Songs", isOn: Binding(
                             get: { library.settings.autoplay },
@@ -172,6 +213,19 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                         .foregroundColor(SonifyTheme.accentGreen)
                 }
+            }
+            .confirmationDialog(
+                "Remove all downloaded songs?",
+                isPresented: $showClearDownloadsDialog,
+                titleVisibility: .visible
+            ) {
+                Button("Delete \(offlineDownloads.downloadedTracks.count) Downloads (\(offlineDownloads.formattedTotalSize))", role: .destructive) {
+                    offlineDownloads.clearAllDownloads()
+                    library.showToast("Cleared all offline downloads")
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This frees up local storage on your iPhone. You can re-download tracks anytime when online.")
             }
             .onAppear {
                 serverInput = api.baseURLString

@@ -2,6 +2,8 @@ import SwiftUI
 
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
 
     @State private var showCreateAlert = false
     @State private var newName = ""
@@ -15,6 +17,7 @@ struct LibraryView: View {
         ("playlists", "Playlists"),
         ("artists", "Artists"),
         ("albums", "Albums"),
+        ("downloads", "Downloads"),
     ]
 
     private var filteredPlaylists: [Playlist] {
@@ -34,6 +37,13 @@ struct LibraryView: View {
         let base = q.isEmpty
             ? library.savedAlbums
             : library.savedAlbums.filter { $0.title.lowercased().contains(q) || $0.artist.lowercased().contains(q) }
+        return sortAlphabetical ? base.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } : base
+    }
+
+    private var filteredDownloadedTracks: [Track] {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let all = offlineDownloads.downloadedTracks.map(\.track)
+        let base = q.isEmpty ? all : all.filter { $0.title.lowercased().contains(q) || $0.artist.lowercased().contains(q) }
         return sortAlphabetical ? base.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending } : base
     }
 
@@ -87,6 +97,68 @@ struct LibraryView: View {
                         .padding(.horizontal)
 
                     List {
+                        // Offline Downloads Pin (always accessible in All & Downloads tabs — works in Airplane Mode)
+                        if selectedFilter == "all" || selectedFilter == "downloads" {
+                            NavigationLink {
+                                DownloadsView()
+                            } label: {
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        LinearGradient(
+                                            colors: [Color(hex: 0x006450), SonifyTheme.accentGreen],
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                        Image(systemName: "arrow.down.circle.fill")
+                                            .font(.title3)
+                                            .foregroundColor(.white)
+                                    }
+                                    .frame(width: 54, height: 54)
+                                    .cornerRadius(8)
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Downloads")
+                                            .font(.subheadline.weight(.bold))
+                                            .foregroundColor(SonifyTheme.textPrimary)
+                                        let count = offlineDownloads.downloadedTracks.count
+                                        Text("\(count) \(count == 1 ? "song" : "songs") • \(offlineDownloads.formattedTotalSize)")
+                                            .font(.caption)
+                                            .foregroundColor(SonifyTheme.textSecondary)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .listRowBackground(SonifyTheme.bgSurface)
+                        }
+
+                        if selectedFilter == "downloads" {
+                            Section {
+                                if filteredDownloadedTracks.isEmpty {
+                                    Text("No offline downloads yet. Tap ••• on any track or Download All on a playlist.")
+                                        .font(.caption)
+                                        .foregroundColor(SonifyTheme.textSecondary)
+                                        .listRowBackground(SonifyTheme.bgSurface)
+                                } else {
+                                    ForEach(filteredDownloadedTracks) { track in
+                                        TrackRowView(
+                                            track: track,
+                                            onTap: { player.play(track: track, context: filteredDownloadedTracks) }
+                                        )
+                                        .listRowBackground(SonifyTheme.bgSurface)
+                                    }
+                                    .onDelete { offsets in
+                                        let ids = offsets.compactMap { $0 < filteredDownloadedTracks.count ? filteredDownloadedTracks[$0].id : nil }
+                                        for id in ids {
+                                            offlineDownloads.removeDownload(trackId: id)
+                                        }
+                                    }
+                                }
+                            } header: {
+                                Text("Downloaded Songs")
+                                    .foregroundColor(SonifyTheme.textSecondary)
+                            }
+                        }
+
                         if selectedFilter == "all" || selectedFilter == "playlists" {
                             // Liked Songs Pin
                             NavigationLink {
@@ -283,7 +355,9 @@ struct LibraryView: View {
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
                     .refreshable {
-                        await library.hydrateAll()
+                        if !offlineDownloads.offlineModeEnabled {
+                            await library.hydrateAll()
+                        }
                     }
                 }
             }

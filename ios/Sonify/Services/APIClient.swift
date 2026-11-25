@@ -21,7 +21,7 @@ enum SonifyAPIError: Error, LocalizedError, Equatable {
     }
 }
 
-final class APIClient: ObservableObject {
+final class APIClient: ObservableObject, @unchecked Sendable {
     static let defaultServerURL = "https://sonify-music.onrender.com"
     private static let serverURLDefaultsKey = "sonify.serverBaseURL"
     private static let pathSegmentAllowed: CharacterSet = {

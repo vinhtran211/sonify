@@ -30,15 +30,21 @@ struct StreamDiagnostic: Decodable, Equatable {
 }
 
 enum PlaybackRoute: Equatable {
+    case local(URL)
     case hls(URL)
     case direct(URL)
     case proxy(URL)
 
     var url: URL {
         switch self {
-        case .hls(let u), .direct(let u), .proxy(let u):
+        case .local(let u), .hls(let u), .direct(let u), .proxy(let u):
             return u
         }
+    }
+
+    var isLocal: Bool {
+        if case .local = self { return true }
+        return false
     }
 
     var isProxy: Bool {
@@ -65,15 +71,51 @@ struct StreamInfoResponse: Decodable, Equatable {
     let diagnostics: [StreamDiagnostic]?
     let cloudMode: Bool?
 
+    init(
+        trackId: String,
+        streamUrl: String,
+        streamUrlWithExt: String? = nil,
+        streamMode: String,
+        streamSource: String,
+        contentType: String,
+        adFree: Bool = true,
+        hlsUrl: String? = nil,
+        directUrl: String? = nil,
+        diagnostics: [StreamDiagnostic]? = nil,
+        cloudMode: Bool? = nil
+    ) {
+        self.trackId = trackId
+        self.streamUrl = streamUrl
+        self.streamUrlWithExt = streamUrlWithExt
+        self.streamMode = streamMode
+        self.streamSource = streamSource
+        self.contentType = contentType
+        self.adFree = adFree
+        self.hlsUrl = hlsUrl
+        self.directUrl = directUrl
+        self.diagnostics = diagnostics
+        self.cloudMode = cloudMode
+    }
+
     var isFullTrack: Bool {
-        streamMode == "full"
+        streamMode == "full" || streamMode == "offline"
     }
 
     var isPreview: Bool {
         streamMode == "preview"
     }
 
+    var isOfflineDownload: Bool {
+        streamMode == "offline" && streamSource == "downloaded"
+    }
+
     var qualityBadgeLabel: String {
+        if isOfflineDownload {
+            if contentType.lowercased().contains("flac") {
+                return "Offline • FLAC"
+            }
+            return "Offline • Downloaded"
+        }
         if isPreview {
             return "30s Preview"
         }
@@ -158,7 +200,7 @@ struct LyricLine: Codable, Identifiable, Equatable {
     }
 }
 
-struct LyricsResponse: Decodable, Equatable {
+struct LyricsResponse: Codable, Equatable {
     let trackId: String
     let title: String
     let artist: String

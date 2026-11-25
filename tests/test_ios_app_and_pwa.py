@@ -390,6 +390,67 @@ class TestNativeIOSAppStoreReadiness(unittest.TestCase):
         ):
             self.assertIn(key, models_text, f"Missing expected Swift Codable contract '{key}'")
 
+    def test_native_ios_offline_downloads_airplane_mode_and_backup_exclusion(self):
+        mgr_path = IOS_DIR / "Sonify" / "Services" / "OfflineDownloadManager.swift"
+        tests_path = IOS_DIR / "SonifyTests" / "OfflineDownloadTests.swift"
+        self.assertTrue(mgr_path.is_file(), "Missing OfflineDownloadManager.swift")
+        self.assertTrue(tests_path.is_file(), "Missing OfflineDownloadTests.swift")
+
+        mgr_src = mgr_path.read_text(encoding="utf-8")
+        for needle in (
+            "import Combine",
+            "import Foundation",
+            "isExcludedFromBackup = true",
+            "SonifyOffline",
+            "URLSessionDownloadDelegate",
+            "activeDownloads",
+            "localAudioURL(for",
+            "localArtworkData(for",
+            "localLyrics(for",
+            "downloadTracks(",
+            "offlineModeEnabled",
+            "baseDirectory: URL? = nil",
+        ):
+            self.assertIn(needle, mgr_src, f"OfflineDownloadManager.swift missing '{needle}'")
+
+        # Ensure offline playback & lyrics check local cache BEFORE any remote API call
+        audio_src = (IOS_DIR / "Sonify" / "Services" / "AudioPlayerService.swift").read_text(encoding="utf-8")
+        self.assertIn("offline.localAudioURL(for: track.id)", audio_src)
+        self.assertLess(
+            audio_src.index("offline.localAudioURL(for: track.id)"),
+            audio_src.index("self.api.getStreamInfo(trackId: track.id"),
+            "AudioPlayerService must check local offline audio before calling getStreamInfo",
+        )
+        self.assertIn("offlineDownloads?.localArtworkData(for: track.id)", audio_src)
+        self.assertIn("offlineDownloads?.offlineModeEnabled != true", audio_src)
+
+        lyrics_src = (IOS_DIR / "Sonify" / "Services" / "LyricsService.swift").read_text(encoding="utf-8")
+        self.assertIn("offlineDownloads?.localLyrics(for: track.id)", lyrics_src)
+
+        app_src = (IOS_DIR / "Sonify" / "SonifyApp.swift").read_text(encoding="utf-8")
+        self.assertIn(".environmentObject(offlineDownloads)", app_src)
+
+        artwork_src = (IOS_DIR / "Sonify" / "Components" / "ArtworkView.swift").read_text(encoding="utf-8")
+        self.assertIn("import UIKit", artwork_src)
+        self.assertIn("localImageData", artwork_src)
+
+        details_src = (IOS_DIR / "Sonify" / "Views" / "DetailViews.swift").read_text(encoding="utf-8")
+        self.assertIn("struct DownloadsView: View", details_src)
+        self.assertIn("offlineDownloads.downloadTracks(", details_src)
+
+        settings_src = (IOS_DIR / "Sonify" / "Views" / "SettingsView.swift").read_text(encoding="utf-8")
+        self.assertIn("Offline Mode", settings_src)
+        self.assertIn("Clear All Downloads", settings_src)
+
+        # Verify both new Swift files are registered in project.pbxproj
+        pbx = (IOS_DIR / "Sonify.xcodeproj" / "project.pbxproj").read_text(encoding="utf-8")
+        self.assertIn("OfflineDownloadManager.swift in Sources", pbx)
+        self.assertIn("OfflineDownloadTests.swift in Sources", pbx)
+
+        # Verify APIClient conforms to @unchecked Sendable for Swift 6 / Xcode 26 strict concurrency
+        api_src = (IOS_DIR / "Sonify" / "Services" / "APIClient.swift").read_text(encoding="utf-8")
+        self.assertIn("@unchecked Sendable", api_src)
+
 
 class TestIOSWebInstallAndShareEndpoints(unittest.TestCase):
     def setUp(self):

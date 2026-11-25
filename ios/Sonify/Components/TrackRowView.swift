@@ -10,9 +10,18 @@ struct TrackRowView: View {
     @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var player: AudioPlayerService
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
 
     private var isCurrent: Bool {
         player.currentTrack?.id == track.id
+    }
+
+    private var isDownloaded: Bool {
+        offlineDownloads.isDownloaded(track.id)
+    }
+
+    private var downloadProgress: Double? {
+        offlineDownloads.progress(for: track.id)
     }
 
     private var trackShareURL: URL? {
@@ -32,7 +41,12 @@ struct TrackRowView: View {
 
                 if showArtwork {
                     ZStack {
-                        ArtworkView(urlString: track.bestCoverURL, size: 48, cornerRadius: 6)
+                        ArtworkView(
+                            urlString: track.bestCoverURL,
+                            localImageData: offlineDownloads.localArtworkData(for: track.id),
+                            size: 48,
+                            cornerRadius: 6
+                        )
                         if isCurrent {
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(Color.black.opacity(0.45))
@@ -50,7 +64,18 @@ struct TrackRowView: View {
                         .foregroundColor(isCurrent ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
                         .lineLimit(1)
 
-                    HStack(spacing: 6) {
+                    HStack(spacing: 5) {
+                        if let prog = downloadProgress {
+                            ProgressView(value: prog)
+                                .progressViewStyle(.circular)
+                                .tint(SonifyTheme.accentGreen)
+                                .scaleEffect(0.55)
+                                .frame(width: 14, height: 14)
+                        } else if isDownloaded {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundColor(SonifyTheme.accentGreen)
+                        }
                         if track.explicit {
                             Text("E")
                                 .font(.system(size: 9, weight: .bold))
@@ -90,6 +115,33 @@ struct TrackRowView: View {
                         player.enqueueNext(track)
                     } label: {
                         Label("Add to Queue", systemImage: "text.badge.plus")
+                    }
+
+                    if downloadProgress != nil {
+                        Button(role: .destructive) {
+                            offlineDownloads.cancelDownload(trackId: track.id)
+                            library.showToast("Cancelled download")
+                        } label: {
+                            Label("Cancel Download", systemImage: "xmark.circle")
+                        }
+                    } else if isDownloaded {
+                        Button(role: .destructive) {
+                            offlineDownloads.removeDownload(trackId: track.id)
+                            library.showToast("Removed from Offline Downloads")
+                        } label: {
+                            Label("Remove Download", systemImage: "trash")
+                        }
+                    } else {
+                        Button {
+                            let quality = library.settings.audioQuality
+                            library.showToast("Downloading \"\(track.title)\"...")
+                            Task {
+                                let ok = await offlineDownloads.downloadTrack(track, api: api, quality: quality)
+                                library.showToast(ok ? "Saved \"\(track.title)\" for offline" : "Download failed")
+                            }
+                        } label: {
+                            Label("Download for Offline", systemImage: "arrow.down.circle")
+                        }
                     }
 
                     Button {

@@ -151,6 +151,7 @@ final class AudioPlayerService: ObservableObject {
     private let api: APIClient
     private weak var libraryStore: LibraryStore?
     private weak var lyricsStore: LyricsStore?
+    private weak var offlineDownloads: OfflineDownloadManager?
 
     private let player: AVPlayer = {
         let p = AVPlayer()
@@ -186,9 +187,22 @@ final class AudioPlayerService: ObservableObject {
         setupObservers()
     }
 
-    func attachStores(library: LibraryStore, lyrics: LyricsStore) {
+    func attachStores(
+        library: LibraryStore,
+        lyrics: LyricsStore,
+        offlineDownloads: OfflineDownloadManager? = nil
+    ) {
         self.libraryStore = library
         self.lyricsStore = lyrics
+        self.offlineDownloads = offlineDownloads
+    }
+
+    func configure(
+        library: LibraryStore,
+        lyrics: LyricsStore,
+        offlineDownloads: OfflineDownloadManager?
+    ) {
+        attachStores(library: library, lyrics: lyrics, offlineDownloads: offlineDownloads)
     }
 
     deinit {
@@ -349,7 +363,10 @@ final class AudioPlayerService: ObservableObject {
         }
         if let next = queueEngine.nextTrack(fromAutoEnd: fromAutoEnd) {
             startPlayback(for: next)
-        } else if fromAutoEnd && (libraryStore?.settings.autoplay ?? true), let seed = currentTrack {
+        } else if fromAutoEnd
+                    && (libraryStore?.settings.autoplay ?? true)
+                    && offlineDownloads?.offlineModeEnabled != true,
+                  let seed = currentTrack {
             Task { [weak self] in
                 guard let self else { return }
                 if let res = try? await self.api.getRadio(trackId: seed.id, limit: 15),
@@ -433,8 +450,10 @@ final class AudioPlayerService: ObservableObject {
 
     private func scheduleNextTrackPrefetch(seq: Int) {
         prefetchTask?.cancel()
+        if offlineDownloads?.offlineModeEnabled == true { return }
         guard let nextTrack = queueEngine.upcomingTracks.first else { return }
         let nextId = nextTrack.id
+        if offlineDownloads?.isDownloaded(nextId) == true { return }
         if cachedPrefetchInfo(for: nextId) != nil { return }
         let qual = libraryStore?.settings.audioQuality ?? "auto"
 
@@ -450,14 +469,16 @@ final class AudioPlayerService: ObservableObject {
 
     private func makePlayerItem(for route: PlaybackRoute, contentType: String) -> AVPlayerItem {
         var assetOptions: [String: Any] = [:]
-        if !route.isHLS {
+        if !route.isHLS && !route.isLocal {
             if #available(iOS 17.0, *) {
                 assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(contentType)
             }
         }
         let asset = AVURLAsset(url: route.url, options: assetOptions)
         let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 2.0
+        if !route.isLocal {
+            item.preferredForwardBufferDuration = 2.0
+        }
         return item
     }
 
@@ -488,6 +509,50 @@ final class AudioPlayerService: ObservableObject {
         updateNowPlayingInfo()
         loadNowPlayingArtwork(for: track)
         lyricsStore?.loadLyrics(for: track)
+
+        // 1. Offline-first playback: check local downloaded audio BEFORE any network call (works in Airplane Mode!)
+        if let offline = offlineDownloads, let localURL = offline.localAudioURL(for: track.id) {
+            let rec = offline.record(for: track.id)
+            let offlineInfo = StreamInfoResponse(
+                trackId: track.id,
+                streamUrl: localURL.absoluteString,
+                streamUrlWithExt: localURL.absoluteString,
+                streamMode: "offline",
+                streamSource: "downloaded",
+                contentType: rec?.contentType ?? "audio/mp4",
+                adFree: true
+            )
+            let localRoute = PlaybackRoute.local(localURL)
+            self.streamInfo = offlineInfo
+            self.currentRoute = localRoute
+            self.activateAudioSession()
+
+            let item = self.makePlayerItem(for: localRoute, contentType: offlineInfo.contentType)
+            self.observePlayerItem(item, seq: seq)
+            self.player.replaceCurrentItem(with: item)
+            self.player.play()
+            if abs(self.playbackRate - 1.0) > 0.01 {
+                self.player.rate = self.playbackRate
+            }
+            self.updateNowPlayingInfo()
+
+            if !offline.offlineModeEnabled {
+                Task { [weak self] in
+                    await self?.libraryStore?.recordHistory(track: track)
+                }
+            }
+            return
+        }
+
+        // 2. If Offline Mode is explicitly enabled and track is not downloaded, notify cleanly without hanging
+        if offlineDownloads?.offlineModeEnabled == true {
+            isLoading = false
+            isPlaying = false
+            let msg = "Offline Mode is on — download \"\(track.title)\" first to play offline"
+            errorMessage = msg
+            libraryStore?.showToast(msg)
+            return
+        }
 
         let qual = libraryStore?.settings.audioQuality ?? "auto"
 
@@ -556,6 +621,7 @@ final class AudioPlayerService: ObservableObject {
                     if !self.didFallbackToProxy,
                        let route = self.currentRoute,
                        !route.isProxy,
+                       !route.isLocal,
                        let info = self.streamInfo,
                        let proxyURL = self.api.streamURL(for: info) {
                         self.didFallbackToProxy = true
@@ -756,6 +822,13 @@ final class AudioPlayerService: ObservableObject {
     }
 
     private func loadNowPlayingArtwork(for track: Track) {
+        if let localData = offlineDownloads?.localArtworkData(for: track.id),
+           let image = UIImage(data: localData) {
+            self.cachedArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            self.updateNowPlayingInfo()
+            return
+        }
+        guard offlineDownloads?.offlineModeEnabled != true else { return }
         guard let coverStr = track.bestCoverURL,
               coverStr.hasPrefix("http://") || coverStr.hasPrefix("https://"),
               let url = URL(string: coverStr) else {

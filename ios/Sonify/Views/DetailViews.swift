@@ -169,6 +169,7 @@ struct AlbumDetailView: View {
     @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
 
     @State private var detail: AlbumDetailResponse?
     @State private var isLoading = false
@@ -219,6 +220,25 @@ struct AlbumDetailView: View {
                                         .padding(.vertical, 11)
                                         .background(SonifyTheme.bgHighlight)
                                         .clipShape(Capsule())
+                                }
+
+                                if let tracks = detail?.tracks, !tracks.isEmpty {
+                                    let allDownloaded = tracks.allSatisfy { offlineDownloads.isDownloaded($0.id) }
+                                    Button {
+                                        let qual = library.settings.audioQuality
+                                        library.showToast("Downloading \(tracks.count) tracks...")
+                                        Task {
+                                            let count = await offlineDownloads.downloadTracks(tracks, api: api, quality: qual)
+                                            library.showToast("Downloaded \(count) songs for offline playback")
+                                        }
+                                    } label: {
+                                        Image(systemName: allDownloaded ? "arrow.down.circle.fill" : "arrow.down.circle")
+                                            .font(.title3)
+                                            .foregroundColor(allDownloaded ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                            .frame(width: 42, height: 42)
+                                            .background(SonifyTheme.bgHighlight)
+                                            .clipShape(Circle())
+                                    }
                                 }
                             }
                         }
@@ -281,6 +301,7 @@ struct PlaylistDetailView: View {
     @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
     @Environment(\.dismiss) private var dismiss
 
     @State private var playlist: Playlist?
@@ -314,16 +335,36 @@ struct PlaylistDetailView: View {
                         .foregroundColor(SonifyTheme.textSubdued)
 
                     if let first = tracks.first {
-                        Button {
-                            player.play(track: first, context: tracks)
-                        } label: {
-                            Label("Play", systemImage: "play.fill")
-                                .font(.subheadline.weight(.bold))
-                                .foregroundColor(.black)
-                                .padding(.horizontal, 36)
-                                .padding(.vertical, 12)
-                                .background(SonifyTheme.accentGreen)
-                                .clipShape(Capsule())
+                        HStack(spacing: 12) {
+                            Button {
+                                player.play(track: first, context: tracks)
+                            } label: {
+                                Label("Play", systemImage: "play.fill")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(.black)
+                                    .padding(.horizontal, 32)
+                                    .padding(.vertical, 12)
+                                    .background(SonifyTheme.accentGreen)
+                                    .clipShape(Capsule())
+                            }
+
+                            let allDownloaded = tracks.allSatisfy { offlineDownloads.isDownloaded($0.id) }
+                            Button {
+                                let qual = library.settings.audioQuality
+                                library.showToast("Downloading \(tracks.count) tracks...")
+                                Task {
+                                    let count = await offlineDownloads.downloadTracks(tracks, api: api, quality: qual)
+                                    library.showToast("Downloaded \(count) songs for offline playback")
+                                }
+                            } label: {
+                                Label(allDownloaded ? "Downloaded" : "Download", systemImage: allDownloaded ? "arrow.down.circle.fill" : "arrow.down.circle")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(allDownloaded ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 12)
+                                    .background(SonifyTheme.bgHighlight)
+                                    .clipShape(Capsule())
+                            }
                         }
                     }
                 }
@@ -514,8 +555,10 @@ struct PlaylistDetailView: View {
 struct MixDetailView: View {
     let mix: MadeForYouMix
 
+    @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
     @State private var playlistTargetTrack: Track?
 
     var body: some View {
@@ -581,6 +624,25 @@ struct MixDetailView: View {
                                     .padding(.vertical, 11)
                                     .background(SonifyTheme.bgHighlight)
                                     .clipShape(Capsule())
+                            }
+
+                            if !mix.tracks.isEmpty {
+                                let allDownloaded = mix.tracks.allSatisfy { offlineDownloads.isDownloaded($0.id) }
+                                Button {
+                                    let qual = library.settings.audioQuality
+                                    library.showToast("Downloading \(mix.tracks.count) tracks...")
+                                    Task {
+                                        let count = await offlineDownloads.downloadTracks(mix.tracks, api: api, quality: qual)
+                                        library.showToast("Downloaded \(count) songs for offline playback")
+                                    }
+                                } label: {
+                                    Image(systemName: allDownloaded ? "arrow.down.circle.fill" : "arrow.down.circle")
+                                        .font(.title3)
+                                        .foregroundColor(allDownloaded ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                        .frame(width: 42, height: 42)
+                                        .background(SonifyTheme.bgHighlight)
+                                        .clipShape(Circle())
+                                }
                             }
                         }
                     }
@@ -868,8 +930,10 @@ struct StatsView: View {
 // MARK: - Liked Songs View
 
 struct LikedSongsView: View {
+    @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
     @State private var filterText = ""
     @State private var playlistTargetTrack: Track?
 
@@ -895,16 +959,36 @@ struct LikedSongsView: View {
                             .foregroundColor(SonifyTheme.textSecondary)
 
                         if let first = filteredTracks.first {
-                            Button {
-                                player.play(track: first, context: filteredTracks)
-                            } label: {
-                                Label("Play All", systemImage: "play.fill")
-                                    .font(.subheadline.weight(.bold))
-                                    .foregroundColor(.black)
-                                    .padding(.horizontal, 28)
-                                    .padding(.vertical, 11)
-                                    .background(SonifyTheme.accentGreen)
-                                    .clipShape(Capsule())
+                            HStack(spacing: 10) {
+                                Button {
+                                    player.play(track: first, context: filteredTracks)
+                                } label: {
+                                    Label("Play All", systemImage: "play.fill")
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(.black)
+                                        .padding(.horizontal, 26)
+                                        .padding(.vertical, 11)
+                                        .background(SonifyTheme.accentGreen)
+                                        .clipShape(Capsule())
+                                }
+
+                                let allDownloaded = filteredTracks.allSatisfy { offlineDownloads.isDownloaded($0.id) }
+                                Button {
+                                    let qual = library.settings.audioQuality
+                                    library.showToast("Downloading \(filteredTracks.count) liked songs...")
+                                    Task {
+                                        let count = await offlineDownloads.downloadTracks(filteredTracks, api: api, quality: qual)
+                                        library.showToast("Downloaded \(count) songs for offline playback")
+                                    }
+                                } label: {
+                                    Label(allDownloaded ? "Downloaded" : "Download", systemImage: allDownloaded ? "arrow.down.circle.fill" : "arrow.down.circle")
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundColor(allDownloaded ? SonifyTheme.accentGreen : SonifyTheme.textPrimary)
+                                        .padding(.horizontal, 16)
+                                        .padding(.vertical, 11)
+                                        .background(SonifyTheme.bgHighlight)
+                                        .clipShape(Capsule())
+                                }
                             }
                             .padding(.top, 4)
                         }
@@ -988,6 +1072,220 @@ struct HistoryView: View {
                     .foregroundColor(SonifyTheme.danger)
                 }
             }
+        }
+        .sheet(item: $playlistTargetTrack) { track in
+            AddToPlaylistSheet(track: track)
+        }
+    }
+}
+
+
+// MARK: - Offline Downloads View (100% Airplane-Mode Playback)
+
+struct DownloadsView: View {
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var player: AudioPlayerService
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
+
+    @State private var filterText = ""
+    @State private var showClearConfirm = false
+    @State private var playlistTargetTrack: Track?
+
+    private var filteredRecords: [DownloadedTrackRecord] {
+        let q = filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return offlineDownloads.downloadedTracks }
+        return offlineDownloads.downloadedTracks.filter {
+            $0.track.title.lowercased().contains(q) || $0.track.artist.lowercased().contains(q)
+        }
+    }
+
+    private var filteredTracks: [Track] {
+        filteredRecords.map(\.track)
+    }
+
+    var body: some View {
+        ZStack {
+            SonifyTheme.bgSurface.ignoresSafeArea()
+            List {
+                // Header Banner
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 12) {
+                        ZStack {
+                            LinearGradient(
+                                colors: [Color(hex: 0x006450), SonifyTheme.accentGreen],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 30))
+                                .foregroundColor(.white)
+                        }
+                        .frame(width: 64, height: 64)
+                        .cornerRadius(12)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Offline Downloads")
+                                .font(.title2.weight(.bold))
+                                .foregroundColor(SonifyTheme.textPrimary)
+                            Text("\(offlineDownloads.downloadedTracks.count) songs • \(offlineDownloads.formattedTotalSize)")
+                                .font(.caption)
+                                .foregroundColor(SonifyTheme.textSecondary)
+                            Text("Plays 100% offline in Airplane Mode")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(SonifyTheme.accentGreen)
+                        }
+                    }
+
+                    if let first = filteredTracks.first {
+                        HStack(spacing: 10) {
+                            Button {
+                                player.play(track: first, context: filteredTracks)
+                            } label: {
+                                Label("Play All", systemImage: "play.fill")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(.black)
+                                    .padding(.horizontal, 24)
+                                    .padding(.vertical, 10)
+                                    .background(SonifyTheme.accentGreen)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                let shuffled = filteredTracks.shuffled()
+                                if let firstShuffled = shuffled.first {
+                                    player.play(track: firstShuffled, context: shuffled)
+                                }
+                            } label: {
+                                Label("Shuffle", systemImage: "shuffle")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundColor(SonifyTheme.textPrimary)
+                                    .padding(.horizontal, 18)
+                                    .padding(.vertical, 10)
+                                    .background(SonifyTheme.bgHighlight)
+                                    .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    TextField("Filter downloaded songs", text: $filterText)
+                        .padding(10)
+                        .background(SonifyTheme.bgHighlight)
+                        .foregroundColor(SonifyTheme.textPrimary)
+                        .cornerRadius(8)
+                }
+                .padding(.vertical, 6)
+                .listRowBackground(SonifyTheme.bgSurface)
+                .listRowSeparator(.hidden)
+
+                // Active Downloads Progress Section
+                if !offlineDownloads.activeDownloads.isEmpty {
+                    Section {
+                        ForEach(Array(offlineDownloads.activeDownloads.keys.sorted()), id: \.self) { tid in
+                            let prog = offlineDownloads.activeDownloads[tid] ?? 0
+                            let activeTrack = offlineDownloads.activeTracksById[tid]
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(activeTrack?.title ?? tid)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundColor(SonifyTheme.textPrimary)
+                                            .lineLimit(1)
+                                        Text(activeTrack?.artist ?? "Downloading...")
+                                            .font(.caption)
+                                            .foregroundColor(SonifyTheme.textSecondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Text("\(Int((prog * 100).rounded()))%")
+                                        .font(.caption.monospacedDigit().weight(.bold))
+                                        .foregroundColor(SonifyTheme.accentGreen)
+                                    Button {
+                                        offlineDownloads.cancelDownload(trackId: tid)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(SonifyTheme.textSecondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                ProgressView(value: prog)
+                                    .tint(SonifyTheme.accentGreen)
+                            }
+                            .padding(.vertical, 4)
+                            .listRowBackground(SonifyTheme.bgSurface)
+                        }
+                    } header: {
+                        Text("Downloading Now")
+                            .foregroundColor(SonifyTheme.accentGreen)
+                    }
+                }
+
+                // Downloaded Tracks List
+                if filteredRecords.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 40))
+                            .foregroundColor(SonifyTheme.textSubdued)
+                        Text(offlineDownloads.downloadedTracks.isEmpty ? "No offline downloads yet" : "No matching downloads")
+                            .font(.headline)
+                            .foregroundColor(SonifyTheme.textPrimary)
+                        Text("Tap ••• on any song or the Download button on a playlist, album, or Liked Songs to save audio, artwork, and synced lyrics for Airplane Mode.")
+                            .font(.caption)
+                            .foregroundColor(SonifyTheme.textSecondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 32)
+                    .listRowBackground(SonifyTheme.bgSurface)
+                    .listRowSeparator(.hidden)
+                } else {
+                    ForEach(filteredRecords) { record in
+                        TrackRowView(
+                            track: record.track,
+                            onTap: { player.play(track: record.track, context: filteredTracks) },
+                            onAddToPlaylist: { playlistTargetTrack = $0 }
+                        )
+                        .listRowBackground(SonifyTheme.bgSurface)
+                    }
+                    .onDelete { offsets in
+                        let ids = offsets.compactMap { $0 < filteredRecords.count ? filteredRecords[$0].id : nil }
+                        for id in ids {
+                            offlineDownloads.removeDownload(trackId: id)
+                        }
+                    }
+                }
+
+                Color.clear
+                    .frame(height: 88)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+        }
+        .navigationTitle("Downloads")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !offlineDownloads.downloadedTracks.isEmpty {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Clear All") {
+                        showClearConfirm = true
+                    }
+                    .foregroundColor(SonifyTheme.danger)
+                }
+            }
+        }
+        .confirmationDialog(
+            "Delete all offline downloads?",
+            isPresented: $showClearConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Clear \(offlineDownloads.downloadedTracks.count) Songs (\(offlineDownloads.formattedTotalSize))", role: .destructive) {
+                offlineDownloads.clearAllDownloads()
+                library.showToast("Cleared all offline downloads")
+            }
+            Button("Cancel", role: .cancel) {}
         }
         .sheet(item: $playlistTargetTrack) { track in
             AddToPlaylistSheet(track: track)

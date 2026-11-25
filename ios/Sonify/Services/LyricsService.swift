@@ -97,10 +97,28 @@ final class LyricsStore: ObservableObject {
     @Published private(set) var loadedTrackId: String?
 
     private let api: APIClient
+    private weak var offlineDownloads: OfflineDownloadManager?
     private var fetchTask: Task<Void, Never>?
 
-    init(api: APIClient) {
+    init(api: APIClient, offlineDownloads: OfflineDownloadManager? = nil) {
         self.api = api
+        self.offlineDownloads = offlineDownloads
+    }
+
+    func attachOfflineDownloads(_ manager: OfflineDownloadManager) {
+        self.offlineDownloads = manager
+    }
+
+    private func applyLyricsResponse(_ response: LyricsResponse) {
+        self.lyrics = response
+        if !response.lines.isEmpty {
+            self.resolvedLines = response.lines
+        } else if !response.rawLrc.isEmpty {
+            self.resolvedLines = LyricsSyncEngine.parseLRC(response.rawLrc)
+        } else {
+            self.resolvedLines = []
+        }
+        self.isLoading = false
     }
 
     func loadLyrics(for track: Track?, forceRefresh: Bool = false) {
@@ -116,25 +134,40 @@ final class LyricsStore: ObservableObject {
             return
         }
 
-        isLoading = true
         loadedTrackId = track.id
+
+        // 1. Offline-first: check cached offline lyrics immediately (0ms network wait, works in Airplane Mode)
+        if !forceRefresh, let cached = offlineDownloads?.localLyrics(for: track.id) {
+            applyLyricsResponse(cached)
+            return
+        }
+
+        if offlineDownloads?.offlineModeEnabled == true {
+            lyrics = LyricsResponse(
+                trackId: track.id,
+                title: track.title,
+                artist: track.artist,
+                status: "not_found"
+            )
+            resolvedLines = []
+            isLoading = false
+            return
+        }
+
+        isLoading = true
 
         fetchTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let response = try await api.getLyrics(for: track, refresh: forceRefresh)
                 guard !Task.isCancelled, self.loadedTrackId == track.id else { return }
-                self.lyrics = response
-                if !response.lines.isEmpty {
-                    self.resolvedLines = response.lines
-                } else if !response.rawLrc.isEmpty {
-                    self.resolvedLines = LyricsSyncEngine.parseLRC(response.rawLrc)
-                } else {
-                    self.resolvedLines = []
-                }
-                self.isLoading = false
+                self.applyLyricsResponse(response)
             } catch {
                 guard !Task.isCancelled, self.loadedTrackId == track.id else { return }
+                if let fallbackCached = self.offlineDownloads?.localLyrics(for: track.id) {
+                    self.applyLyricsResponse(fallbackCached)
+                    return
+                }
                 self.lyrics = LyricsResponse(
                     trackId: track.id,
                     title: track.title,

@@ -1,7 +1,9 @@
 import SwiftUI
+import UIKit
 
 struct ArtworkView: View {
     let urlString: String?
+    var localImageData: Data? = nil
     var size: CGFloat = 56
     var cornerRadius: CGFloat = 6
     var isCircular: Bool = false
@@ -19,7 +21,11 @@ struct ArtworkView: View {
 
     var body: some View {
         Group {
-            if let url = remoteURL {
+            if let data = localImageData, let uiImg = UIImage(data: data) {
+                Image(uiImage: uiImg)
+                    .resizable()
+                    .scaledToFill()
+            } else if let url = remoteURL {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):

@@ -1,9 +1,11 @@
 import SwiftUI
 
 struct NowPlayingView: View {
+    @EnvironmentObject private var api: APIClient
     @EnvironmentObject private var player: AudioPlayerService
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var lyricsStore: LyricsStore
+    @EnvironmentObject private var offlineDownloads: OfflineDownloadManager
     @Environment(\.dismiss) private var dismiss
 
     @State private var isDraggingSlider = false
@@ -36,8 +38,13 @@ struct NowPlayingView: View {
                             .transition(.opacity)
                     } else {
                         Spacer(minLength: 4)
-                        ArtworkView(urlString: track.bestCoverURL, size: 310, cornerRadius: 12)
-                            .shadow(color: .black.opacity(0.6), radius: 24, y: 12)
+                        ArtworkView(
+                            urlString: track.bestCoverURL,
+                            localImageData: offlineDownloads.localArtworkData(for: track.id),
+                            size: 310,
+                            cornerRadius: 12
+                        )
+                        .shadow(color: .black.opacity(0.6), radius: 24, y: 12)
                         Spacer(minLength: 4)
                     }
 
@@ -120,6 +127,33 @@ struct NowPlayingView: View {
                     Label("Add to Playlist", systemImage: "plus.circle")
                 }
 
+                if offlineDownloads.isDownloading(track.id) {
+                    Button(role: .destructive) {
+                        offlineDownloads.cancelDownload(trackId: track.id)
+                        library.showToast("Cancelled download")
+                    } label: {
+                        Label("Cancel Download", systemImage: "xmark.circle")
+                    }
+                } else if offlineDownloads.isDownloaded(track.id) {
+                    Button(role: .destructive) {
+                        offlineDownloads.removeDownload(trackId: track.id)
+                        library.showToast("Removed from Offline Downloads")
+                    } label: {
+                        Label("Remove Offline Download", systemImage: "trash")
+                    }
+                } else {
+                    Button {
+                        let qual = library.settings.audioQuality
+                        library.showToast("Downloading \"\(track.title)\"...")
+                        Task {
+                            let ok = await offlineDownloads.downloadTrack(track, api: api, quality: qual)
+                            library.showToast(ok ? "Saved for offline playback" : "Download failed")
+                        }
+                    } label: {
+                        Label("Download for Offline", systemImage: "arrow.down.circle")
+                    }
+                }
+
                 Button {
                     player.startRadio(for: track)
                 } label: {
@@ -172,6 +206,35 @@ struct NowPlayingView: View {
             }
 
             Spacer()
+
+            // Quick 1-tap Offline Download / Progress / Downloaded button
+            Button {
+                if offlineDownloads.isDownloading(track.id) {
+                    offlineDownloads.cancelDownload(trackId: track.id)
+                    library.showToast("Cancelled download")
+                } else if offlineDownloads.isDownloaded(track.id) {
+                    offlineDownloads.removeDownload(trackId: track.id)
+                    library.showToast("Removed from Offline Downloads")
+                } else {
+                    let qual = library.settings.audioQuality
+                    library.showToast("Downloading \"\(track.title)\"...")
+                    Task {
+                        let ok = await offlineDownloads.downloadTrack(track, api: api, quality: qual)
+                        library.showToast(ok ? "Saved for offline playback" : "Download failed")
+                    }
+                }
+            } label: {
+                if let prog = offlineDownloads.progress(for: track.id) {
+                    ProgressView(value: prog)
+                        .progressViewStyle(.circular)
+                        .tint(SonifyTheme.accentGreen)
+                        .frame(width: 28, height: 28)
+                } else {
+                    Image(systemName: offlineDownloads.isDownloaded(track.id) ? "arrow.down.circle.fill" : "arrow.down.circle")
+                        .font(.title2)
+                        .foregroundColor(offlineDownloads.isDownloaded(track.id) ? SonifyTheme.accentGreen : SonifyTheme.textSecondary)
+                }
+            }
 
             Button {
                 Task { await library.toggleLike(track) }
