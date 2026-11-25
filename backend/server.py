@@ -19,7 +19,11 @@ from backend.db import Database
 from backend.providers import lyrics as lyrics_provider, youtube_music
 from backend.services.catalog_service import CatalogService
 from backend.services.library_service import LibraryError, LibraryService
-from backend.services.stream_service import StreamService, StreamUnavailableError
+from backend.services.stream_service import (
+    StreamService,
+    StreamUnavailableError,
+    strip_known_stream_extension,
+)
 
 _MIME_OVERRIDES = {
     ".html": "text/html; charset=utf-8",
@@ -28,6 +32,7 @@ _MIME_OVERRIDES = {
     ".css": "text/css; charset=utf-8",
     ".svg": "image/svg+xml",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -303,7 +308,7 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     debug = self._qparam(qs, "debug", "0").strip().lower() in ("1", "true", "yes")
                     self._send_json(self.server.stream.get_stream_info(track_id, debug=debug))
                     return
-                track_id = urllib.parse.unquote(rest).strip("/")
+                track_id = strip_known_stream_extension(urllib.parse.unquote(rest).strip("/"))
                 if not track_id:
                     self._send_error_json(400, "INVALID_TRACK", "Missing trackId")
                     return

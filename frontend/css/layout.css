@@ -9,9 +9,11 @@
   gap: var(--shell-gap);
   padding: var(--shell-gap) var(--shell-gap) 0 var(--shell-gap);
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
   background: var(--bg-base);
   overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* Left Sidebar */
@@ -341,7 +343,7 @@
 
   .app-shell {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(0, 1fr) var(--player-height) var(--mobile-nav-height);
+    grid-template-rows: minmax(0, 1fr) var(--player-height) calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
     grid-template-areas:
       "main"
       "player"
@@ -364,8 +366,8 @@
   }
 
   .topbar {
-    padding: 0 12px;
-    height: 56px;
+    padding: env(safe-area-inset-top, 0px) 12px 0;
+    height: calc(56px + env(safe-area-inset-top, 0px));
     gap: 8px;
   }
 
@@ -375,7 +377,10 @@
 
   .right-drawer {
     position: fixed;
-    inset: 0 0 calc(var(--player-height) + var(--mobile-nav-height)) 0;
+    top: env(safe-area-inset-top, 0px);
+    left: 0;
+    right: 0;
+    bottom: calc(var(--player-height) + var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
     width: 100%;
     border-radius: 0;
     z-index: 70;
@@ -418,7 +423,8 @@
     grid-template-columns: repeat(4, 1fr);
     background: #0b0b0b;
     border-top: 1px solid var(--border-subtle);
-    height: var(--mobile-nav-height);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    height: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom, 0px));
   }
 
   .mobile-nav-btn {

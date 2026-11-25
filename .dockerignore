@@ -13,3 +13,5 @@ venv/
 *.tmp
 tests/
 docs/
+ios/
+.github/

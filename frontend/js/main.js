@@ -372,3 +372,9 @@ async function bootstrap() {
 bootstrap().catch((err) => {
   console.error('[Sonify] Bootstrap failed:', err);
 });
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  });
+}

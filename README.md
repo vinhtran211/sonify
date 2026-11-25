@@ -55,6 +55,28 @@ This repository includes a Render Blueprint (`render.yaml`) and production `Dock
 
 ---
 
+## iOS App (Native SwiftUI + App Store / TestFlight + iOS PWA)
+
+### 1. Instant iOS PWA (No App Store Needed)
+Open your live Sonify URL in **Safari on iPhone / iPad** -> tap **Share** -> **Add to Home Screen**. Sonify includes `frontend/manifest.json`, 180×180 / 192×192 / 512×512 RGB icons, notch/Dynamic Island safe-area CSS (`100dvh` + `env(safe-area-inset-*)`), and a static-shell Service Worker (`frontend/sw.js`) that strictly bypasses `/api/*` for native HTTP `Range` streaming.
+
+### 2. Native SwiftUI iOS App (`ios/`, iOS 16.0+, Zero Third-Party Dependencies)
+A complete Spotify-like native SwiftUI iOS application lives in `ios/`:
+- **Native Playback & Lock Screen**: `AVPlayer` / `AVURLAsset` with extension-hinted streams (`/api/stream/{id}.{ext}` + iOS 17+ `AVURLAssetOverrideMIMETypeKey`), `AVAudioSession(.playback)` background audio, headphone-unplug & call interruption handling, `MPNowPlayingInfoCenter`, `MPRemoteCommandCenter`, and AirPlay (`AVRoutePickerView`).
+- **Full Feature Set**: Home (Global / Vietnam charts), debounced Search, Artist/Album/Playlist/Likes/History details, floating Mini Player, full-screen Now Playing, real-time synced `.lrc` Lyrics with tap-to-seek, reorderable Queue, and Settings (defaults to `https://sonify-music.onrender.com`, or point to your local LAN server via `NSAllowsLocalNetworking`).
+- **App Store Ready**: Includes `PrivacyInfo.xcprivacy` (`NSPrivacyTracking=false`, `UserDefaults` `CA92.1`), `Info.plist` (`UIBackgroundModes:[audio]`, `ITSAppUsesNonExemptEncryption=false`), `1024×1024` RGB-only `AppIcon.png` (zero alpha), `ios/project.yml` (XcodeGen), committed `ios/Sonify.xcodeproj`, and `SonifyTests` (`XCTest`).
+
+### 3. Free GitHub Actions macOS Xcode CI, Sideload `.ipa` & TestFlight Upload
+`.github/workflows/ios-build.yml` runs on GitHub's free `macos-latest` runner:
+- **Every Push / PR to `ios/**`**: Runs `xcodegen` validation, `xcodebuild test` (`SonifyTests` on iOS Simulator), and builds **`Sonify-unsigned.ipa`** as a downloadable Actions artifact (sideloadable via AltStore / SideStore / Sideloadly).
+- **One-Click TestFlight / App Store Connect Upload**: Add these GitHub Repository Secrets, then run **Actions -> Sonify iOS Build, Test & TestFlight -> Run workflow -> `upload_to_testflight: true`**:
+  - `APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD` (base64 Apple Distribution `.p12`)
+  - `APPLE_PROVISIONING_PROFILE_BASE64` (base64 App Store `.mobileprovision`)
+  - `APPLE_TEAM_ID`, optional `IOS_BUNDLE_ID` (defaults to `com.sonify.music`)
+  - `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_PRIVATE_KEY_BASE64` (App Store Connect API Key `.p8`)
+
+---
+
 ## Key Features
 
 - **Spotify-Inspired Dark UI & Responsive Design**

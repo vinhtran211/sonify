@@ -30,6 +30,56 @@ _YT_SOURCES = frozenset({"youtube-innertube", "yt-dlp", "piped", "invidious", "y
 _VALID_STREAM_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
 PREVIEW_CACHE_TTL = 12.0
 
+ALLOWED_STREAM_EXTENSIONS = frozenset(
+    {".flac", ".m4a", ".mp4", ".mp3", ".wav", ".aac", ".ogg", ".webm"}
+)
+
+
+def normalize_stream_mime(content_type: str) -> str:
+    """Normalize media MIME types for broad browser + iOS AVPlayer compatibility."""
+    ctype = (content_type or "audio/mpeg").split(";", 1)[0].strip().lower()
+    if ctype in ("audio/x-flac", "application/flac"):
+        return "audio/flac"
+    if ctype in ("audio/x-m4a", "audio/x-m4p", "audio/m4a"):
+        return "audio/mp4"
+    if ctype in ("audio/mp3", "audio/x-mpeg"):
+        return "audio/mpeg"
+    if ctype in ("audio/x-wav", "audio/wave"):
+        return "audio/wav"
+    return ctype or "audio/mpeg"
+
+
+def mime_to_extension(content_type: str) -> str:
+    """Map a normalized media MIME type to an AVPlayer-friendly filename extension."""
+    ctype = normalize_stream_mime(content_type)
+    if "flac" in ctype:
+        return ".flac"
+    if ctype.startswith("video/mp4"):
+        return ".mp4"
+    if "mp4" in ctype or "aac" in ctype:
+        return ".m4a"
+    if "mpeg" in ctype or "mp3" in ctype:
+        return ".mp3"
+    if "wav" in ctype:
+        return ".wav"
+    if "webm" in ctype:
+        return ".webm"
+    if "ogg" in ctype:
+        return ".ogg"
+    return ".m4a"
+
+
+def strip_known_stream_extension(track_id: str) -> str:
+    """Strip a trailing known media extension (e.g. '.flac', '.m4a') if present."""
+    tid = (track_id or "").strip()
+    if not tid or "." not in tid:
+        return tid
+    dot_idx = tid.rfind(".")
+    suffix = tid[dot_idx:].lower()
+    if dot_idx > 0 and suffix in ALLOWED_STREAM_EXTENSIONS:
+        return tid[:dot_idx]
+    return tid
+
 
 class StreamUnavailableError(RuntimeError):
     """Raised when no real upstream stream can be resolved in online mode."""
@@ -865,12 +915,15 @@ class StreamService:
                 monochrome.start_background_cache(mc_id)
             except Exception:
                 pass
+        norm_mime = normalize_stream_mime(resolved.content_type)
+        ext = mime_to_extension(norm_mime)
         payload: Dict[str, Any] = {
             "trackId": track_id,
             "streamUrl": f"/api/stream/{track_id}",
+            "streamUrlWithExt": f"/api/stream/{track_id}{ext}",
             "streamMode": resolved.mode,
             "streamSource": resolved.source,
-            "contentType": resolved.content_type,
+            "contentType": norm_mime,
             "adFree": True,
         }
         if debug:
@@ -879,7 +932,10 @@ class StreamService:
         return payload
 
     def _send_common_stream_headers(self, handler: Any, resolved: ResolvedStream) -> None:
-        handler.send_header("Content-Type", resolved.content_type)
+        norm_mime = normalize_stream_mime(resolved.content_type)
+        ext = mime_to_extension(norm_mime)
+        handler.send_header("Content-Type", norm_mime)
+        handler.send_header("Content-Disposition", f'inline; filename="stream{ext}"')
         handler.send_header("Accept-Ranges", "bytes")
         handler.send_header("Cache-Control", "private, max-age=1800")
         handler.send_header("X-Stream-Mode", resolved.mode)
@@ -887,7 +943,7 @@ class StreamService:
         handler.send_header("X-Ad-Free", "true")
         handler.send_header(
             "Access-Control-Expose-Headers",
-            "X-Stream-Mode, X-Stream-Source, X-Ad-Free, Content-Range",
+            "X-Stream-Mode, X-Stream-Source, X-Ad-Free, Content-Range, Content-Disposition",
         )
 
     def _send_stream_unavailable(self, handler: Any, message: str, head_only: bool) -> None:
