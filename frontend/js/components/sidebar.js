@@ -6,6 +6,7 @@ import { escapeHtml } from '../lrc.js';
 import { playList } from '../player.js';
 import { navigate } from '../router.js';
 import { getState, setState } from '../store.js';
+import { openInstallAppModal } from './installModal.js';
 import { openCreatePlaylistModal, openDeletePlaylistModal, openEditPlaylistModal, showToast } from './modals.js';
 import { renderMosaicHtml } from './trackList.js';
 
@@ -95,11 +96,18 @@ export function renderSidebar() {
             : ''
         }
       </div>
+
+      <div class="sidebar-install-footer">
+        <button id="btn-sidebar-install" class="sidebar-install-btn" type="button">
+          ${ICONS.smartphone}<span>Install on Phone</span>
+        </button>
+      </div>
     </div>
   `;
 
   el.querySelector('#brand-home-link')?.addEventListener('click', () => navigate('#/'));
   el.querySelector('#btn-create-playlist')?.addEventListener('click', () => openCreatePlaylistModal());
+  el.querySelector('#btn-sidebar-install')?.addEventListener('click', () => openInstallAppModal());
   el.querySelector('#lib-liked-item')?.addEventListener('click', () => navigate('#/liked'));
 
   el.querySelectorAll('[data-lib-filter]').forEach((btn) => {

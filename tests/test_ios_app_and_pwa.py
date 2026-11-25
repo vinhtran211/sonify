@@ -10,6 +10,8 @@ import struct
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,6 +20,7 @@ from unittest import mock
 from backend import http_client
 from backend.providers import monochrome
 from backend.server import create_server
+from backend.services import ios_install_service
 from backend.services.stream_service import (
     ResolvedStream,
     mime_to_extension,
@@ -386,6 +389,240 @@ class TestNativeIOSAppStoreReadiness(unittest.TestCase):
             "let ytDlpConfigured: Bool?",
         ):
             self.assertIn(key, models_text, f"Missing expected Swift Codable contract '{key}'")
+
+
+class TestIOSWebInstallAndShareEndpoints(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.srv = create_server(
+            host="127.0.0.1",
+            port=0,
+            db_path=os.path.join(self._tmp.name, "ios_install.db"),
+            offline=True,
+            quiet=True,
+        )
+        self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        http_client.set_offline_mode(None)
+        self._tmp.cleanup()
+
+    def test_resolve_public_origin_proxy_headers_and_sanitization(self):
+        self.assertEqual(
+            ios_install_service.resolve_public_origin(
+                {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "sonify-music.onrender.com"}
+            ),
+            "https://sonify-music.onrender.com",
+        )
+        self.assertEqual(
+            ios_install_service.resolve_public_origin({"Host": "127.0.0.1:8080"}),
+            "http://127.0.0.1:8080",
+        )
+        self.assertEqual(
+            ios_install_service.resolve_public_origin({"Host": "sonify-music.onrender.com"}),
+            "https://sonify-music.onrender.com",
+        )
+        # Unsafe / injected host headers must fall back cleanly
+        for bad_host in ("evil.com/path", "evil.com?x=1", "http://evil.com", "bad host"):
+            self.assertEqual(
+                ios_install_service.resolve_public_origin({"X-Forwarded-Host": bad_host}),
+                "http://127.0.0.1:8080",
+            )
+
+    def test_ios_install_endpoints_default_and_configured_env(self):
+        proxy_hdrs = {
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "sonify-music.onrender.com",
+        }
+
+        # 1. Default env (no TestFlight / no signed IPA)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SONIFY_TESTFLIGHT_URL": "",
+                "SONIFY_IOS_IPA_URL": "",
+                "SONIFY_IOS_BUNDLE_ID": "",
+                "SONIFY_GITHUB_REPO": "",
+            },
+            clear=False,
+        ):
+            req = urllib.request.Request(f"{self.base}/api/ios/install-info", headers=proxy_hdrs)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                info = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(info["appUrl"], "https://sonify-music.onrender.com/")
+                self.assertEqual(info["mobileconfigUrl"], "/api/ios/install.mobileconfig")
+                self.assertIsNone(info["testflightUrl"])
+                self.assertIsNone(info["otaManifestUrl"])
+                self.assertIsNone(info["otaInstallUrl"])
+                self.assertIn("github.com/vinhtran211/sonify/actions/workflows/ios-build.yml", info["ipaDownloadUrl"])
+                self.assertEqual(
+                    info["altstoreSourceUrl"],
+                    "https://sonify-music.onrender.com/api/ios/altstore-source.json",
+                )
+                self.assertFalse(info["hasDirectNativeInstall"])
+                self.assertEqual(info["bundleId"], "com.sonify.music")
+                self.assertTrue(info["version"])
+
+            # /api/ios/manifest.plist returns 404 JSON IPA_NOT_CONFIGURED when unset
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(f"{self.base}/api/ios/manifest.plist", timeout=5)
+            self.assertEqual(ctx.exception.code, 404)
+            err_body = json.loads(ctx.exception.read().decode("utf-8"))
+            ctx.exception.close()
+            self.assertEqual(err_body["error"]["code"], "IPA_NOT_CONFIGURED")
+
+            # /api/ios/altstore-source.json returns valid v2 JSON with empty versions
+            req_alt = urllib.request.Request(f"{self.base}/api/ios/altstore-source.json", headers=proxy_hdrs)
+            with urllib.request.urlopen(req_alt, timeout=5) as r:
+                alt = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(alt["identifier"], "com.sonify.music.altstore")
+                self.assertEqual(alt["sourceURL"], "https://sonify-music.onrender.com/api/ios/altstore-source.json")
+                self.assertEqual(alt["apps"][0]["bundleIdentifier"], "com.sonify.music")
+                self.assertEqual(alt["apps"][0]["versions"], [])
+
+            # /api/ios/install.mobileconfig (GET + HEAD) returns valid deterministic Apple Web Clip XML plist
+            req_mc = urllib.request.Request(f"{self.base}/api/ios/install.mobileconfig", headers=proxy_hdrs)
+            with urllib.request.urlopen(req_mc, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                self.assertEqual(r.headers.get("Content-Type"), "application/x-apple-aspen-config")
+                self.assertEqual(r.headers.get("Content-Disposition"), 'attachment; filename="Sonify.mobileconfig"')
+                self.assertEqual(r.headers.get("X-Ad-Free"), "true")
+                raw1 = r.read()
+
+            with urllib.request.urlopen(req_mc, timeout=5) as r2:
+                raw2 = r2.read()
+            self.assertEqual(raw1, raw2, ".mobileconfig UUIDs & XML must be deterministic")
+
+            head_mc = urllib.request.Request(
+                f"{self.base}/api/ios/install.mobileconfig", headers=proxy_hdrs, method="HEAD"
+            )
+            with urllib.request.urlopen(head_mc, timeout=5) as rh:
+                self.assertEqual(rh.status, 200)
+                self.assertEqual(rh.headers.get("Content-Type"), "application/x-apple-aspen-config")
+                self.assertEqual(rh.read(), b"")
+
+            prof = plistlib.loads(raw1)
+            self.assertEqual(prof["PayloadType"], "Configuration")
+            self.assertIs(prof["PayloadRemovalDisallowed"], False)
+            self.assertEqual(len(prof["PayloadContent"]), 1)
+            clip = prof["PayloadContent"][0]
+            self.assertEqual(clip["PayloadType"], "com.apple.webClip.managed")
+            self.assertEqual(clip["Label"], "Sonify")
+            self.assertEqual(clip["URL"], "https://sonify-music.onrender.com/")
+            self.assertIs(clip["FullScreen"], True)
+            self.assertIs(clip["IsRemovable"], True)
+            self.assertIs(clip["Precomposed"], True)
+            self.assertEqual(clip["Icon"], (FRONTEND_DIR / "icons" / "apple-touch-icon.png").read_bytes())
+
+        # 2. Configured TestFlight + signed HTTPS IPA env
+        ipa_url = "https://cdn.example.com/releases/Sonify-1.0.0.ipa"
+        tf_url = "https://testflight.apple.com/join/AbCdEf12"
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SONIFY_TESTFLIGHT_URL": tf_url,
+                "SONIFY_IOS_IPA_URL": ipa_url,
+                "SONIFY_IOS_BUNDLE_ID": "com.sonify.custom",
+            },
+            clear=False,
+        ):
+            req = urllib.request.Request(f"{self.base}/api/ios/install-info", headers=proxy_hdrs)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                info = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(info["testflightUrl"], tf_url)
+                self.assertEqual(info["otaManifestUrl"], "https://sonify-music.onrender.com/api/ios/manifest.plist")
+                self.assertEqual(
+                    info["otaInstallUrl"],
+                    "itms-services://?action=download-manifest&url="
+                    + urllib.parse.quote("https://sonify-music.onrender.com/api/ios/manifest.plist", safe=""),
+                )
+                self.assertEqual(info["ipaDownloadUrl"], ipa_url)
+                self.assertTrue(info["hasDirectNativeInstall"])
+                self.assertEqual(info["bundleId"], "com.sonify.custom")
+
+            req_man = urllib.request.Request(f"{self.base}/api/ios/manifest.plist", headers=proxy_hdrs)
+            with urllib.request.urlopen(req_man, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                self.assertIn("application/xml", r.headers.get("Content-Type", ""))
+                man = plistlib.loads(r.read())
+                item = man["items"][0]
+                assets = {a["kind"]: a["url"] for a in item["assets"]}
+                self.assertEqual(assets["software-package"], ipa_url)
+                self.assertEqual(assets["display-image"], "https://sonify-music.onrender.com/icons/icon-192.png")
+                self.assertEqual(assets["full-size-image"], "https://sonify-music.onrender.com/icons/icon-512.png")
+                self.assertEqual(item["metadata"]["bundle-identifier"], "com.sonify.custom")
+                self.assertEqual(item["metadata"]["kind"], "software")
+
+            req_alt = urllib.request.Request(f"{self.base}/api/ios/altstore-source.json", headers=proxy_hdrs)
+            with urllib.request.urlopen(req_alt, timeout=5) as r:
+                alt = json.loads(r.read().decode("utf-8"))
+                self.assertEqual(len(alt["apps"][0]["versions"]), 1)
+                self.assertEqual(alt["apps"][0]["versions"][0]["downloadURL"], ipa_url)
+
+        # 3. Non-HTTPS env URLs are ignored safely, POST returns 405, unknown path returns 404
+        with mock.patch.dict(
+            os.environ,
+            {"SONIFY_TESTFLIGHT_URL": "http://insecure.example.com", "SONIFY_IOS_IPA_URL": "javascript:alert(1)"},
+            clear=False,
+        ):
+            with urllib.request.urlopen(f"{self.base}/api/ios/install-info", timeout=5) as r:
+                info = json.loads(r.read().decode("utf-8"))
+                self.assertIsNone(info["testflightUrl"])
+                self.assertIsNone(info["otaInstallUrl"])
+                self.assertFalse(info["hasDirectNativeInstall"])
+
+        post_req = urllib.request.Request(f"{self.base}/api/ios/install-info", data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx_405:
+            urllib.request.urlopen(post_req, timeout=5)
+        self.assertEqual(ctx_405.exception.code, 405)
+        ctx_405.exception.close()
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx_404:
+            urllib.request.urlopen(f"{self.base}/api/ios/nonexistent", timeout=5)
+        self.assertEqual(ctx_404.exception.code, 404)
+        ctx_404.exception.close()
+
+    def test_frontend_install_button_modal_share_css_cascade_and_docs(self):
+        html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="btn-install-app"', html)
+        self.assertIn('id="btn-share-app"', html)
+
+        sidebar_js = (FRONTEND_DIR / "js" / "components" / "sidebar.js").read_text(encoding="utf-8")
+        self.assertIn('id="btn-sidebar-install"', sidebar_js)
+        self.assertIn("openInstallAppModal", sidebar_js)
+
+        main_js = (FRONTEND_DIR / "js" / "main.js").read_text(encoding="utf-8")
+        for needle in ("beforeinstallprompt", "appinstalled", "isStandaloneApp", "openInstallAppModal", "shareSonifyApp"):
+            self.assertIn(needle, main_js)
+
+        modal_js = (FRONTEND_DIR / "js" / "components" / "installModal.js").read_text(encoding="utf-8")
+        for needle in (
+            "Zalo|FBAN|FBAV|FB_IAB|Messenger|Instagram",
+            "navigator.share",
+            "info.mobileconfigUrl",
+            "info.testflightUrl",
+            "info.otaInstallUrl",
+            "info.altstoreSourceUrl",
+            "Install Directly to iPhone",
+        ):
+            self.assertIn(needle, modal_js)
+        # iOS Safari requires direct same-tab download for .mobileconfig (no target="_blank" or download attr)
+        self.assertIn('id="install-mobileconfig-btn" href="${escapeHtml(info.mobileconfigUrl)}"', modal_js)
+
+        # CSS cascade check: @media (max-width: 420px) for .install-app-btn MUST appear AFTER base .install-app-btn
+        comp_css = (FRONTEND_DIR / "css" / "components.css").read_text(encoding="utf-8")
+        base_pos = comp_css.index("/* Topbar Install App & Share Buttons + Sidebar Footer */")
+        mobile_pos = comp_css.index("@media (max-width: 420px)")
+        self.assertGreater(mobile_pos, base_pos, "Mobile @media override must come after base .install-app-btn rule")
+
+        readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+        for needle in ("install.mobileconfig", "SONIFY_TESTFLIGHT_URL", "SONIFY_IOS_IPA_URL"):
+            self.assertIn(needle, readme)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 from backend import config, http_client, offline_catalog
 from backend.db import Database
 from backend.providers import lyrics as lyrics_provider, youtube_music
+from backend.services import ios_install_service
 from backend.services.catalog_service import CatalogService
 from backend.services.library_service import LibraryError, LibraryService
 from backend.services.stream_service import (
@@ -225,6 +226,51 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         "timestamp": int(time.time()),
                     }
                 )
+                return
+
+            # /api/ios/* (Direct iPhone install profile, OTA manifest, AltStore source, install metadata)
+            if path.startswith("/api/ios/"):
+                if method != "GET":
+                    self._send_error_json(405, "METHOD_NOT_ALLOWED", "Use GET")
+                    return
+                origin = ios_install_service.resolve_public_origin(self.headers)
+                if path == "/api/ios/install-info":
+                    self._send_json(ios_install_service.get_install_info(origin))
+                    return
+                if path == "/api/ios/install.mobileconfig":
+                    payload = ios_install_service.build_mobileconfig(origin)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-apple-aspen-config")
+                    self.send_header("Content-Disposition", 'attachment; filename="Sonify.mobileconfig"')
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Ad-Free", "true")
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(payload)
+                    return
+                if path == "/api/ios/manifest.plist":
+                    manifest = ios_install_service.build_ota_manifest(origin)
+                    if manifest is None:
+                        self._send_error_json(
+                            404,
+                            "IPA_NOT_CONFIGURED",
+                            "Direct signed IPA OTA install is not configured (set SONIFY_IOS_IPA_URL).",
+                        )
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml; charset=utf-8")
+                    self.send_header("Content-Length", str(len(manifest)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Ad-Free", "true")
+                    self.end_headers()
+                    if not head_only:
+                        self.wfile.write(manifest)
+                    return
+                if path == "/api/ios/altstore-source.json":
+                    self._send_json(ios_install_service.build_altstore_source(origin))
+                    return
+                self._send_error_json(404, "NOT_FOUND", f"Unknown iOS endpoint '{path}'")
                 return
 
             # /api/artwork/{slug}

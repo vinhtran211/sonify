@@ -2,6 +2,12 @@
 
 import { closeContextMenu, initContextMenuGlobalClose, isContextMenuOpen } from './components/contextMenu.js';
 import {
+  detectClientEnvironment,
+  isStandaloneApp,
+  openInstallAppModal,
+  shareSonifyApp,
+} from './components/installModal.js';
+import {
   ensureLyricsRafLoop,
   loadLyricsForCurrentTrack,
   renderFullStageLyrics,
@@ -43,6 +49,7 @@ import { renderSearchView } from './views/searchView.js';
 
 let searchDebounce = null;
 let lastRenderedTrackId = null;
+let deferredInstallPrompt = null;
 
 function initTopbar() {
   const backBtn = document.getElementById('btn-nav-back');
@@ -51,6 +58,9 @@ function initTopbar() {
   const searchInput = document.getElementById('global-search-input');
   const clearBtn = document.getElementById('global-search-clear');
   const retryBtn = document.getElementById('btn-retry-online');
+  const installBtn = document.getElementById('btn-install-app');
+  const installIcon = document.getElementById('topbar-install-icon');
+  const shareBtn = document.getElementById('btn-share-app');
 
   if (backBtn) {
     backBtn.innerHTML = ICONS.chevronLeft;
@@ -61,6 +71,52 @@ function initTopbar() {
     fwdBtn.addEventListener('click', () => window.history.forward());
   }
   if (searchIcon) searchIcon.innerHTML = ICONS.search;
+  if (installIcon) installIcon.innerHTML = ICONS.download;
+  if (shareBtn) {
+    shareBtn.innerHTML = ICONS.share;
+    shareBtn.addEventListener('click', () => shareSonifyApp());
+  }
+
+  if (installBtn) {
+    if (isStandaloneApp()) {
+      installBtn.classList.add('hidden');
+    }
+    installBtn.addEventListener('click', async () => {
+      const env = detectClientEnvironment();
+      if (deferredInstallPrompt && !env.isIOS) {
+        try {
+          deferredInstallPrompt.prompt();
+          const choice = await deferredInstallPrompt.userChoice;
+          deferredInstallPrompt = null;
+          if (choice?.outcome === 'accepted') {
+            installBtn.classList.add('hidden');
+            return;
+          }
+        } catch {
+          deferredInstallPrompt = null;
+        }
+      }
+      openInstallAppModal({
+        deferredInstallPrompt,
+        onConsumedPrompt: () => {
+          deferredInstallPrompt = null;
+        },
+      });
+    });
+  }
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    if (installBtn && !isStandaloneApp()) {
+      installBtn.classList.remove('hidden');
+    }
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    installBtn?.classList.add('hidden');
+  });
 
   if (searchInput) {
     searchInput.addEventListener('input', () => {

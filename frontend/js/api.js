@@ -100,4 +100,7 @@ export const api = {
   // Settings
   getSettings: () => request('/api/settings'),
   patchSettings: (partial) => request('/api/settings', { method: 'PATCH', body: partial }),
+
+  // iOS Direct Install & Distribution
+  getIosInstallInfo: () => request('/api/ios/install-info'),
 };

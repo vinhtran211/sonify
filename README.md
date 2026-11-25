@@ -58,8 +58,14 @@ This repository includes a Render Blueprint (`render.yaml`) and production `Dock
 
 ## iOS App (Native SwiftUI + App Store / TestFlight + iOS PWA)
 
-### 1. Instant iOS PWA (No App Store Needed)
-Open your live Sonify URL in **Safari on iPhone / iPad** -> tap **Share** -> **Add to Home Screen**. Sonify includes `frontend/manifest.json`, 180×180 / 192×192 / 512×512 RGB icons, notch/Dynamic Island safe-area CSS (`100dvh` + `env(safe-area-inset-*)`), and a static-shell Service Worker (`frontend/sw.js`) that strictly bypasses `/api/*` for native HTTP `Range` streaming.
+### 1. Share & Direct iPhone Install (From the Website)
+Sonify includes an **Install App** button (`#btn-install-app`), a **Share** button (`#btn-share-app`, using native iOS Web Share API with clipboard fallback), and a sidebar **Install on Phone** shortcut right on the website:
+- **Direct iPhone Profile Install (Free, No PC, Never Expires)**: Tapping **Install Directly to iPhone** downloads `GET /api/ios/install.mobileconfig` (Apple `com.apple.webClip.managed` profile with Sonify's icon and full-screen mode) -> **Allow** -> **Settings -> Profile Downloaded -> Install**.
+- **2-Tap Safari PWA**: Or in Safari tap **Share -> Add to Home Screen** (`frontend/manifest.json`, 180×180 / 192×192 / 512×512 RGB icons, notch safe-area CSS, static-shell `sw.js`).
+- **Optional Direct Native iOS Distribution (Render Environment Variables)**:
+  - `SONIFY_TESTFLIGHT_URL`: set your public `https://testflight.apple.com/join/...` link to enable a **1-Tap Install via TestFlight** button inside the website Install modal.
+  - `SONIFY_IOS_IPA_URL`: set an HTTPS URL to a signed `.ipa` to enable Apple OTA `itms-services://` (`GET /api/ios/manifest.plist`) and populate `GET /api/ios/altstore-source.json`.
+  - `SONIFY_IOS_BUNDLE_ID` (optional, default `com.sonify.music`) & `SONIFY_GITHUB_REPO` (optional, default `vinhtran211/sonify`).
 
 ### 2. Native SwiftUI iOS App (`ios/`, iOS 16.0+, Zero Third-Party Dependencies)
 A complete Spotify-like native SwiftUI iOS application lives in `ios/`:

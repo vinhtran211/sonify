@@ -107,3 +107,26 @@ DEFAULT_SETTINGS = {
 
 def has_yt_dlp() -> bool:
     return shutil.which("yt-dlp") is not None
+
+
+# Optional iOS distribution / App Store / TestFlight / OTA env helpers
+def get_testflight_url() -> str | None:
+    val = os.environ.get("SONIFY_TESTFLIGHT_URL", "").strip()
+    if val.lower().startswith("https://"):
+        return val
+    return None
+
+
+def get_ios_ipa_url() -> str | None:
+    val = os.environ.get("SONIFY_IOS_IPA_URL", "").strip()
+    if val.lower().startswith("https://"):
+        return val
+    return None
+
+
+def get_ios_bundle_id() -> str:
+    return os.environ.get("SONIFY_IOS_BUNDLE_ID", "").strip() or "com.sonify.music"
+
+
+def get_github_repo() -> str:
+    return os.environ.get("SONIFY_GITHUB_REPO", "").strip() or "vinhtran211/sonify"

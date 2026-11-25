@@ -33,10 +33,11 @@ export function closeModal() {
   modalOpen = false;
 }
 
-function openModal(html, onMount) {
+export function openModal(html, onMount, cardClass = '') {
   const root = document.getElementById('modal-root');
   if (!root) return;
-  root.innerHTML = `<div class="modal-card" role="document">${html}</div>`;
+  const cls = cardClass ? `modal-card ${cardClass}` : 'modal-card';
+  root.innerHTML = `<div class="${cls}" role="document">${html}</div>`;
   root.classList.remove('hidden');
   modalOpen = true;
 
