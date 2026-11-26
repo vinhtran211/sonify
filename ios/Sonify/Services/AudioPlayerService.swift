@@ -467,8 +467,15 @@ final class AudioPlayerService: ObservableObject {
         }
     }
 
-    private func makePlayerItem(for route: PlaybackRoute, contentType: String) -> AVPlayerItem {
+    private func makePlayerItem(
+        for route: PlaybackRoute,
+        contentType: String,
+        headers: [String: String] = [:]
+    ) -> AVPlayerItem {
         var assetOptions: [String: Any] = [:]
+        if !headers.isEmpty && !route.isLocal {
+            assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+        }
         if !route.isHLS && !route.isLocal {
             if #available(iOS 17.0, *) {
                 assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(contentType)
@@ -559,18 +566,60 @@ final class AudioPlayerService: ObservableObject {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let info: StreamInfoResponse
-                if let cached = self.cachedPrefetchInfo(for: track.id) {
-                    info = cached
-                } else {
-                    let fetched = try await self.api.getStreamInfo(trackId: track.id, quality: qual)
-                    self.storePrefetchInfo(fetched, for: track.id)
-                    info = fetched
+                var info: StreamInfoResponse
+                var customHeaders: [String: String] = [:]
+                var customRoute: PlaybackRoute?
+
+                do {
+                    if let cached = self.cachedPrefetchInfo(for: track.id) {
+                        info = cached
+                    } else {
+                        let fetched = try await self.api.getStreamInfo(trackId: track.id, quality: qual)
+                        self.storePrefetchInfo(fetched, for: track.id)
+                        info = fetched
+                    }
+                    guard !Task.isCancelled, seq == self.playbackSeq else { return }
+
+                    // Residential-IP Native iOS Full-Track Fallback when cloud backend only returned a 30s preview
+                    if info.isPreview, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                        guard !Task.isCancelled, seq == self.playbackSeq else { return }
+                        info = StreamInfoResponse(
+                            trackId: track.id,
+                            streamUrl: yt.url.absoluteString,
+                            streamMode: "full",
+                            streamSource: "youtube-direct",
+                            contentType: yt.mimeType,
+                            adFree: true,
+                            directUrl: yt.url.absoluteString
+                        )
+                        customRoute = .direct(yt.url)
+                        customHeaders = yt.headers
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // Residential-IP fallback if backend /info failed
+                    if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                        guard !Task.isCancelled, seq == self.playbackSeq else { return }
+                        info = StreamInfoResponse(
+                            trackId: track.id,
+                            streamUrl: yt.url.absoluteString,
+                            streamMode: "full",
+                            streamSource: "youtube-direct",
+                            contentType: yt.mimeType,
+                            adFree: true,
+                            directUrl: yt.url.absoluteString
+                        )
+                        customRoute = .direct(yt.url)
+                        customHeaders = yt.headers
+                    } else {
+                        throw error
+                    }
                 }
                 guard !Task.isCancelled, seq == self.playbackSeq else { return }
 
                 let proxyURL = self.api.streamURL(for: info)
-                guard let route = info.preferredPlaybackRoute(proxyURL: proxyURL) else {
+                guard let route = customRoute ?? info.preferredPlaybackRoute(proxyURL: proxyURL) else {
                     self.isLoading = false
                     self.errorMessage = "Invalid audio stream URL"
                     return
@@ -580,7 +629,7 @@ final class AudioPlayerService: ObservableObject {
                 self.currentRoute = route
                 self.activateAudioSession()
 
-                let item = self.makePlayerItem(for: route, contentType: info.contentType)
+                let item = self.makePlayerItem(for: route, contentType: info.contentType, headers: customHeaders)
                 self.observePlayerItem(item, seq: seq)
                 self.player.replaceCurrentItem(with: item)
                 self.player.play()
@@ -623,6 +672,7 @@ final class AudioPlayerService: ObservableObject {
                        !route.isProxy,
                        !route.isLocal,
                        let info = self.streamInfo,
+                       info.streamSource != "youtube-direct",
                        let proxyURL = self.api.streamURL(for: info) {
                         self.didFallbackToProxy = true
                         let proxyRoute = PlaybackRoute.proxy(proxyURL)

@@ -21,6 +21,7 @@
 		47126C344816791C5DC5AA08 /* LibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97963F774CD734259219FB6E /* LibraryStore.swift */; };
 		315D45219E6061FE144A9406 /* LyricsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D453057C72CB6498DA8A129 /* LyricsService.swift */; };
 		B1E4A29C7D3F5081E6A92C41 /* OfflineDownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E4A29C7D3F5081E6A92C42 /* OfflineDownloadManager.swift */; };
+		D3A6C4BE9F517203A8CB4E61 /* YouTubeDirectResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = D3A6C4BE9F517203A8CB4E62 /* YouTubeDirectResolver.swift */; };
 		08B62DC938ABC38DA538ED4B /* SonifyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 887BD72523BDF8FD6E53D27E /* SonifyApp.swift */; };
 		631C03D826B79918FD88321B /* SonifyTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CA5FA1C132BABABD8E6F132 /* SonifyTheme.swift */; };
 		F03E3CCFB3B1E7E8FC3A6014 /* DetailViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = C67C9073661D6E9DB2A629E4 /* DetailViews.swift */; };
@@ -38,6 +39,7 @@
 		ECA2C3601A84A94D7C00CAD9 /* ModelDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34861EACC966B20EB286D578 /* ModelDecodingTests.swift */; };
 		01DE160868A3E12C660F207F /* QueueLogicTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C810472AD81191822DD3518 /* QueueLogicTests.swift */; };
 		C2F5B3AD8E406192F7BA3D51 /* OfflineDownloadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2F5B3AD8E406192F7BA3D52 /* OfflineDownloadTests.swift */; };
+		E4B7D5CF0A628314B9DC5F71 /* YouTubeDirectResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E4B7D5CF0A628314B9DC5F72 /* YouTubeDirectResolverTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -67,6 +69,7 @@
 		97963F774CD734259219FB6E /* LibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LibraryStore.swift"; sourceTree = "<group>"; };
 		9D453057C72CB6498DA8A129 /* LyricsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "LyricsService.swift"; sourceTree = "<group>"; };
 		B1E4A29C7D3F5081E6A92C42 /* OfflineDownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OfflineDownloadManager.swift"; sourceTree = "<group>"; };
+		D3A6C4BE9F517203A8CB4E62 /* YouTubeDirectResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "YouTubeDirectResolver.swift"; sourceTree = "<group>"; };
 		887BD72523BDF8FD6E53D27E /* SonifyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SonifyApp.swift"; sourceTree = "<group>"; };
 		7CA5FA1C132BABABD8E6F132 /* SonifyTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SonifyTheme.swift"; sourceTree = "<group>"; };
 		C67C9073661D6E9DB2A629E4 /* DetailViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "DetailViews.swift"; sourceTree = "<group>"; };
@@ -85,6 +88,7 @@
 		34861EACC966B20EB286D578 /* ModelDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "ModelDecodingTests.swift"; sourceTree = "<group>"; };
 		0C810472AD81191822DD3518 /* QueueLogicTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "QueueLogicTests.swift"; sourceTree = "<group>"; };
 		C2F5B3AD8E406192F7BA3D52 /* OfflineDownloadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OfflineDownloadTests.swift"; sourceTree = "<group>"; };
+		E4B7D5CF0A628314B9DC5F72 /* YouTubeDirectResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "YouTubeDirectResolverTests.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -178,6 +182,7 @@
 				97963F774CD734259219FB6E /* LibraryStore.swift */,
 				9D453057C72CB6498DA8A129 /* LyricsService.swift */,
 				B1E4A29C7D3F5081E6A92C42 /* OfflineDownloadManager.swift */,
+				D3A6C4BE9F517203A8CB4E62 /* YouTubeDirectResolver.swift */,
 			);
 			path = "Services";
 			sourceTree = "<group>";
@@ -213,6 +218,7 @@
 				34861EACC966B20EB286D578 /* ModelDecodingTests.swift */,
 				C2F5B3AD8E406192F7BA3D52 /* OfflineDownloadTests.swift */,
 				0C810472AD81191822DD3518 /* QueueLogicTests.swift */,
+				E4B7D5CF0A628314B9DC5F72 /* YouTubeDirectResolverTests.swift */,
 			);
 			path = "SonifyTests";
 			sourceTree = "<group>";
@@ -331,6 +337,7 @@
 				47126C344816791C5DC5AA08 /* LibraryStore.swift in Sources */,
 				315D45219E6061FE144A9406 /* LyricsService.swift in Sources */,
 				B1E4A29C7D3F5081E6A92C41 /* OfflineDownloadManager.swift in Sources */,
+				D3A6C4BE9F517203A8CB4E61 /* YouTubeDirectResolver.swift in Sources */,
 				08B62DC938ABC38DA538ED4B /* SonifyApp.swift in Sources */,
 				631C03D826B79918FD88321B /* SonifyTheme.swift in Sources */,
 				F03E3CCFB3B1E7E8FC3A6014 /* DetailViews.swift in Sources */,
@@ -353,6 +360,7 @@
 				ECA2C3601A84A94D7C00CAD9 /* ModelDecodingTests.swift in Sources */,
 				C2F5B3AD8E406192F7BA3D51 /* OfflineDownloadTests.swift in Sources */,
 				01DE160868A3E12C660F207F /* QueueLogicTests.swift in Sources */,
+				E4B7D5CF0A628314B9DC5F71 /* YouTubeDirectResolverTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

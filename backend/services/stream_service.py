@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import json
 import re
@@ -19,6 +20,7 @@ from backend.db import Database
 from backend.providers import (
     apple_itunes,
     audius,
+    bilibili,
     deezer,
     jiosaavn,
     monochrome,
@@ -30,6 +32,7 @@ _RANGE_RE = re.compile(r"^\s*bytes=(\d*)-(\d*)\s*$", re.IGNORECASE)
 _YT_SOURCES = frozenset({"youtube-innertube", "yt-dlp", "piped", "invidious", "youtube"})
 _VALID_STREAM_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
 PREVIEW_CACHE_TTL = 12.0
+SOUNDCLOUD_HLS_CACHE_TTL = 240.0         # 4 min max TTL for CloudFront signed m3u8 playlists
 TAIL_PASSTHROUGH_GAP = 512 * 1024        # 512 KiB ahead of sequential producer
 TAIL_PASSTHROUGH_MAX_LEN = 2 * 1024 * 1024  # 2 MiB cap for direct tail/seek Range pass-through
 MONOCHROME_PARALLEL_GRACE_SEC = 2.8      # Wait up to 2.8s for studio master FLAC before instant SC fallback
@@ -111,6 +114,34 @@ class ResolvedStream:
     local_bytes: Optional[bytes] = None
     resolved_at: float = field(default_factory=time.time)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+
+def _cloudfront_policy_expiry(url: str) -> Optional[float]:
+    """Extract AWS:EpochTime expiry from a CloudFront signed URL's Policy query param, if present."""
+    if not url or "Policy=" not in url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        raw_pol = (qs.get("Policy") or [""])[0]
+        if not raw_pol:
+            return None
+        # CloudFront URL-safe base64 uses '-' -> '+', '_' -> '=', '~' -> '/'
+        b64 = raw_pol.replace("-", "+").replace("_", "=").replace("~", "/")
+        pad = (-len(b64)) % 4
+        if pad:
+            b64 += "=" * pad
+        doc = json.loads(base64.b64decode(b64).decode("utf-8"))
+        stmts = doc.get("Statement") if isinstance(doc, dict) else None
+        if isinstance(stmts, list) and stmts:
+            cond = (stmts[0] or {}).get("Condition") or {}
+            dl = cond.get("DateLessThan") or {}
+            epoch = dl.get("AWS:EpochTime")
+            if epoch is not None:
+                return float(epoch)
+    except Exception:
+        return None
+    return None
 
 
 def _extract_monochrome_id(resolved: ResolvedStream) -> Optional[str]:
@@ -196,7 +227,20 @@ class StreamService:
         cached = self._cache.get(track_id)
         if not cached:
             return None
-        ttl = PREVIEW_CACHE_TTL if cached.mode == "preview" else config.STREAM_CACHE_TTL
+        if cached.mode == "preview":
+            ttl = PREVIEW_CACHE_TTL
+        elif (
+            cached.source == "soundcloud"
+            and cached.local_bytes is None
+            and cached.headers.get("X-SC-M3U8")
+        ):
+            m3u8_url = str(cached.headers.get("X-SC-M3U8") or "")
+            cf_exp = _cloudfront_policy_expiry(m3u8_url)
+            if cf_exp is not None and now >= (cf_exp - 60.0):
+                return None
+            ttl = SOUNDCLOUD_HLS_CACHE_TTL
+        else:
+            ttl = config.STREAM_CACHE_TTL
         if (now - cached.resolved_at) < ttl:
             return cached
         return None
@@ -488,6 +532,8 @@ class StreamService:
                 detail_parts.append(f"scored={sc_stats.get('scored_count', 0)}")
                 if sc_stats.get("transcode_failures"):
                     detail_parts.append(f"tc_fail={sc_stats['transcode_failures']}")
+                if sc_stats.get("http_errors"):
+                    detail_parts.append(f"http={'/'.join(str(c) for c in sc_stats['http_errors'])}")
             detail = ",".join(detail_parts)
             if sc_match:
                 entry: Dict[str, Any] = {"provider": "soundcloud", "outcome": "ok", "ms": ms}
@@ -544,6 +590,41 @@ class StreamService:
         except Exception:
             attempts.append(
                 {"provider": "soundcloud", "outcome": "error", "ms": int((time.monotonic() - t0) * 1000)}
+            )
+        return None
+
+    def _try_resolve_bilibili(
+        self,
+        track_id: str,
+        title: str,
+        artist: str,
+        duration: int,
+        excluded: Set[str],
+        attempts: List[Dict[str, Any]],
+    ) -> Optional[ResolvedStream]:
+        if not title or "bilibili" in excluded:
+            return None
+        t0 = time.monotonic()
+        try:
+            bili_match = bilibili.find_best_stream(title, artist, duration)
+            ms = int((time.monotonic() - t0) * 1000)
+            if bili_match:
+                attempts.append({"provider": "bilibili", "outcome": "ok", "ms": ms})
+                resolved = ResolvedStream(
+                    track_id=track_id,
+                    mode="full",
+                    source="bilibili",
+                    content_type=bili_match[1],
+                    url=bili_match[0],
+                    headers=dict(bili_match[2]),
+                    diagnostics=list(attempts),
+                )
+                self._store_cache(resolved)
+                return resolved
+            attempts.append({"provider": "bilibili", "outcome": "no_match", "ms": ms})
+        except Exception:
+            attempts.append(
+                {"provider": "bilibili", "outcome": "error", "ms": int((time.monotonic() - t0) * 1000)}
             )
         return None
 
@@ -860,10 +941,11 @@ class StreamService:
                             self._store_cache(sc_res)
                             return sc_res
 
-                        # If Monochrome only timed out (and SoundCloud missed), give Monochrome one last quick check if done
-                        if mc_timed_out and f_mc.done():
+                        # If Monochrome timed out (and SoundCloud missed), wait up to 3.0s for Monochrome
+                        # to finish rather than prematurely dropping to a 30s preview!
+                        if mc_timed_out:
                             try:
-                                late_mc, late_ms = f_mc.result(timeout=0.1)
+                                late_mc, late_ms = f_mc.result(timeout=3.0)
                                 if late_mc is not None:
                                     attempts.append(
                                         {"provider": "monochrome", "outcome": "ok", "ms": late_ms, "parallel": True}
@@ -920,6 +1002,13 @@ class StreamService:
             if js_resolved:
                 return js_resolved
 
+            # Tier 4.5 (Cloud): Bilibili DASH Audio (cloud-safe, proxied with Referer)
+            bili_resolved = self._try_resolve_bilibili(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if bili_resolved:
+                return bili_resolved
+
             # Tier 5 (Cloud): Audius
             au_resolved = self._try_resolve_audius(
                 track_id, title, artist, duration, excluded, attempts
@@ -966,6 +1055,13 @@ class StreamService:
             )
             if sc_resolved:
                 return sc_resolved
+
+            # Tier 4.5 (Local): Bilibili DASH Audio (proxied with Referer)
+            bili_resolved = self._try_resolve_bilibili(
+                track_id, title, artist, duration, excluded, attempts
+            )
+            if bili_resolved:
+                return bili_resolved
 
             # Tier 5 (Local): Audius
             au_resolved = self._try_resolve_audius(
@@ -1495,8 +1591,10 @@ class StreamService:
                     resolved.content_type = assembled[1]
                     self._serve_local_bytes(handler, resolved, range_header, head_only)
                     return
+                is_stale = (time.time() - resolved.resolved_at) > 30.0
                 self.invalidate(track_id)
-                excluded.add("soundcloud")
+                if attempt >= 1 or not is_stale:
+                    excluded.add("soundcloud")
                 try:
                     resolved = self.resolve_stream(
                         track_id, force_refresh=True, exclude_sources=excluded

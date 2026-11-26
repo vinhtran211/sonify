@@ -782,12 +782,13 @@ class TestStreamWaterfall(unittest.TestCase):
                 r2 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
                 self.assertEqual((r2.mode, r2.source), ("full", "jiosaavn"))
 
-            # Next: YouTube, Monochrome, JioSaavn & SoundCloud fail -> Audius cross-match
+            # Next: YouTube, Monochrome, JioSaavn, SoundCloud & Bilibili fail -> Audius cross-match
             with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
                  mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
                  mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.bilibili.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.audius.find_best_stream", return_value=("https://audius/full.mp3", "audio/mpeg")):
                 r3 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
                 self.assertEqual((r3.mode, r3.source), ("full", "audius"))
@@ -798,6 +799,7 @@ class TestStreamWaterfall(unittest.TestCase):
                  mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.bilibili.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.deezer.get_track", return_value={"id": "dz:908604612", "source": "deezer", "title": "Blinding Lights", "artist": "The Weeknd", "previewUrl": "https://preview.dz/fresh.mp3"}), \
                  mock.patch("backend.http_client.probe_url", side_effect=[
@@ -814,6 +816,7 @@ class TestStreamWaterfall(unittest.TestCase):
                  mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+                 mock.patch("backend.providers.bilibili.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.deezer.get_track", return_value=None), \
                  mock.patch("backend.http_client.probe_url", return_value=(False, 0, {}, "")):
@@ -974,6 +977,7 @@ class TestStreamWaterfall(unittest.TestCase):
              mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
              mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
              mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
+             mock.patch("backend.providers.bilibili.find_best_stream", return_value=None), \
              mock.patch("backend.providers.audius.find_best_stream", return_value=None), \
              mock.patch("backend.providers.apple_itunes.get_track", return_value={
                  "id": "it:777888",

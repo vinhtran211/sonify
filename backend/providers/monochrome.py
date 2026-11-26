@@ -713,6 +713,17 @@ def score_candidate(
     return score
 
 
+_SEARCH_SUFFIX_RE = re.compile(
+    r"\s*[\(\[]\s*(?:with\s+[^)\]]+|from\s+[\"']?[^)\]]+)[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def _clean_search_title(title: str) -> str:
+    stripped = _SEARCH_SUFFIX_RE.sub("", title or "")
+    return lrc_parser.clean_track_title(stripped) or lrc_parser.clean_track_title(title)
+
+
 def find_best_stream(
     title: str,
     artist: str,
@@ -727,8 +738,9 @@ def find_best_stream(
     Returns (stream_url, "audio/flac", monochrome_track_id) or None.
     """
     clean_title = lrc_parser.clean_track_title(title)
+    search_title = _clean_search_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
-    primary_query = f"{primary_artist} {clean_title}".strip()
+    primary_query = f"{primary_artist} {search_title}".strip()
     if not primary_query:
         return None
 
@@ -736,9 +748,9 @@ def find_best_stream(
     ascii_q = lrc_parser.normalize_key(primary_query).strip()
     if ascii_q and ascii_q.lower() != primary_query.lower():
         queries.append(ascii_q)
-    elif clean_title and len(clean_title.strip()) >= 4 and primary_artist:
-        ct_q = clean_title.strip()
-        if ct_q.lower() != primary_query.lower():
+    if search_title and len(search_title.strip()) >= 4 and primary_artist:
+        ct_q = search_title.strip()
+        if all(ct_q.lower() != q.lower() for q in queries):
             queries.append(ct_q)
 
     scored: List[Tuple[float, Dict[str, Any]]] = []

@@ -284,63 +284,79 @@ def find_best_stream(
     if not query:
         return None
 
-    try:
-        candidates = search_songs(query, limit=8)
-    except Exception:
-        return None
+    queries = [query]
+    if any(ord(ch) > 127 for ch in query):
+        ascii_q = lrc_parser.normalize_key(query).strip()
+        if ascii_q and ascii_q.lower() != query.lower():
+            queries.append(ascii_q)
 
     target_context = f"{title or ''} {artist or ''}"
     target_has_artist = bool(
         primary_artist and primary_artist.lower() not in ("unknown artist", "various artists")
     )
+    norm_pa = lrc_parser.normalize_key(primary_artist)
+    norm_pa_compact = norm_pa.replace(" ", "")
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
-    for cand in candidates:
-        cand_title = str(cand.get("title") or "")
-        cand_artist = str(cand.get("artist") or "")
-        cand_dur = int(cand.get("duration") or 0)
+    seen_ids: set[str] = set()
 
-        # Hard Gate 1: Title similarity >= 0.60
-        title_sim = lrc_parser.token_similarity(
-            lrc_parser.clean_track_title(cand_title), clean_title
-        )
-        if title_sim < 0.60:
-            continue
+    for q in queries:
+        try:
+            candidates = search_songs(q, limit=8)
+        except Exception:
+            candidates = []
 
-        # Hard Gate 2: Artist similarity >= 0.50 when target artist is known (blocks cover hijack)
-        artist_sim = max(
-            lrc_parser.token_similarity(cand_artist, primary_artist),
-            lrc_parser.token_similarity(cand_artist, artist or primary_artist),
-        )
-        if target_has_artist and artist_sim < 0.50:
-            continue
+        for cand in candidates:
+            cid = str(cand.get("id") or "")
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
 
-        # Hard Gate 3: Duration within max(25s, 20%) when both durations are known
-        if duration > 30 and cand_dur > 0:
-            max_diff = max(25, int(duration * 0.20))
-            if abs(cand_dur - duration) > max_diff:
+            cand_title = str(cand.get("title") or "")
+            cand_artist = str(cand.get("artist") or "")
+            cand_dur = int(cand.get("duration") or 0)
+
+            # Hard Gate 1: Title similarity >= 0.60
+            title_sim = lrc_parser.token_similarity(
+                lrc_parser.clean_track_title(cand_title), clean_title
+            )
+            if title_sim < 0.60:
                 continue
 
-        sc = score_match(
-            cand_title,
-            cand_artist,
-            cand_dur,
-            clean_title,
-            primary_artist,
-            duration,
-        )
-        # Recompute with max multi-artist similarity if better
-        if artist_sim > lrc_parser.token_similarity(cand_artist, primary_artist):
+            # Hard Gate 2: Artist similarity >= 0.50 (with multi-artist substring match)
+            artist_sim = max(
+                lrc_parser.token_similarity(cand_artist, primary_artist),
+                lrc_parser.token_similarity(cand_artist, artist or primary_artist),
+            )
+            norm_ca = lrc_parser.normalize_key(cand_artist)
+            if norm_pa and len(norm_pa) >= 2 and (
+                norm_pa in norm_ca
+                or (len(norm_pa_compact) >= 3 and norm_pa_compact in norm_ca.replace(" ", ""))
+            ):
+                artist_sim = max(artist_sim, 0.70)
+
+            if target_has_artist and artist_sim < 0.50:
+                continue
+
+            # Hard Gate 3: Duration within max(25s, 20%) when both durations are known
+            if duration > 30 and cand_dur > 0:
+                max_diff = max(25, int(duration * 0.20))
+                if abs(cand_dur - duration) > max_diff:
+                    continue
+
             dur_prox = (
                 max(0.0, 1.0 - abs(cand_dur - duration) / 25.0)
                 if (duration > 0 and cand_dur > 0)
                 else 0.7
             )
             sc = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox
+            sc -= _noise_penalty(f"{cand_title} {cand_artist}", target_context)
+            if sc >= min_score:
+                scored.append((sc, cand))
 
-        sc -= _noise_penalty(f"{cand_title} {cand_artist}", target_context)
-        if sc >= min_score:
-            scored.append((sc, cand))
+        if scored:
+            break
 
     scored.sort(key=lambda item: item[0], reverse=True)
     for _, cand in scored[:3]:

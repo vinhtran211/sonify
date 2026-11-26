@@ -38,6 +38,28 @@ HOME_SWR_TTL = 3600.0          # Serve stale Home snapshot up to 1h while refres
 HOME_FETCH_DEADLINE = 3.5      # Cap Home parallel provider wait at 3.5s
 
 
+_GENRE_SPAM_RE = re.compile(
+    r"(?:as\s+made\s+famous\s+by|\bkaraoke\b|\btribute\b|workout\s+music\s+tv|"
+    r"\bringtone\b|\b8-bit\b|\blullaby\b|christmas\s+music)",
+    re.IGNORECASE,
+)
+
+
+def _is_genre_spam(item: Dict[str, Any]) -> bool:
+    haystack = f"{item.get('title') or ''} {item.get('artist') or ''} {item.get('album') or ''}"
+    return bool(_GENRE_SPAM_RE.search(haystack))
+
+
+def _interleave_lists(lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    max_len = max((len(lst) for lst in lists), default=0)
+    for i in range(max_len):
+        for lst in lists:
+            if i < len(lst):
+                out.append(lst[i])
+    return out
+
+
 class CatalogService:
     """Aggregates live music providers with TTL caching, SQLite upsert, and offline fallback."""
 
@@ -758,84 +780,84 @@ class CatalogService:
             "name": "Pop",
             "color": "#E8115B",
             "description": "Chart-topping pop anthems and global hits.",
-            "queries": ["pop hits", "top pop"],
+            "queries": ["taylor swift", "sabrina carpenter", "ariana grande"],
         },
         "vpop": {
             "slug": "vpop",
             "name": "V-Pop & Vietnam",
             "color": "#1DB954",
             "description": "Vietnam's hottest V-Pop, Indie & Rap hits.",
-            "queries": ["sơn tùng m-tp", "v-pop hits"],
+            "queries": ["sơn tùng m-tp", "hieuthuhai", "vũ."],
         },
         "hiphop": {
             "slug": "hiphop",
             "name": "Hip-Hop & Rap",
             "color": "#BC5900",
             "description": "Hard-hitting hip-hop, trap, and rap essentials.",
-            "queries": ["hip hop rap", "kendrick lamar drake"],
+            "queries": ["kendrick lamar", "drake", "travis scott"],
         },
         "kpop": {
             "slug": "kpop",
             "name": "K-Pop",
             "color": "#E13300",
             "description": "Seoul's biggest idols, choreo bangers, and K-R&B.",
-            "queries": ["kpop blackpink bts", "newjeans aespa"],
+            "queries": ["blackpink", "newjeans", "aespa"],
         },
         "indie": {
             "slug": "indie",
             "name": "Indie & Alt",
             "color": "#148A08",
             "description": "Dreamy guitars, alt-pop, and independent gems.",
-            "queries": ["indie rock alternative", "tame impala arctic monkeys"],
+            "queries": ["tame impala", "arctic monkeys", "clairo"],
         },
         "electronic": {
             "slug": "electronic",
             "name": "Electronic & EDM",
             "color": "#0D73EC",
             "description": "House, synthwave, and festival-ready electronic.",
-            "queries": ["electronic edm house", "daft punk calvin harris"],
+            "queries": ["calvin harris", "daft punk", "fred again"],
         },
         "chill": {
             "slug": "chill",
             "name": "Chill & Unwind",
             "color": "#1E3264",
             "description": "Laid-back tracks for late nights and easy afternoons.",
-            "queries": ["chill acoustic vibes", "billie eilish frank ocean"],
+            "queries": ["billie eilish", "lana del rey", "cigarettes after sex"],
         },
         "workout": {
             "slug": "workout",
             "name": "Workout & Energy",
             "color": "#D84000",
             "description": "High-tempo motivation to power every rep and run.",
-            "queries": ["workout pump up hits", "gym motivation electronic"],
+            "queries": ["eminem", "dua lipa", "david guetta"],
         },
         "focus": {
             "slug": "focus",
             "name": "Deep Focus",
             "color": "#503750",
             "description": "Ambient, piano, and instrumental flow for deep work.",
-            "queries": ["ambient piano study", "instrumental focus"],
+            "queries": ["ludovico einaudi", "max richter", "yiruma"],
         },
         "rnb": {
             "slug": "rnb",
             "name": "R&B & Soul",
             "color": "#8D67AB",
             "description": "Silky vocals, neo-soul grooves, and midnight R&B.",
-            "queries": ["r&b soul sza", "the weeknd bruno mars"],
+            "queries": ["sza", "the weeknd", "frank ocean"],
         },
         "acoustic": {
             "slug": "acoustic",
             "name": "Acoustic & Ballad",
             "color": "#7358FF",
             "description": "Stripped-back ballads, warm strings, and pure vocals.",
-            "queries": ["acoustic ballad", "ed sheeran adele"],
+            "queries": ["ed sheeran", "adele", "john mayer"],
         },
         "lofi": {
             "slug": "lofi",
             "name": "Lo-Fi Beats",
             "color": "#27856A",
             "description": "Dusty beats to study, code, and relax to.",
-            "queries": ["lofi chill beats", "lo-fi hip hop"],
+            "queries": ["joji", "nujabes", "keshi"],
         },
     }
 
@@ -906,24 +928,37 @@ class CatalogService:
             except Exception:
                 return []
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=6)
         try:
-            f_dz_t = pool.submit(_safe, deezer.search_tracks, queries[0], 20)
+            track_futs = [
+                pool.submit(_safe, deezer.search_tracks, q, 12) for q in queries[:3]
+            ]
+            f_it_t = pool.submit(_safe, apple_itunes.search_songs, queries[-1], country, 10)
             f_dz_a = pool.submit(_safe, deezer.search_albums, queries[0], 10)
             f_dz_art = pool.submit(_safe, deezer.search_artists, queries[0], 10)
-            f_it_t = pool.submit(_safe, apple_itunes.search_songs, queries[-1], country, 16)
-            concurrent.futures.wait([f_dz_t, f_dz_a, f_dz_art, f_it_t], timeout=4.0)
+            all_futs = track_futs + [f_it_t, f_dz_a, f_dz_art]
+            concurrent.futures.wait(all_futs, timeout=4.0)
 
-            dz_tracks = f_dz_t.result() if f_dz_t.done() else []
-            dz_albums = f_dz_a.result() if f_dz_a.done() else []
-            dz_artists = f_dz_art.result() if f_dz_art.done() else []
-            it_tracks = f_it_t.result() if f_it_t.done() else []
+            per_query_tracks: List[List[Dict[str, Any]]] = []
+            for fut in track_futs:
+                raw_list = fut.result() if fut.done() else []
+                clean_list = [t for t in (raw_list or []) if not _is_genre_spam(t)]
+                if clean_list:
+                    per_query_tracks.append(clean_list)
+            it_tracks = [
+                t for t in ((f_it_t.result() if f_it_t.done() else []) or []) if not _is_genre_spam(t)
+            ]
+            if it_tracks:
+                per_query_tracks.append(it_tracks)
+            dz_albums = [
+                a for a in ((f_dz_a.result() if f_dz_a.done() else []) or []) if not _is_genre_spam(a)
+            ]
+            dz_artists = (f_dz_art.result() if f_dz_art.done() else []) or []
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
-        merged_tracks = self._dedup_tracks_keep_order(
-            (dz_tracks or []) + (it_tracks or []), limit=24
-        )
+        interleaved = _interleave_lists(per_query_tracks)
+        merged_tracks = self._dedup_tracks_keep_order(interleaved, limit=24)
         if not merged_tracks:
             merged_tracks = [dict(t) for t in offline_catalog.OFFLINE_TRACKS]
         self.db.upsert_tracks(merged_tracks)

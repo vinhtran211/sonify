@@ -55,12 +55,17 @@ private final class DownloadDelegateBridge: NSObject, URLSessionDownloadDelegate
 
     func download(
         from url: URL,
+        headers: [String: String] = [:],
         to destinationURL: URL,
         trackId: String,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> Int64 {
         try await withCheckedThrowingContinuation { continuation in
-            let task = session.downloadTask(with: url)
+            var request = URLRequest(url: url)
+            for (k, v) in headers {
+                request.setValue(v, forHTTPHeaderField: k)
+            }
+            let task = session.downloadTask(with: request)
             lock.lock()
             jobsByTaskId[task.taskIdentifier] = ActiveJob(
                 trackId: trackId,
@@ -304,13 +309,33 @@ final class OfflineDownloadManager: ObservableObject {
         }
 
         do {
-            // 1. Resolve stream metadata & ALWAYS download the self-contained proxy audio file (never ephemeral .m3u8 HLS)
-            let info = try await api.getStreamInfo(trackId: track.id, quality: quality)
-            guard let proxyURL = api.streamURL(for: info) else {
+            // 1. Resolve stream metadata & ALWAYS download a full-length file (never ephemeral .m3u8 HLS)
+            let downloadURL: URL
+            let downloadHeaders: [String: String]
+            let resolvedContentType: String
+            let resolvedSource: String
+
+            let backendInfo = try? await api.getStreamInfo(trackId: track.id, quality: quality)
+            if let info = backendInfo, !info.isPreview, let proxyURL = api.streamURL(for: info) {
+                downloadURL = proxyURL
+                downloadHeaders = [:]
+                resolvedContentType = info.contentType
+                resolvedSource = info.streamSource
+            } else if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                downloadURL = yt.url
+                downloadHeaders = yt.headers
+                resolvedContentType = yt.mimeType
+                resolvedSource = "youtube-direct"
+            } else if let info = backendInfo, let proxyURL = api.streamURL(for: info) {
+                downloadURL = proxyURL
+                downloadHeaders = [:]
+                resolvedContentType = info.contentType
+                resolvedSource = info.streamSource
+            } else {
                 throw OfflineDownloadError.invalidStreamURL
             }
 
-            let ext = StreamInfoResponse.extensionForMIME(info.contentType)
+            let ext = StreamInfoResponse.extensionForMIME(resolvedContentType)
             let safeId = Self.safeFilename(for: track.id)
             let audioFilename = "\(safeId)\(ext)"
             let audioDestURL = audioDirectory.appendingPathComponent(audioFilename, isDirectory: false)
@@ -321,7 +346,8 @@ final class OfflineDownloadManager: ObservableObject {
 
             let trackId = track.id
             let audioBytes = try await bridge.download(
-                from: proxyURL,
+                from: downloadURL,
+                headers: downloadHeaders,
                 to: audioDestURL,
                 trackId: trackId
             ) { [weak self] fraction in
@@ -338,8 +364,8 @@ final class OfflineDownloadManager: ObservableObject {
                 track: track,
                 audioFilename: audioFilename,
                 audioSizeBytes: audioBytes,
-                contentType: info.contentType,
-                streamSource: info.streamSource,
+                contentType: resolvedContentType,
+                streamSource: resolvedSource,
                 artworkData: artData,
                 lyrics: lyricsResp
             )

@@ -79,6 +79,7 @@ _MAX_HLS_CACHE_ITEMS = 8
 _HLS_KEY_LOCKS_GUARD = threading.Lock()
 _HLS_KEY_LOCKS: Dict[str, threading.Lock] = {}
 _HLS_PREWARM_ACTIVE: set[str] = set()
+_SC_THREAD_LOCAL = threading.local()
 
 
 def _get_hls_key_lock(cache_key: str) -> threading.Lock:
@@ -445,7 +446,9 @@ def start_background_hls_assembly(
 
 
 def _resolve_item_stream(
-    item: Dict[str, Any], client_id: str, assemble_now: bool = True
+    item: Dict[str, Any],
+    client_id: str,
+    assemble_now: bool = True,
 ) -> Optional[Dict[str, Any]]:
     transcodings = ((item.get("media") or {}).get("transcodings")) or []
     if not transcodings:
@@ -453,18 +456,37 @@ def _resolve_item_stream(
 
     track_auth = str(item.get("track_authorization") or "")
     sc_id = str(item.get("id") or "")
+    active_cid = [client_id]
+    http_errs = getattr(_SC_THREAD_LOCAL, "http_errors", None)
 
     def _fetch_transcoding_stream_url(tc: Dict[str, Any]) -> Optional[str]:
         t_url = str(tc.get("url") or "")
         if not t_url:
             return None
         sep = "&" if "?" in t_url else "?"
-        params: Dict[str, str] = {"client_id": client_id}
-        if track_auth:
-            params["track_authorization"] = track_auth
-        full_u = f"{t_url}{sep}{urllib.parse.urlencode(params)}"
-        data = http_client.fetch_json(full_u, timeout=config.PROVIDER_TIMEOUT)
-        return str((data or {}).get("url") or "") or None
+        for attempt in range(2):
+            params: Dict[str, str] = {"client_id": active_cid[0]}
+            if track_auth:
+                params["track_authorization"] = track_auth
+            full_u = f"{t_url}{sep}{urllib.parse.urlencode(params)}"
+            try:
+                data = http_client.fetch_json(full_u, timeout=config.PROVIDER_TIMEOUT)
+                return str((data or {}).get("url") or "") or None
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+                if isinstance(http_errs, list) and code not in http_errs:
+                    http_errs.append(code)
+                if code in (401, 403) and attempt == 0:
+                    refreshed = get_client_id(force_refresh=True) or ""
+                    if refreshed:
+                        active_cid[0] = refreshed
+                        continue
+                raise
+        return None
 
     # 1. Prefer progressive direct HTTP stream (audio/mpeg) when available (never snipped/preview)
     for tc in transcodings:
@@ -647,14 +669,24 @@ def find_best_stream(
     if not cid:
         return None
 
-    for _, item in scored[:6]:
-        resolved = _resolve_item_stream(item, cid, assemble_now=assemble_now)
-        if resolved:
-            if stats is not None:
-                stats["transcode_failures"] = transcode_failures
-            return resolved
-        transcode_failures += 1
+    _SC_THREAD_LOCAL.http_errors = []
+    try:
+        for _, item in scored[:6]:
+            cid = get_client_id(force_refresh=False) or cid
+            resolved = _resolve_item_stream(item, cid, assemble_now=assemble_now)
+            if resolved:
+                if stats is not None:
+                    stats["transcode_failures"] = transcode_failures
+                    if _SC_THREAD_LOCAL.http_errors:
+                        stats["http_errors"] = list(_SC_THREAD_LOCAL.http_errors)
+                return resolved
+            transcode_failures += 1
+    finally:
+        captured_errs = list(getattr(_SC_THREAD_LOCAL, "http_errors", []))
+        _SC_THREAD_LOCAL.http_errors = None
 
     if stats is not None:
         stats["transcode_failures"] = transcode_failures
+        if captured_errs:
+            stats["http_errors"] = captured_errs
     return None
