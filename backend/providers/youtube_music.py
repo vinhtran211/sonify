@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from backend import config, http_client, lrc_parser
+from backend import config, http_client, lrc_parser, security
 
 YTM_ORIGIN = "https://music.youtube.com"
 YTM_SEARCH_URL = "https://music.youtube.com/youtubei/v1/search"
@@ -373,8 +373,17 @@ def _get_ytdlp_extra_args() -> List[str]:
             try:
                 if cookies_b64 != _COOKIES_B64_HASH or not _COOKIES_FILE_PATH.is_file():
                     raw = base64.b64decode(cookies_b64)
-                    _COOKIES_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    _COOKIES_FILE_PATH.write_bytes(raw)
+                    _COOKIES_FILE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    try:
+                        os.chmod(_COOKIES_FILE_PATH.parent, 0o700)
+                    except OSError:
+                        pass
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(str(_COOKIES_FILE_PATH), flags, 0o600)
+                    try:
+                        os.write(fd, raw)
+                    finally:
+                        os.close(fd)
                     try:
                         os.chmod(_COOKIES_FILE_PATH, 0o600)
                     except OSError:
@@ -385,17 +394,28 @@ def _get_ytdlp_extra_args() -> List[str]:
                 pass
     else:
         cookies_path = os.environ.get("YTDLP_COOKIES_PATH", "").strip()
-        if cookies_path and Path(cookies_path).is_file():
+        if (
+            cookies_path
+            and not cookies_path.startswith("-")
+            and not any(ch in cookies_path for ch in ("\r", "\n", "\x00"))
+            and Path(cookies_path).is_file()
+        ):
             extra_args.extend(["--cookies", cookies_path])
 
     proxy_val = os.environ.get("YTDLP_PROXY", "").strip()
-    if proxy_val:
+    if (
+        proxy_val
+        and not proxy_val.startswith("-")
+        and not any(ch in proxy_val for ch in ("\r", "\n", "\x00"))
+    ):
         extra_args.extend(["--proxy", proxy_val])
 
     return extra_args
 
 
 def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
+    if not security.validate_provider_id("yt", video_id):
+        return None
     if not shutil.which("yt-dlp"):
         return None
     # On cloud datacenter IPs without cookies or proxy, anonymous yt-dlp hits LOGIN_REQUIRED
@@ -416,6 +436,7 @@ def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str
             "6",
         ]
         cmd.extend(_get_ytdlp_extra_args())
+        cmd.append("--")
         cmd.append(f"https://www.youtube.com/watch?v={video_id}")
         proc = subprocess.run(
             cmd,
@@ -536,6 +557,8 @@ def _pick_best_progressive_format(formats: List[Dict[str, Any]]) -> Optional[Tup
 
 
 def _resolve_via_innertube_player(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
+    if not security.validate_provider_id("yt", video_id):
+        return None
     clients = [
         (
             {
@@ -680,6 +703,8 @@ def _get_invidious_instances() -> List[str]:
 
 
 def _resolve_via_piped(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
+    if not security.validate_provider_id("yt", video_id):
+        return None
     tried = 0
     for inst in _PIPED_SEED_INSTANCES:
         if not _is_instance_healthy(inst):
@@ -727,6 +752,8 @@ def _resolve_via_piped(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]
 
 
 def _resolve_via_invidious(video_id: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
+    if not security.validate_provider_id("yt", video_id):
+        return None
     tried = 0
     for inst in _get_invidious_instances()[:4]:
         if not _is_instance_healthy(inst):
@@ -776,7 +803,7 @@ def resolve_audio_stream(video_id: str) -> Optional[Tuple[str, str, Dict[str, st
     cloud datacenter IPs where InnerTube may hit LOGIN_REQUIRED), then Piped & Invidious.
     Returns (url, content_type, headers, source_label) or None.
     """
-    if not video_id:
+    if not video_id or not security.validate_provider_id("yt", video_id):
         return None
 
     res = _resolve_via_innertube_player(video_id)
@@ -847,7 +874,7 @@ def _extract_ytm_lyrics_text(obj: Any) -> Optional[str]:
 
 
 def fetch_plain_lyrics(video_id: str) -> Optional[str]:
-    if not video_id:
+    if not video_id or not security.validate_provider_id("yt", video_id):
         return None
     try:
         next_data = http_client.fetch_json(

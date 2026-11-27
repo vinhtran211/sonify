@@ -7,8 +7,7 @@ RUN apt-get update \
 
 # Install optional cloud streaming & decryption dependencies (cryptography + yt-dlp)
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt \
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm -f /tmp/requirements.txt
 
 # Run as non-root UID 1000 for container security

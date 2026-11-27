@@ -1,5 +1,8 @@
 name: Sonify iOS Build, Test & TestFlight
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]

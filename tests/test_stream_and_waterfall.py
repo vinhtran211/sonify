@@ -149,6 +149,7 @@ class TestByteRangeParser(unittest.TestCase):
 class TestProbeUrlAndStrictMatchers(unittest.TestCase):
     def setUp(self):
         http_client.set_offline_mode(False)
+        http_client.set_allow_loopback_for_tests(True)
         _MockAudioCDNHandler.content_type = "audio/mpeg"
         _MockAudioCDNHandler.fail_first_get = False
         _MockAudioCDNHandler.reject_head_405 = False
@@ -166,6 +167,7 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
     def tearDown(self):
         self.cdn.shutdown()
         self.cdn.server_close()
+        http_client.set_allow_loopback_for_tests(False)
         http_client.set_offline_mode(None)
 
     def test_probe_url_uses_open_range_rejects_po_token_and_html(self):
@@ -999,6 +1001,7 @@ class TestStreamProxyLiveHTTP(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self._tmp.name, "proxy.db")
+        http_client.set_allow_loopback_for_tests(True)
 
         _MockAudioCDNHandler.content_type = "audio/mpeg"
         _MockAudioCDNHandler.fail_first_get = False
@@ -1036,6 +1039,7 @@ class TestStreamProxyLiveHTTP(unittest.TestCase):
         self.srv.server_close()
         self.cdn.shutdown()
         self.cdn.server_close()
+        http_client.set_allow_loopback_for_tests(False)
         http_client.set_offline_mode(None)
         self._tmp.cleanup()
 

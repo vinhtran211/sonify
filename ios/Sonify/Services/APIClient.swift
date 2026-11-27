@@ -24,6 +24,7 @@ enum SonifyAPIError: Error, LocalizedError, Equatable {
 final class APIClient: ObservableObject, @unchecked Sendable {
     static let defaultServerURL = "https://sonify-music.onrender.com"
     private static let serverURLDefaultsKey = "sonify.serverBaseURL"
+    private static let sessionTokenDefaultsKey = "sonify.sessionToken"
     private static let pathSegmentAllowed: CharacterSet = {
         var cs = CharacterSet.urlPathAllowed
         cs.remove(charactersIn: "/:?#")
@@ -32,6 +33,7 @@ final class APIClient: ObservableObject, @unchecked Sendable {
 
     @Published private(set) var baseURLString: String
     private let session: URLSession
+    private let sessionToken: String
     private let decoder: JSONDecoder
     private let encoder: JSONEncoder
 
@@ -39,8 +41,36 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         let saved = UserDefaults.standard.string(forKey: Self.serverURLDefaultsKey)
         self.baseURLString = Self.sanitizeBaseURL(baseURLString ?? saved ?? Self.defaultServerURL)
         self.session = session
+        self.sessionToken = Self.loadOrCreateSessionToken()
         self.decoder = JSONDecoder()
         self.encoder = JSONEncoder()
+    }
+
+    private static func loadOrCreateSessionToken() -> String {
+        if let existing = UserDefaults.standard.string(forKey: sessionTokenDefaultsKey),
+           existing.count >= 20 {
+            return existing
+        }
+        let fresh = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        UserDefaults.standard.set(fresh, forKey: sessionTokenDefaultsKey)
+        return fresh
+    }
+
+    private static func isLocalOrLANHost(_ host: String) -> Bool {
+        let low = host.lowercased()
+        if low == "localhost" || low == "127.0.0.1" || low == "::1" || low.hasSuffix(".local") {
+            return true
+        }
+        if low.hasPrefix("10.") || low.hasPrefix("192.168.") {
+            return true
+        }
+        if low.hasPrefix("172.") {
+            let parts = low.split(separator: ".")
+            if parts.count >= 2, let second = Int(parts[1]), (16...31).contains(second) {
+                return true
+            }
+        }
+        return false
     }
 
     static func sanitizeBaseURL(_ raw: String) -> String {
@@ -53,6 +83,16 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         }
         if !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://") {
             trimmed = "https://" + trimmed
+        }
+        if var comps = URLComponents(string: trimmed),
+           let scheme = comps.scheme?.lowercased(),
+           scheme == "http",
+           let host = comps.host,
+           !isLocalOrLANHost(host) {
+            comps.scheme = "https"
+            if let upgraded = comps.string {
+                trimmed = upgraded
+            }
         }
         return trimmed
     }
@@ -112,6 +152,7 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(sessionToken, forHTTPHeaderField: "X-Sonify-Session")
         if let body {
             request.httpBody = body
             request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")

@@ -14,12 +14,25 @@ _SAFE_HOST_RE = re.compile(r"^[a-zA-Z0-9._:\-\[\]]+$")
 
 
 def resolve_public_origin(headers: Any) -> str:
-    """Infer public http(s) origin from proxy headers or Host header safely."""
+    """Resolve pinned or allowlisted public http(s) origin (prevents Host/X-Forwarded-Host spoofing)."""
+    pinned = config.get_public_origin()
+    if pinned:
+        return pinned
+
+    allowed_hosts = config.get_allowed_hosts()
     raw_proto = ""
     raw_host = ""
     if headers is not None:
         raw_proto = str(headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
         raw_host = str(headers.get("X-Forwarded-Host") or headers.get("Host") or "").split(",", 1)[0].strip()
+
+    if allowed_hosts:
+        host_only = raw_host.split(":", 1)[0].strip().lower() if raw_host and not raw_host.startswith("[") else raw_host.lower()
+        if not raw_host or not _SAFE_HOST_RE.match(raw_host) or (
+            raw_host.lower() not in allowed_hosts and host_only not in allowed_hosts
+        ):
+            primary_host = sorted(allowed_hosts)[0]
+            return f"https://{primary_host}".rstrip("/")
 
     proto = raw_proto if raw_proto in ("http", "https") else ""
     if not raw_host or not _SAFE_HOST_RE.match(raw_host):

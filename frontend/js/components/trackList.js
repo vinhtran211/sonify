@@ -1,7 +1,14 @@
 // Reusable Spotify-style Track Table, Sortable Columns, Drag-and-Drop Reorder, Media Cards & Playlist Cover Builder
 
 import { ICONS } from '../icons.js';
-import { coverUrlFor, escapeHtml, formatRelativeTime, formatTime } from '../lrc.js';
+import {
+  coverUrlFor,
+  escapeHtml,
+  formatRelativeTime,
+  formatTime,
+  sanitizeCssColor,
+  sanitizeSafeUrl,
+} from '../lrc.js';
 import { playTrack, togglePlay } from '../player.js';
 import { navigate } from '../router.js';
 import { getState, toggleLike } from '../store.js';
@@ -9,7 +16,7 @@ import { openTrackContextMenu } from './contextMenu.js';
 import { showToast } from './modals.js';
 
 export function renderMosaicHtml(covers = []) {
-  const valid = (covers || []).filter(Boolean).slice(0, 4);
+  const valid = (covers || []).map((u) => sanitizeSafeUrl(u)).filter(Boolean).slice(0, 4);
   if (valid.length === 0) {
     return `<div class="mosaic-placeholder">${ICONS.musicNote}</div>`;
   }
@@ -22,11 +29,13 @@ export function renderMosaicHtml(covers = []) {
 }
 
 export function renderPlaylistCoverHtml(playlist, covers = null) {
-  if (playlist?.coverUrl) {
-    return `<div class="mosaic-grid single"><img src="${escapeHtml(playlist.coverUrl)}" alt="${escapeHtml(playlist.name || '')}" loading="lazy" /></div>`;
+  const safeCoverUrl = sanitizeSafeUrl(playlist?.coverUrl);
+  if (safeCoverUrl) {
+    return `<div class="mosaic-grid single"><img src="${escapeHtml(safeCoverUrl)}" alt="${escapeHtml(playlist.name || '')}" loading="lazy" /></div>`;
   }
-  if (playlist?.coverColor || playlist?.coverEmoji) {
-    const bg = playlist.coverColor || '#1e3264';
+  const safeColor = sanitizeCssColor(playlist?.coverColor);
+  if (safeColor || playlist?.coverEmoji) {
+    const bg = safeColor || '#1e3264';
     const emoji = playlist.coverEmoji || '🎵';
     return `<div class="custom-cover-art" style="background:linear-gradient(135deg, ${escapeHtml(bg)}, #121212);">${escapeHtml(emoji)}</div>`;
   }
@@ -41,7 +50,7 @@ export function renderMediaCard(item, type = 'album') {
       ? `${Number(item.fans).toLocaleString()} fans`
       : 'Artist'
     : item.artist || item.subtitle || 'Album';
-  const img = item.image || item.cover || coverUrlFor(item, false);
+  const img = sanitizeSafeUrl(item.image || item.cover) || coverUrlFor(item, false);
   return `
     <article class="media-card ${isArtist ? 'artist-card' : ''}" data-card-type="${escapeHtml(type)}" data-card-id="${escapeHtml(item.id || '')}">
       <div class="media-card-art ${isArtist ? 'round' : ''}">

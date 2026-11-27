@@ -11,3 +11,9 @@ services:
         value: 0.0.0.0
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: SONIFY_PUBLIC_ORIGIN
+        value: https://sonify-music.onrender.com
+      - key: SONIFY_ALLOW_DEBUG
+        value: "0"
+      - key: SONIFY_SESSION_SECRET
+        generateValue: true

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 from pathlib import Path
+from typing import Optional, Set
 
 APP_NAME = "Sonify"
 APP_VERSION = "1.0.0"
+
+_PROCESS_SESSION_SECRET: bytes = secrets.token_bytes(32)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -102,7 +106,10 @@ BROWSER_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/134.0.0.0 Safari/537.36"
 )
-JIOSAAVN_DES_KEY = b"38346591"
+# JioSaavn's public protocol DES-ECB obfuscation constant (not an app secret; optional env override)
+JIOSAAVN_DES_KEY = (
+    os.environ.get("JIOSAAVN_DES_KEY", "").strip().encode("utf-8")[:8] or b"38346591"
+)
 
 DEFAULT_SETTINGS = {
     "volume": 0.8,
@@ -146,3 +153,83 @@ def get_ios_bundle_id() -> str:
 
 def get_github_repo() -> str:
     return os.environ.get("SONIFY_GITHUB_REPO", "").strip() or "vinhtran211/sonify"
+
+
+# ------------------------------------------------------------------
+# Security & Session Configuration Helpers
+# ------------------------------------------------------------------
+def get_session_secret() -> bytes:
+    """Return signing key for sonify_sid cookies (SONIFY_SESSION_SECRET or per-process CSPRNG)."""
+    raw = os.environ.get("SONIFY_SESSION_SECRET", "").strip()
+    if raw:
+        return raw.encode("utf-8")
+    return _PROCESS_SESSION_SECRET
+
+
+def is_session_required() -> bool:
+    return os.environ.get("SONIFY_REQUIRE_SESSION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def get_api_token() -> Optional[str]:
+    val = os.environ.get("SONIFY_API_TOKEN", "").strip()
+    return val or None
+
+
+def is_debug_allowed() -> bool:
+    flag = os.environ.get("SONIFY_ALLOW_DEBUG", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return not is_cloud_env()
+
+
+def get_debug_token() -> Optional[str]:
+    val = os.environ.get("SONIFY_DEBUG_TOKEN", "").strip()
+    return val or None
+
+
+def get_public_origin() -> Optional[str]:
+    val = os.environ.get("SONIFY_PUBLIC_ORIGIN", "").strip().rstrip("/")
+    if val.lower().startswith(("https://", "http://")):
+        return val
+    return None
+
+
+def get_allowed_hosts() -> Set[str]:
+    hosts: Set[str] = set()
+    raw = os.environ.get("SONIFY_ALLOWED_HOSTS", "")
+    for part in raw.split(","):
+        h = part.strip().lower()
+        if h:
+            hosts.add(h)
+    render_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip().lower()
+    if render_host:
+        hosts.add(render_host)
+    return hosts
+
+
+def get_allowed_origins() -> Set[str]:
+    origins: Set[str] = set()
+    raw = os.environ.get("SONIFY_ALLOWED_ORIGINS", "")
+    for part in raw.split(","):
+        o = part.strip().rstrip("/").lower()
+        if o:
+            origins.add(o)
+    pub = get_public_origin()
+    if pub:
+        origins.add(pub.lower())
+    return origins
+
+
+def get_rate_limit_rpm() -> int:
+    raw = os.environ.get("SONIFY_RATE_LIMIT_RPM", "180").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 180

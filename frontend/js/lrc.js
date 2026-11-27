@@ -133,12 +133,36 @@ export function escapeHtml(str) {
     .replace(/'/g, '&#39;');
 }
 
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/;
+const UNSAFE_URL_CHARS_RE = /[\x00-\x1f\x7f'"()\\<>\s]/;
+
+export function sanitizeSafeUrl(url) {
+  const raw = String(url ?? '').trim();
+  if (!raw || raw.length > 512) return '';
+  if (UNSAFE_URL_CHARS_RE.test(raw)) return '';
+  if (raw.startsWith('//')) return '';
+  if (raw.startsWith('/api/artwork/')) {
+    return raw.includes('..') ? '' : raw;
+  }
+  const low = raw.toLowerCase();
+  if (low.startsWith('https://') || low.startsWith('http://')) {
+    return raw;
+  }
+  return '';
+}
+
+export function sanitizeCssColor(color, fallback = '') {
+  const raw = String(color ?? '').trim();
+  return HEX_COLOR_RE.test(raw) ? raw : fallback;
+}
+
 export function coverUrlFor(item, large = false) {
   if (!item) return '/api/artwork/sonify';
-  const url = large
+  const rawUrl = large
     ? item.coverLarge || item.pictureLarge || item.coverSmall || item.pictureSmall
     : item.coverSmall || item.pictureSmall || item.coverLarge || item.pictureLarge;
-  if (url) return url;
+  const safe = sanitizeSafeUrl(rawUrl);
+  if (safe) return safe;
   const seed = encodeURIComponent(item.title || item.name || item.id || 'sonify');
   return `/api/artwork/${seed}`;
 }

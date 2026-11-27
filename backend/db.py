@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS tracks_cache (
 
 CREATE TABLE IF NOT EXISTS playlists (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'default',
     name TEXT NOT NULL,
     description TEXT DEFAULT '',
     created_at INTEGER NOT NULL,
@@ -50,12 +51,15 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
 );
 
 CREATE TABLE IF NOT EXISTS liked_tracks (
-    track_id TEXT PRIMARY KEY,
-    liked_at INTEGER NOT NULL
+    owner_id TEXT NOT NULL DEFAULT 'default',
+    track_id TEXT NOT NULL,
+    liked_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, track_id)
 );
 
 CREATE TABLE IF NOT EXISTS play_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL DEFAULT 'default',
     track_id TEXT NOT NULL,
     played_at INTEGER NOT NULL
 );
@@ -72,11 +76,18 @@ CREATE TABLE IF NOT EXISTS lyrics_cache (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'default',
+    key TEXT NOT NULL,
     value_json TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (owner_id, key)
 );
 """
+
+
+def _norm_owner(owner_id: Optional[str]) -> str:
+    val = str(owner_id or "default").strip()[:64]
+    return val or "default"
 
 
 def row_to_track(row: sqlite3.Row, liked_ids: Optional[Set[str]] = None) -> Dict[str, Any]:
@@ -137,41 +148,159 @@ class Database:
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS followed_artists (
-                        artist_id   TEXT PRIMARY KEY,
+                        owner_id    TEXT NOT NULL DEFAULT 'default',
+                        artist_id   TEXT NOT NULL,
                         name        TEXT NOT NULL,
                         artwork_url TEXT DEFAULT '',
                         fans        INTEGER DEFAULT 0,
-                        followed_at INTEGER NOT NULL
+                        followed_at INTEGER NOT NULL,
+                        PRIMARY KEY (owner_id, artist_id)
                     );
 
                     CREATE TABLE IF NOT EXISTS saved_albums (
-                        album_id     TEXT PRIMARY KEY,
+                        owner_id     TEXT NOT NULL DEFAULT 'default',
+                        album_id     TEXT NOT NULL,
                         title        TEXT NOT NULL,
                         artist       TEXT NOT NULL,
                         artist_id    TEXT DEFAULT '',
                         artwork_url  TEXT DEFAULT '',
                         release_date TEXT DEFAULT '',
                         track_count  INTEGER DEFAULT 0,
-                        saved_at     INTEGER NOT NULL
+                        saved_at     INTEGER NOT NULL,
+                        PRIMARY KEY (owner_id, album_id)
                     );
 
                     CREATE TABLE IF NOT EXISTS pinned_items (
+                        owner_id  TEXT NOT NULL DEFAULT 'default',
                         item_type TEXT NOT NULL,
                         item_id   TEXT NOT NULL,
                         pinned_at INTEGER NOT NULL,
-                        PRIMARY KEY (item_type, item_id)
+                        PRIMARY KEY (owner_id, item_type, item_id)
                     );
                     """
                 )
-                existing_cols = {
-                    row["name"]
-                    for row in conn.execute("PRAGMA table_info(playlists)").fetchall()
-                }
+
+                def _cols(table: str) -> Set[str]:
+                    return {
+                        row["name"]
+                        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    }
+
+                pl_cols = _cols("playlists")
                 for col_name in ("cover_color", "cover_emoji", "cover_url"):
-                    if col_name not in existing_cols:
+                    if col_name not in pl_cols:
                         conn.execute(
                             f"ALTER TABLE playlists ADD COLUMN {col_name} TEXT DEFAULT ''"
                         )
+                if "owner_id" not in pl_cols:
+                    conn.execute(
+                        "ALTER TABLE playlists ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'default'"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists(owner_id, updated_at DESC)"
+                )
+
+                ph_cols = _cols("play_history")
+                if "owner_id" not in ph_cols:
+                    conn.execute(
+                        "ALTER TABLE play_history ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'default'"
+                    )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_history_owner_played ON play_history(owner_id, played_at DESC, id DESC)"
+                )
+
+                # Safe table recreations for legacy single-user DBs lacking owner_id in composite PKs
+                if "owner_id" not in _cols("liked_tracks"):
+                    conn.executescript(
+                        """
+                        CREATE TABLE liked_tracks_v2 (
+                            owner_id TEXT NOT NULL DEFAULT 'default',
+                            track_id TEXT NOT NULL,
+                            liked_at INTEGER NOT NULL,
+                            PRIMARY KEY (owner_id, track_id)
+                        );
+                        INSERT OR IGNORE INTO liked_tracks_v2 (owner_id, track_id, liked_at)
+                        SELECT 'default', track_id, liked_at FROM liked_tracks;
+                        DROP TABLE liked_tracks;
+                        ALTER TABLE liked_tracks_v2 RENAME TO liked_tracks;
+                        """
+                    )
+
+                if "owner_id" not in _cols("settings"):
+                    conn.executescript(
+                        """
+                        CREATE TABLE settings_v2 (
+                            owner_id TEXT NOT NULL DEFAULT 'default',
+                            key TEXT NOT NULL,
+                            value_json TEXT NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            PRIMARY KEY (owner_id, key)
+                        );
+                        INSERT OR IGNORE INTO settings_v2 (owner_id, key, value_json, updated_at)
+                        SELECT 'default', key, value_json, updated_at FROM settings;
+                        DROP TABLE settings;
+                        ALTER TABLE settings_v2 RENAME TO settings;
+                        """
+                    )
+
+                if "owner_id" not in _cols("followed_artists"):
+                    conn.executescript(
+                        """
+                        CREATE TABLE followed_artists_v2 (
+                            owner_id    TEXT NOT NULL DEFAULT 'default',
+                            artist_id   TEXT NOT NULL,
+                            name        TEXT NOT NULL,
+                            artwork_url TEXT DEFAULT '',
+                            fans        INTEGER DEFAULT 0,
+                            followed_at INTEGER NOT NULL,
+                            PRIMARY KEY (owner_id, artist_id)
+                        );
+                        INSERT OR IGNORE INTO followed_artists_v2 (owner_id, artist_id, name, artwork_url, fans, followed_at)
+                        SELECT 'default', artist_id, name, artwork_url, fans, followed_at FROM followed_artists;
+                        DROP TABLE followed_artists;
+                        ALTER TABLE followed_artists_v2 RENAME TO followed_artists;
+                        """
+                    )
+
+                if "owner_id" not in _cols("saved_albums"):
+                    conn.executescript(
+                        """
+                        CREATE TABLE saved_albums_v2 (
+                            owner_id     TEXT NOT NULL DEFAULT 'default',
+                            album_id     TEXT NOT NULL,
+                            title        TEXT NOT NULL,
+                            artist       TEXT NOT NULL,
+                            artist_id    TEXT DEFAULT '',
+                            artwork_url  TEXT DEFAULT '',
+                            release_date TEXT DEFAULT '',
+                            track_count  INTEGER DEFAULT 0,
+                            saved_at     INTEGER NOT NULL,
+                            PRIMARY KEY (owner_id, album_id)
+                        );
+                        INSERT OR IGNORE INTO saved_albums_v2 (owner_id, album_id, title, artist, artist_id, artwork_url, release_date, track_count, saved_at)
+                        SELECT 'default', album_id, title, artist, artist_id, artwork_url, release_date, track_count, saved_at FROM saved_albums;
+                        DROP TABLE saved_albums;
+                        ALTER TABLE saved_albums_v2 RENAME TO saved_albums;
+                        """
+                    )
+
+                if "owner_id" not in _cols("pinned_items"):
+                    conn.executescript(
+                        """
+                        CREATE TABLE pinned_items_v2 (
+                            owner_id  TEXT NOT NULL DEFAULT 'default',
+                            item_type TEXT NOT NULL,
+                            item_id   TEXT NOT NULL,
+                            pinned_at INTEGER NOT NULL,
+                            PRIMARY KEY (owner_id, item_type, item_id)
+                        );
+                        INSERT OR IGNORE INTO pinned_items_v2 (owner_id, item_type, item_id, pinned_at)
+                        SELECT 'default', item_type, item_id, pinned_at FROM pinned_items;
+                        DROP TABLE pinned_items;
+                        ALTER TABLE pinned_items_v2 RENAME TO pinned_items;
+                        """
+                    )
+
                 conn.commit()
             finally:
                 conn.close()
@@ -209,7 +338,25 @@ class Database:
             conn = self.connect()
             try:
                 for t in items:
-                    tid = str(t["id"])
+                    tid = str(t["id"]).strip()[:128]
+                    if not tid:
+                        continue
+                    source_val = str(t.get("source") or tid.split(":", 1)[0])[:32]
+                    title_val = str(t.get("title") or "Untitled")[:240]
+                    artist_val = str(t.get("artist") or "Unknown Artist")[:200]
+                    artist_id_val = str(t.get("artistId") or "")[:128]
+                    album_val = str(t.get("album") or "")[:200]
+                    album_id_val = str(t.get("albumId") or "")[:128]
+                    try:
+                        duration_val = max(0, min(86400, int(t.get("duration") or 0)))
+                    except Exception:
+                        duration_val = 0
+                    cover_small_val = str(t.get("coverSmall") or "")[:512]
+                    cover_large_val = str(t.get("coverLarge") or t.get("coverSmall") or "")[:512]
+                    explicit_val = 1 if t.get("explicit") else 0
+                    release_date_val = str(t.get("releaseDate") or "")[:32]
+                    preview_url_val = str(t.get("previewUrl") or "")[:512]
+
                     incoming_extra = (extra_map or {}).get(tid) or t.get("_extra")
                     if incoming_extra is not None:
                         existing = conn.execute(
@@ -248,18 +395,18 @@ class Database:
                             """,
                             (
                                 tid,
-                                str(t.get("source") or tid.split(":", 1)[0]),
-                                str(t.get("title") or "Untitled"),
-                                str(t.get("artist") or "Unknown Artist"),
-                                str(t.get("artistId") or ""),
-                                str(t.get("album") or ""),
-                                str(t.get("albumId") or ""),
-                                int(t.get("duration") or 0),
-                                str(t.get("coverSmall") or ""),
-                                str(t.get("coverLarge") or t.get("coverSmall") or ""),
-                                1 if t.get("explicit") else 0,
-                                str(t.get("releaseDate") or ""),
-                                str(t.get("previewUrl") or ""),
+                                source_val,
+                                title_val,
+                                artist_val,
+                                artist_id_val,
+                                album_val,
+                                album_id_val,
+                                duration_val,
+                                cover_small_val,
+                                cover_large_val,
+                                explicit_val,
+                                release_date_val,
+                                preview_url_val,
                                 extra_str,
                                 now,
                             ),
@@ -289,18 +436,18 @@ class Database:
                             """,
                             (
                                 tid,
-                                str(t.get("source") or tid.split(":", 1)[0]),
-                                str(t.get("title") or "Untitled"),
-                                str(t.get("artist") or "Unknown Artist"),
-                                str(t.get("artistId") or ""),
-                                str(t.get("album") or ""),
-                                str(t.get("albumId") or ""),
-                                int(t.get("duration") or 0),
-                                str(t.get("coverSmall") or ""),
-                                str(t.get("coverLarge") or t.get("coverSmall") or ""),
-                                1 if t.get("explicit") else 0,
-                                str(t.get("releaseDate") or ""),
-                                str(t.get("previewUrl") or ""),
+                                source_val,
+                                title_val,
+                                artist_val,
+                                artist_id_val,
+                                album_val,
+                                album_id_val,
+                                duration_val,
+                                cover_small_val,
+                                cover_large_val,
+                                explicit_val,
+                                release_date_val,
+                                preview_url_val,
                                 now,
                             ),
                         )
@@ -308,13 +455,15 @@ class Database:
             finally:
                 conn.close()
 
-    def get_track(self, track_id: str, include_extra: bool = False) -> Optional[Dict[str, Any]]:
+    def get_track(
+        self, track_id: str, include_extra: bool = False, owner_id: str = "default"
+    ) -> Optional[Dict[str, Any]]:
         conn = self.connect()
         try:
             row = conn.execute("SELECT * FROM tracks_cache WHERE id = ?", (track_id,)).fetchone()
             if not row:
                 return None
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner_id)
             track = row_to_track(row, liked_ids)
             if include_extra:
                 try:
@@ -345,14 +494,16 @@ class Database:
             finally:
                 conn.close()
 
-    def search_cached_tracks(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_cached_tracks(
+        self, query: str, limit: int = 20, owner_id: str = "default"
+    ) -> List[Dict[str, Any]]:
         q_clean = (query or "").strip()
         pattern = f"%{q_clean}%"
         q_norm = lrc_parser.normalize_key(q_clean)
         q_tokens = [tok for tok in q_norm.split() if tok]
         conn = self.connect()
         try:
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner_id)
             rows = conn.execute(
                 """
                 SELECT * FROM tracks_cache
@@ -384,10 +535,12 @@ class Database:
         finally:
             conn.close()
 
-    def get_tracks_by_artist_id(self, artist_id: str, limit: int = 25) -> List[Dict[str, Any]]:
+    def get_tracks_by_artist_id(
+        self, artist_id: str, limit: int = 25, owner_id: str = "default"
+    ) -> List[Dict[str, Any]]:
         conn = self.connect()
         try:
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner_id)
             rows = conn.execute(
                 "SELECT * FROM tracks_cache WHERE artist_id = ? ORDER BY updated_at DESC LIMIT ?",
                 (artist_id, limit),
@@ -396,10 +549,12 @@ class Database:
         finally:
             conn.close()
 
-    def get_tracks_by_album_id(self, album_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_tracks_by_album_id(
+        self, album_id: str, limit: int = 50, owner_id: str = "default"
+    ) -> List[Dict[str, Any]]:
         conn = self.connect()
         try:
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner_id)
             rows = conn.execute(
                 "SELECT * FROM tracks_cache WHERE album_id = ? ORDER BY updated_at ASC LIMIT ?",
                 (album_id, limit),
@@ -411,18 +566,25 @@ class Database:
     # ------------------------------------------------------------------
     # Likes
     # ------------------------------------------------------------------
-    def get_liked_ids(self, conn: Optional[sqlite3.Connection] = None) -> Set[str]:
+    def get_liked_ids(
+        self, conn: Optional[sqlite3.Connection] = None, owner_id: str = "default"
+    ) -> Set[str]:
+        owner = _norm_owner(owner_id)
         own = conn is None
         c = conn or self.connect()
         try:
-            rows = c.execute("SELECT track_id FROM liked_tracks").fetchall()
+            rows = c.execute(
+                "SELECT track_id FROM liked_tracks WHERE owner_id = ?", (owner,)
+            ).fetchall()
             return {r["track_id"] for r in rows}
         finally:
             if own:
                 c.close()
 
-    def annotate_tracks(self, tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        liked_ids = self.get_liked_ids()
+    def annotate_tracks(
+        self, tracks: List[Dict[str, Any]], owner_id: str = "default"
+    ) -> List[Dict[str, Any]]:
+        liked_ids = self.get_liked_ids(owner_id=owner_id)
         result: List[Dict[str, Any]] = []
         for t in tracks:
             item = {k: v for k, v in t.items() if k != "_extra"}
@@ -431,7 +593,8 @@ class Database:
             result.append(item)
         return result
 
-    def get_liked_tracks(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def get_liked_tracks(self, owner_id: str = "default") -> Tuple[List[Dict[str, Any]], List[str]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
             rows = conn.execute(
@@ -439,8 +602,10 @@ class Database:
                 SELECT tc.*, lt.liked_at
                 FROM liked_tracks lt
                 JOIN tracks_cache tc ON tc.id = lt.track_id
+                WHERE lt.owner_id = ?
                 ORDER BY lt.liked_at DESC
-                """
+                """,
+                (owner,),
             ).fetchall()
             liked_ids = [r["id"] for r in rows]
             liked_set = set(liked_ids)
@@ -453,7 +618,10 @@ class Database:
         finally:
             conn.close()
 
-    def like_track(self, track_id: str, track: Optional[Dict[str, Any]] = None) -> None:
+    def like_track(
+        self, track_id: str, track: Optional[Dict[str, Any]] = None, owner_id: str = "default"
+    ) -> None:
+        owner = _norm_owner(owner_id)
         if track:
             self.upsert_track(track)
         now = int(time.time())
@@ -462,21 +630,25 @@ class Database:
             try:
                 conn.execute(
                     """
-                    INSERT INTO liked_tracks (track_id, liked_at)
-                    VALUES (?, ?)
-                    ON CONFLICT(track_id) DO UPDATE SET liked_at = excluded.liked_at
+                    INSERT INTO liked_tracks (owner_id, track_id, liked_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(owner_id, track_id) DO UPDATE SET liked_at = excluded.liked_at
                     """,
-                    (track_id, now),
+                    (owner, track_id, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def unlike_track(self, track_id: str) -> None:
+    def unlike_track(self, track_id: str, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
-                conn.execute("DELETE FROM liked_tracks WHERE track_id = ?", (track_id,))
+                conn.execute(
+                    "DELETE FROM liked_tracks WHERE owner_id = ? AND track_id = ?",
+                    (owner, track_id),
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -521,39 +693,49 @@ class Database:
             "updatedAt": int(row["updated_at"]),
         }
 
-    def list_playlists(self) -> List[Dict[str, Any]]:
+    def list_playlists(self, owner_id: str = "default") -> List[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM playlists ORDER BY updated_at DESC, created_at DESC"
+                "SELECT * FROM playlists WHERE owner_id = ? ORDER BY updated_at DESC, created_at DESC",
+                (owner,),
             ).fetchall()
             return [self._playlist_row_to_dict(conn, r) for r in rows]
         finally:
             conn.close()
 
-    def create_playlist(self, name: str, description: str = "") -> Dict[str, Any]:
+    def create_playlist(
+        self, name: str, description: str = "", owner_id: str = "default"
+    ) -> Dict[str, Any]:
+        owner = _norm_owner(owner_id)
         pid = f"pl_{uuid.uuid4().hex[:12]}"
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
                 conn.execute(
-                    "INSERT INTO playlists (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (pid, name.strip(), description.strip(), now, now),
+                    "INSERT INTO playlists (id, owner_id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (pid, owner, name.strip(), description.strip(), now, now),
                 )
                 conn.commit()
-                row = conn.execute("SELECT * FROM playlists WHERE id = ?", (pid,)).fetchone()
+                row = conn.execute(
+                    "SELECT * FROM playlists WHERE id = ? AND owner_id = ?", (pid, owner)
+                ).fetchone()
                 return self._playlist_row_to_dict(conn, row)
             finally:
                 conn.close()
 
-    def get_playlist(self, playlist_id: str) -> Optional[Dict[str, Any]]:
+    def get_playlist(self, playlist_id: str, owner_id: str = "default") -> Optional[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
-            row = conn.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+            ).fetchone()
             if not row:
                 return None
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner)
             track_rows = conn.execute(
                 """
                 SELECT tc.*, pt.position, pt.added_at
@@ -585,12 +767,16 @@ class Database:
         cover_color: Optional[str] = None,
         cover_emoji: Optional[str] = None,
         cover_url: Optional[str] = None,
+        owner_id: str = "default",
     ) -> Optional[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
-                row = conn.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                row = conn.execute(
+                    "SELECT * FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                ).fetchone()
                 if not row:
                     return None
                 new_name = row["name"] if name is None else name.strip()
@@ -602,20 +788,23 @@ class Database:
                     """
                     UPDATE playlists
                     SET name = ?, description = ?, cover_color = ?, cover_emoji = ?, cover_url = ?, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND owner_id = ?
                     """,
-                    (new_name, new_desc, new_color, new_emoji, new_url, now, playlist_id),
+                    (new_name, new_desc, new_color, new_emoji, new_url, now, playlist_id, owner),
                 )
                 conn.commit()
-                updated = conn.execute("SELECT * FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                updated = conn.execute(
+                    "SELECT * FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                ).fetchone()
                 return self._playlist_row_to_dict(conn, updated)
             finally:
                 conn.close()
 
     def duplicate_playlist(
-        self, playlist_id: str, new_name: Optional[str] = None
+        self, playlist_id: str, new_name: Optional[str] = None, owner_id: str = "default"
     ) -> Optional[Dict[str, Any]]:
-        source = self.get_playlist(playlist_id)
+        owner = _norm_owner(owner_id)
+        source = self.get_playlist(playlist_id, owner_id=owner)
         if not source:
             return None
         pl = source["playlist"]
@@ -627,11 +816,12 @@ class Database:
             try:
                 conn.execute(
                     """
-                    INSERT INTO playlists (id, name, description, cover_color, cover_emoji, cover_url, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO playlists (id, owner_id, name, description, cover_color, cover_emoji, cover_url, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pid,
+                        owner,
                         cloned_name,
                         pl.get("description", ""),
                         pl.get("coverColor", ""),
@@ -652,28 +842,43 @@ class Database:
                 conn.commit()
             finally:
                 conn.close()
-        return self.get_playlist(pid)
+        return self.get_playlist(pid, owner_id=owner)
 
-    def delete_playlist(self, playlist_id: str) -> bool:
+    def delete_playlist(self, playlist_id: str, owner_id: str = "default") -> bool:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
-                cur = conn.execute("DELETE FROM playlists WHERE id = ?", (playlist_id,))
+                cur = conn.execute(
+                    "DELETE FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                )
+                if cur.rowcount > 0:
+                    conn.execute(
+                        "DELETE FROM pinned_items WHERE owner_id = ? AND item_type = 'playlist' AND item_id = ?",
+                        (owner, playlist_id),
+                    )
                 conn.commit()
                 return cur.rowcount > 0
             finally:
                 conn.close()
 
     def add_track_to_playlist(
-        self, playlist_id: str, track_id: str, track: Optional[Dict[str, Any]] = None
+        self,
+        playlist_id: str,
+        track_id: str,
+        track: Optional[Dict[str, Any]] = None,
+        owner_id: str = "default",
     ) -> Optional[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         if track:
             self.upsert_track(track)
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
-                exists = conn.execute("SELECT id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                exists = conn.execute(
+                    "SELECT id FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                ).fetchone()
                 if not exists:
                     return None
                 existing_link = conn.execute(
@@ -696,7 +901,10 @@ class Database:
                         """,
                         (playlist_id, track_id, position, now),
                     )
-                    conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (now, playlist_id))
+                    conn.execute(
+                        "UPDATE playlists SET updated_at = ? WHERE id = ? AND owner_id = ?",
+                        (now, playlist_id, owner),
+                    )
                     duplicate = False
                 conn.commit()
                 cnt_row = conn.execute(
@@ -712,12 +920,17 @@ class Database:
             finally:
                 conn.close()
 
-    def remove_track_from_playlist(self, playlist_id: str, track_id: str) -> Optional[Dict[str, Any]]:
+    def remove_track_from_playlist(
+        self, playlist_id: str, track_id: str, owner_id: str = "default"
+    ) -> Optional[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
-                exists = conn.execute("SELECT id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                exists = conn.execute(
+                    "SELECT id FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                ).fetchone()
                 if not exists:
                     return None
                 conn.execute(
@@ -734,18 +947,26 @@ class Database:
                         "UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?",
                         (idx, playlist_id, r["track_id"]),
                     )
-                conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (now, playlist_id))
+                conn.execute(
+                    "UPDATE playlists SET updated_at = ? WHERE id = ? AND owner_id = ?",
+                    (now, playlist_id, owner),
+                )
                 conn.commit()
                 return {"removed": True, "trackCount": len(rem)}
             finally:
                 conn.close()
 
-    def reorder_playlist_tracks(self, playlist_id: str, track_ids: List[str]) -> Optional[bool]:
+    def reorder_playlist_tracks(
+        self, playlist_id: str, track_ids: List[str], owner_id: str = "default"
+    ) -> Optional[bool]:
+        owner = _norm_owner(owner_id)
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
-                exists = conn.execute("SELECT id FROM playlists WHERE id = ?", (playlist_id,)).fetchone()
+                exists = conn.execute(
+                    "SELECT id FROM playlists WHERE id = ? AND owner_id = ?", (playlist_id, owner)
+                ).fetchone()
                 if not exists:
                     return None
                 existing_rows = conn.execute(
@@ -765,7 +986,10 @@ class Database:
                         "UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?",
                         (idx, playlist_id, tid),
                     )
-                conn.execute("UPDATE playlists SET updated_at = ? WHERE id = ?", (now, playlist_id))
+                conn.execute(
+                    "UPDATE playlists SET updated_at = ? WHERE id = ? AND owner_id = ?",
+                    (now, playlist_id, owner),
+                )
                 conn.commit()
                 return True
             finally:
@@ -774,7 +998,10 @@ class Database:
     # ------------------------------------------------------------------
     # Play History
     # ------------------------------------------------------------------
-    def record_history(self, track_id: str, track: Optional[Dict[str, Any]] = None) -> None:
+    def record_history(
+        self, track_id: str, track: Optional[Dict[str, Any]] = None, owner_id: str = "default"
+    ) -> None:
+        owner = _norm_owner(owner_id)
         if track:
             self.upsert_track(track)
         now = int(time.time())
@@ -783,41 +1010,48 @@ class Database:
             try:
                 # Avoid duplicate consecutive entries within 10 seconds
                 last = conn.execute(
-                    "SELECT id, track_id, played_at FROM play_history ORDER BY played_at DESC, id DESC LIMIT 1"
+                    "SELECT id, track_id, played_at FROM play_history WHERE owner_id = ? ORDER BY played_at DESC, id DESC LIMIT 1",
+                    (owner,),
                 ).fetchone()
                 if last and last["track_id"] == track_id and abs(now - int(last["played_at"])) < 10:
-                    conn.execute("UPDATE play_history SET played_at = ? WHERE id = ?", (now, last["id"]))
+                    conn.execute(
+                        "UPDATE play_history SET played_at = ? WHERE id = ? AND owner_id = ?",
+                        (now, last["id"], owner),
+                    )
                 else:
                     conn.execute(
-                        "INSERT INTO play_history (track_id, played_at) VALUES (?, ?)",
-                        (track_id, now),
+                        "INSERT INTO play_history (owner_id, track_id, played_at) VALUES (?, ?, ?)",
+                        (owner, track_id, now),
                     )
-                # Keep history bounded to latest 300 entries
+                # Keep history bounded to latest 300 entries per owner
                 conn.execute(
                     """
                     DELETE FROM play_history
-                    WHERE id NOT IN (
-                        SELECT id FROM play_history ORDER BY played_at DESC, id DESC LIMIT 300
+                    WHERE owner_id = ? AND id NOT IN (
+                        SELECT id FROM play_history WHERE owner_id = ? ORDER BY played_at DESC, id DESC LIMIT 300
                     )
-                    """
+                    """,
+                    (owner, owner),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def get_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_history(self, limit: int = 50, owner_id: str = "default") -> List[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
-            liked_ids = self.get_liked_ids(conn)
+            liked_ids = self.get_liked_ids(conn, owner_id=owner)
             rows = conn.execute(
                 """
                 SELECT tc.*, ph.played_at
                 FROM play_history ph
                 JOIN tracks_cache tc ON tc.id = ph.track_id
+                WHERE ph.owner_id = ?
                 ORDER BY ph.played_at DESC, ph.id DESC
                 LIMIT ?
                 """,
-                (max(1, min(limit, 200)),),
+                (owner, max(1, min(limit, 200))),
             ).fetchall()
             return [
                 {"playedAt": int(r["played_at"]), "track": row_to_track(r, liked_ids)}
@@ -826,11 +1060,12 @@ class Database:
         finally:
             conn.close()
 
-    def clear_history(self) -> None:
+    def clear_history(self, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
-                conn.execute("DELETE FROM play_history")
+                conn.execute("DELETE FROM play_history WHERE owner_id = ?", (owner,))
                 conn.commit()
             finally:
                 conn.close()
@@ -902,11 +1137,14 @@ class Database:
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
-    def get_settings(self) -> Dict[str, Any]:
+    def get_settings(self, owner_id: str = "default") -> Dict[str, Any]:
+        owner = _norm_owner(owner_id)
         result = dict(config.DEFAULT_SETTINGS)
         conn = self.connect()
         try:
-            rows = conn.execute("SELECT key, value_json FROM settings").fetchall()
+            rows = conn.execute(
+                "SELECT key, value_json FROM settings WHERE owner_id = ?", (owner,)
+            ).fetchall()
             for r in rows:
                 try:
                     result[r["key"]] = json.loads(r["value_json"])
@@ -916,7 +1154,8 @@ class Database:
         finally:
             conn.close()
 
-    def update_settings(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+    def update_settings(self, updates: Dict[str, Any], owner_id: str = "default") -> Dict[str, Any]:
+        owner = _norm_owner(owner_id)
         allowed = set(config.DEFAULT_SETTINGS.keys())
         now = int(time.time())
         with self._lock:
@@ -927,27 +1166,31 @@ class Database:
                         continue
                     conn.execute(
                         """
-                        INSERT INTO settings (key, value_json, updated_at)
-                        VALUES (?, ?, ?)
-                        ON CONFLICT(key) DO UPDATE SET
+                        INSERT INTO settings (owner_id, key, value_json, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(owner_id, key) DO UPDATE SET
                             value_json = excluded.value_json,
                             updated_at = excluded.updated_at
                         """,
-                        (k, json.dumps(v), now),
+                        (owner, k, json.dumps(v), now),
                     )
                 conn.commit()
             finally:
                 conn.close()
-        return self.get_settings()
+        return self.get_settings(owner_id=owner)
 
     # ------------------------------------------------------------------
     # Followed Artists, Saved Albums & Pinned Items
     # ------------------------------------------------------------------
-    def get_followed_artists(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def get_followed_artists(
+        self, owner_id: str = "default"
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM followed_artists ORDER BY followed_at DESC"
+                "SELECT * FROM followed_artists WHERE owner_id = ? ORDER BY followed_at DESC",
+                (owner,),
             ).fetchall()
             artists = [
                 {
@@ -964,56 +1207,63 @@ class Database:
         finally:
             conn.close()
 
-    def follow_artist(self, artist: Dict[str, Any]) -> str:
-        aid = str(artist.get("id") or "").strip()
-        name = str(artist.get("name") or "Unknown Artist").strip()
+    def follow_artist(self, artist: Dict[str, Any], owner_id: str = "default") -> str:
+        owner = _norm_owner(owner_id)
+        aid = str(artist.get("id") or "").strip()[:128]
+        name = str(artist.get("name") or "Unknown Artist").strip()[:200]
         artwork = str(
             artist.get("pictureLarge")
             or artist.get("pictureSmall")
             or artist.get("picture")
             or artist.get("artworkUrl")
             or ""
-        ).strip()
-        fans = int(artist.get("fans") or 0)
+        ).strip()[:512]
+        fans = max(0, int(artist.get("fans") or 0))
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
                 conn.execute(
                     """
-                    INSERT INTO followed_artists (artist_id, name, artwork_url, fans, followed_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(artist_id) DO UPDATE SET
+                    INSERT INTO followed_artists (owner_id, artist_id, name, artwork_url, fans, followed_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id, artist_id) DO UPDATE SET
                         name = excluded.name,
                         artwork_url = CASE WHEN excluded.artwork_url != '' THEN excluded.artwork_url ELSE followed_artists.artwork_url END,
                         fans = CASE WHEN excluded.fans > 0 THEN excluded.fans ELSE followed_artists.fans END,
                         followed_at = excluded.followed_at
                     """,
-                    (aid, name, artwork, fans, now),
+                    (owner, aid, name, artwork, fans, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
         return aid
 
-    def unfollow_artist(self, artist_id: str) -> None:
+    def unfollow_artist(self, artist_id: str, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
-                conn.execute("DELETE FROM followed_artists WHERE artist_id = ?", (artist_id,))
                 conn.execute(
-                    "DELETE FROM pinned_items WHERE item_type = 'artist' AND item_id = ?",
-                    (artist_id,),
+                    "DELETE FROM followed_artists WHERE owner_id = ? AND artist_id = ?",
+                    (owner, artist_id),
+                )
+                conn.execute(
+                    "DELETE FROM pinned_items WHERE owner_id = ? AND item_type = 'artist' AND item_id = ?",
+                    (owner, artist_id),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def get_saved_albums(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def get_saved_albums(self, owner_id: str = "default") -> Tuple[List[Dict[str, Any]], List[str]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
             rows = conn.execute(
-                "SELECT * FROM saved_albums ORDER BY saved_at DESC"
+                "SELECT * FROM saved_albums WHERE owner_id = ? ORDER BY saved_at DESC",
+                (owner,),
             ).fetchall()
             albums = [
                 {
@@ -1033,19 +1283,20 @@ class Database:
         finally:
             conn.close()
 
-    def save_album(self, album: Dict[str, Any]) -> str:
-        albid = str(album.get("id") or "").strip()
-        title = str(album.get("title") or "Untitled Album").strip()
-        artist = str(album.get("artist") or "Unknown Artist").strip()
-        artist_id = str(album.get("artistId") or "").strip()
+    def save_album(self, album: Dict[str, Any], owner_id: str = "default") -> str:
+        owner = _norm_owner(owner_id)
+        albid = str(album.get("id") or "").strip()[:128]
+        title = str(album.get("title") or "Untitled Album").strip()[:240]
+        artist = str(album.get("artist") or "Unknown Artist").strip()[:200]
+        artist_id = str(album.get("artistId") or "").strip()[:128]
         artwork = str(
             album.get("coverLarge")
             or album.get("coverSmall")
             or album.get("artworkUrl")
             or ""
-        ).strip()
-        rel = str(album.get("releaseDate") or "").strip()
-        tc = int(album.get("trackCount") or 0)
+        ).strip()[:512]
+        rel = str(album.get("releaseDate") or "").strip()[:32]
+        tc = max(0, int(album.get("trackCount") or 0))
         now = int(time.time())
         with self._lock:
             conn = self.connect()
@@ -1053,9 +1304,9 @@ class Database:
                 conn.execute(
                     """
                     INSERT INTO saved_albums (
-                        album_id, title, artist, artist_id, artwork_url, release_date, track_count, saved_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(album_id) DO UPDATE SET
+                        owner_id, album_id, title, artist, artist_id, artwork_url, release_date, track_count, saved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(owner_id, album_id) DO UPDATE SET
                         title = excluded.title,
                         artist = excluded.artist,
                         artist_id = CASE WHEN excluded.artist_id != '' THEN excluded.artist_id ELSE saved_albums.artist_id END,
@@ -1064,31 +1315,37 @@ class Database:
                         track_count = CASE WHEN excluded.track_count > 0 THEN excluded.track_count ELSE saved_albums.track_count END,
                         saved_at = excluded.saved_at
                     """,
-                    (albid, title, artist, artist_id, artwork, rel, tc, now),
+                    (owner, albid, title, artist, artist_id, artwork, rel, tc, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
         return albid
 
-    def unsave_album(self, album_id: str) -> None:
+    def unsave_album(self, album_id: str, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
-                conn.execute("DELETE FROM saved_albums WHERE album_id = ?", (album_id,))
                 conn.execute(
-                    "DELETE FROM pinned_items WHERE item_type = 'album' AND item_id = ?",
-                    (album_id,),
+                    "DELETE FROM saved_albums WHERE owner_id = ? AND album_id = ?",
+                    (owner, album_id),
+                )
+                conn.execute(
+                    "DELETE FROM pinned_items WHERE owner_id = ? AND item_type = 'album' AND item_id = ?",
+                    (owner, album_id),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def get_pins(self) -> List[Dict[str, Any]]:
+    def get_pins(self, owner_id: str = "default") -> List[Dict[str, Any]]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
             rows = conn.execute(
-                "SELECT item_type, item_id, pinned_at FROM pinned_items ORDER BY pinned_at DESC"
+                "SELECT item_type, item_id, pinned_at FROM pinned_items WHERE owner_id = ? ORDER BY pinned_at DESC",
+                (owner,),
             ).fetchall()
             return [
                 {
@@ -1101,30 +1358,32 @@ class Database:
         finally:
             conn.close()
 
-    def pin_item(self, item_type: str, item_id: str) -> None:
+    def pin_item(self, item_type: str, item_id: str, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         now = int(time.time())
         with self._lock:
             conn = self.connect()
             try:
                 conn.execute(
                     """
-                    INSERT INTO pinned_items (item_type, item_id, pinned_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(item_type, item_id) DO UPDATE SET pinned_at = excluded.pinned_at
+                    INSERT INTO pinned_items (owner_id, item_type, item_id, pinned_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(owner_id, item_type, item_id) DO UPDATE SET pinned_at = excluded.pinned_at
                     """,
-                    (item_type, item_id, now),
+                    (owner, item_type, item_id, now),
                 )
                 conn.commit()
             finally:
                 conn.close()
 
-    def unpin_item(self, item_type: str, item_id: str) -> None:
+    def unpin_item(self, item_type: str, item_id: str, owner_id: str = "default") -> None:
+        owner = _norm_owner(owner_id)
         with self._lock:
             conn = self.connect()
             try:
                 conn.execute(
-                    "DELETE FROM pinned_items WHERE item_type = ? AND item_id = ?",
-                    (item_type, item_id),
+                    "DELETE FROM pinned_items WHERE owner_id = ? AND item_type = ? AND item_id = ?",
+                    (owner, item_type, item_id),
                 )
                 conn.commit()
             finally:
@@ -1133,11 +1392,14 @@ class Database:
     # ------------------------------------------------------------------
     # Listening Stats ("Sound Capsule")
     # ------------------------------------------------------------------
-    def get_listening_stats(self) -> Dict[str, Any]:
+    def get_listening_stats(self, owner_id: str = "default") -> Dict[str, Any]:
+        owner = _norm_owner(owner_id)
         conn = self.connect()
         try:
-            liked_ids = self.get_liked_ids(conn)
-            total_plays_row = conn.execute("SELECT COUNT(*) AS cnt FROM play_history").fetchone()
+            liked_ids = self.get_liked_ids(conn, owner_id=owner)
+            total_plays_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM play_history WHERE owner_id = ?", (owner,)
+            ).fetchone()
             total_plays = int(total_plays_row["cnt"]) if total_plays_row else 0
 
             dur_row = conn.execute(
@@ -1145,22 +1407,33 @@ class Database:
                 SELECT COALESCE(SUM(CASE WHEN tc.duration > 0 THEN tc.duration ELSE 180 END), 0) AS secs
                 FROM play_history ph
                 JOIN tracks_cache tc ON tc.id = ph.track_id
-                """
+                WHERE ph.owner_id = ?
+                """,
+                (owner,),
             ).fetchone()
             total_minutes = int(round((int(dur_row["secs"]) if dur_row else 0) / 60.0))
 
             liked_count = len(liked_ids)
-            playlist_count = int(conn.execute("SELECT COUNT(*) AS cnt FROM playlists").fetchone()["cnt"])
+            playlist_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM playlists WHERE owner_id = ?", (owner,)
+                ).fetchone()["cnt"]
+            )
             followed_count = int(
-                conn.execute("SELECT COUNT(*) AS cnt FROM followed_artists").fetchone()["cnt"]
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM followed_artists WHERE owner_id = ?", (owner,)
+                ).fetchone()["cnt"]
             )
             saved_albums_count = int(
-                conn.execute("SELECT COUNT(*) AS cnt FROM saved_albums").fetchone()["cnt"]
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM saved_albums WHERE owner_id = ?", (owner,)
+                ).fetchone()["cnt"]
             )
 
             # Hourly activity & listening streak (UTC calendar days)
             ts_rows = conn.execute(
-                "SELECT played_at FROM play_history ORDER BY played_at DESC LIMIT 2000"
+                "SELECT played_at FROM play_history WHERE owner_id = ? ORDER BY played_at DESC LIMIT 2000",
+                (owner,),
             ).fetchall()
             hourly_counts = [0] * 24
             active_days: Set[int] = set()
@@ -1190,10 +1463,12 @@ class Database:
                 SELECT tc.*, COUNT(ph.id) AS play_count, MAX(ph.played_at) AS last_played
                 FROM play_history ph
                 JOIN tracks_cache tc ON tc.id = ph.track_id
+                WHERE ph.owner_id = ?
                 GROUP BY ph.track_id
                 ORDER BY play_count DESC, last_played DESC
                 LIMIT 10
-                """
+                """,
+                (owner,),
             ).fetchall()
             top_tracks = [
                 {
@@ -1212,11 +1487,12 @@ class Database:
                        COUNT(ph.id) AS play_count
                 FROM play_history ph
                 JOIN tracks_cache tc ON tc.id = ph.track_id
-                WHERE tc.artist != ''
+                WHERE ph.owner_id = ? AND tc.artist != ''
                 GROUP BY tc.artist
                 ORDER BY play_count DESC
                 LIMIT 10
-                """
+                """,
+                (owner,),
             ).fetchall()
             top_artists = [
                 {

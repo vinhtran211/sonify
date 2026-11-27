@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from backend import config, http_client, offline_catalog
+from backend import config, http_client, offline_catalog, security
 from backend.db import Database
 from backend.providers import (
     apple_itunes,
@@ -193,6 +193,28 @@ def parse_byte_range(range_header: Optional[str], total_size: int) -> Tuple[Opti
     return (start, end), True
 
 
+_SAFE_TRACK_RAW_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _validate_stream_track_id(track_id: str) -> Tuple[str, str]:
+    """Validate track_id syntax before cache lookup or upstream provider calls."""
+    tid = (track_id or "").strip()
+    if not tid or ":" not in tid or len(tid) > 128 or ".." in tid:
+        raise StreamUnavailableError("Invalid track identifier.", code="INVALID_TRACK", status=400)
+    prefix, _, raw_id = tid.partition(":")
+    p = prefix.strip().lower()
+    rid = raw_id.strip()
+    if p in ("yt", "au", "js", "mc", "local", "imp"):
+        if not security.validate_provider_id(p, rid):
+            raise StreamUnavailableError("Invalid track identifier.", code="INVALID_TRACK", status=400)
+        return p, rid
+    if p in ("dz", "it"):
+        if not _SAFE_TRACK_RAW_ID_RE.match(rid) or rid.startswith("-"):
+            raise StreamUnavailableError("Invalid track identifier.", code="INVALID_TRACK", status=400)
+        return p, rid
+    raise StreamUnavailableError("Unsupported track provider.", code="INVALID_TRACK", status=400)
+
+
 class StreamService:
     """Resolves ad-free audio streams via cloud-aware waterfall and proxies with HTTP Range support."""
 
@@ -265,15 +287,15 @@ class StreamService:
 
         fetched = None
         try:
-            if prefix == "dz" and raw_id:
+            if prefix == "dz" and security.validate_provider_id("dz", raw_id):
                 fetched = deezer.get_track(raw_id)
-            elif prefix == "it" and raw_id:
+            elif prefix == "it" and security.validate_provider_id("it", raw_id):
                 fetched = apple_itunes.get_track(raw_id)
-            elif prefix == "au" and raw_id:
+            elif prefix == "au" and security.validate_provider_id("au", raw_id):
                 fetched = audius.get_track(raw_id)
-            elif prefix == "js" and raw_id:
+            elif prefix == "js" and security.validate_provider_id("js", raw_id):
                 fetched = jiosaavn.get_song_details(raw_id)
-            elif prefix == "yt" and raw_id:
+            elif prefix == "yt" and security.validate_provider_id("yt", raw_id):
                 fetched = {
                     "id": track_id,
                     "source": "youtube_music",
@@ -283,7 +305,7 @@ class StreamService:
                     "streamUrl": f"/api/stream/{track_id}",
                     "_extra": {"videoId": raw_id},
                 }
-            elif prefix == "mc" and raw_id:
+            elif prefix == "mc" and security.validate_provider_id("mc", raw_id):
                 fetched = {
                     "id": track_id,
                     "source": "monochrome",
@@ -321,6 +343,7 @@ class StreamService:
         exclude_sources: Optional[Iterable[str]] = None,
         quality: str = "auto",
     ) -> ResolvedStream:
+        _validate_stream_track_id(track_id)
         excluded: Set[str] = set(exclude_sources or ())
         qual = (quality or "auto").strip().lower()
         if qual not in ("auto", "lossless", "fast"):
@@ -1486,6 +1509,9 @@ class StreamService:
         handler.send_header("Content-Disposition", f'inline; filename="stream{ext}"')
         handler.send_header("Accept-Ranges", "bytes")
         handler.send_header("Cache-Control", "private, max-age=1800")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("X-Frame-Options", "DENY")
+        handler.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         handler.send_header("X-Stream-Mode", resolved.mode)
         handler.send_header("X-Stream-Source", resolved.source)
         handler.send_header("X-Ad-Free", "true")
@@ -1494,15 +1520,25 @@ class StreamService:
             "X-Stream-Mode, X-Stream-Source, X-Ad-Free, Content-Range, Content-Disposition",
         )
 
-    def _send_stream_unavailable(self, handler: Any, message: str, head_only: bool) -> None:
+    def _send_stream_unavailable(
+        self,
+        handler: Any,
+        message: str,
+        head_only: bool,
+        *,
+        status: int = 502,
+        code: str = "STREAM_UNAVAILABLE",
+    ) -> None:
         body = json.dumps(
-            {"error": {"code": "STREAM_UNAVAILABLE", "message": message}},
+            {"error": {"code": code, "message": message}},
             ensure_ascii=False,
         ).encode("utf-8")
-        handler.send_response(502)
+        handler.send_response(status)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("X-Frame-Options", "DENY")
         handler.send_header("X-Ad-Free", "true")
         handler.end_headers()
         if not head_only:
@@ -1818,7 +1854,9 @@ class StreamService:
         try:
             resolved = self.resolve_stream(track_id)
         except StreamUnavailableError as exc:
-            self._send_stream_unavailable(handler, exc.message, head_only)
+            self._send_stream_unavailable(
+                handler, exc.message, head_only, status=exc.status, code=exc.code
+            )
             return
 
         # Proxy/serve resolved stream; on pre-header failure, exclude failed source and cascade

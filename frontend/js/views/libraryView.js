@@ -10,7 +10,7 @@ import {
 } from '../components/modals.js';
 import { renderPlaylistCoverHtml, renderTrackTable } from '../components/trackList.js';
 import { ICONS } from '../icons.js';
-import { coverUrlFor, escapeHtml, formatTotalDuration } from '../lrc.js';
+import { coverUrlFor, escapeHtml, formatTotalDuration, sanitizeCssColor } from '../lrc.js';
 import {
   downloadPlaylist,
   getAllDownloads,
@@ -325,8 +325,9 @@ export async function renderPlaylistView(container, playlistId, forceReload = fa
 
   const heroEl = container.querySelector('#pl-hero-el');
   if (heroEl) {
-    if (playlist.coverColor) {
-      heroEl.style.background = `linear-gradient(135deg, ${playlist.coverColor}, #181818)`;
+    const safeColor = sanitizeCssColor(playlist.coverColor);
+    if (safeColor) {
+      heroEl.style.background = `linear-gradient(135deg, ${safeColor}, #181818)`;
     } else {
       applyDynamicHeroGradient(heroEl, playlist.name || playlist.id);
     }

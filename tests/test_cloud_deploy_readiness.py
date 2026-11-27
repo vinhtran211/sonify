@@ -200,7 +200,8 @@ class TestCloudServerProcessAndRenderPackaging(unittest.TestCase):
                     try:
                         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as r:
                             hdrs = {k.lower(): v for k, v in r.headers.items()}
-                            self.assertNotIn("x-frame-options", hdrs)
+                            self.assertEqual(hdrs.get("x-frame-options"), "DENY")
+                            self.assertEqual(hdrs.get("x-content-type-options"), "nosniff")
                             self.assertEqual(r.status, 200)
                             health = json.loads(r.read().decode("utf-8"))
                             break
@@ -217,7 +218,8 @@ class TestCloudServerProcessAndRenderPackaging(unittest.TestCase):
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                     hdrs = {k.lower(): v for k, v in r.headers.items()}
                     self.assertEqual(r.status, 200)
-                    self.assertNotIn("x-frame-options", hdrs)
+                    self.assertEqual(hdrs.get("x-frame-options"), "DENY")
+                    self.assertEqual(hdrs.get("x-content-type-options"), "nosniff")
                     self.assertIn(b"Sonify", r.read())
 
                 # Verify fast, clean SIGTERM shutdown (Docker container stop)

@@ -79,13 +79,17 @@ class CatalogService:
             self._genre_cache.clear()
             self._mix_cache.clear()
 
-    def _annotate_sections(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _annotate_sections(
+        self, payload: Dict[str, Any], owner_id: str = "default"
+    ) -> Dict[str, Any]:
         out = dict(payload)
         sections = []
         for sec in payload.get("sections") or []:
             sec_copy = dict(sec)
             if sec.get("type") == "tracks":
-                sec_copy["items"] = self.db.annotate_tracks(sec.get("items") or [])
+                sec_copy["items"] = self.db.annotate_tracks(
+                    sec.get("items") or [], owner_id=owner_id
+                )
             sections.append(sec_copy)
         out["sections"] = sections
         return out
@@ -367,13 +371,15 @@ class CatalogService:
 
         threading.Thread(target=_bg, name="home-swr-refresh", daemon=True).start()
 
-    def get_home(self, region: str = "global", refresh: bool = False) -> Dict[str, Any]:
+    def get_home(
+        self, region: str = "global", refresh: bool = False, owner_id: str = "default"
+    ) -> Dict[str, Any]:
         region_key = "vn" if (region or "").lower() == "vn" else "global"
         now = time.time()
 
         if http_client.is_offline_mode():
             offline_payload = self._build_offline_home(region_key)
-            return self._annotate_sections(offline_payload)
+            return self._annotate_sections(offline_payload, owner_id=owner_id)
 
         if not refresh:
             with self._lock:
@@ -381,18 +387,24 @@ class CatalogService:
             if entry is not None:
                 age = now - entry[0]
                 if age < config.HOME_CACHE_TTL:
-                    return self._annotate_sections(self._project_home_region(entry[1], region_key))
+                    return self._annotate_sections(
+                        self._project_home_region(entry[1], region_key), owner_id=owner_id
+                    )
                 if age < HOME_SWR_TTL:
                     # Stale-while-revalidate: instant response + background refresh
                     self._trigger_background_home_refresh()
-                    return self._annotate_sections(self._project_home_region(entry[1], region_key))
+                    return self._annotate_sections(
+                        self._project_home_region(entry[1], region_key), owner_id=owner_id
+                    )
 
         base_payload = self._fetch_home_base()
         if base_payload is None:
             offline_payload = self._build_offline_home(region_key)
-            return self._annotate_sections(offline_payload)
+            return self._annotate_sections(offline_payload, owner_id=owner_id)
 
-        return self._annotate_sections(self._project_home_region(base_payload, region_key))
+        return self._annotate_sections(
+            self._project_home_region(base_payload, region_key), owner_id=owner_id
+        )
 
     def _dedup_and_rank_tracks(
         self, tracks: List[Dict[str, Any]], query: str, limit: int
@@ -494,7 +506,9 @@ class CatalogService:
         ranked = sorted(dedup.values(), key=lambda x: x[0], reverse=True)
         return [item[1] for item in ranked[:limit]]
 
-    def _search_offline(self, query: str, search_type: str, limit: int) -> Dict[str, Any]:
+    def _search_offline(
+        self, query: str, search_type: str, limit: int, owner_id: str = "default"
+    ) -> Dict[str, Any]:
         q_norm = lrc_parser.normalize_key(query)
         tokens = [tok for tok in q_norm.split() if tok]
 
@@ -512,7 +526,7 @@ class CatalogService:
         offline_tracks = [dict(t) for t in offline_catalog.OFFLINE_TRACKS]
         self.db.upsert_tracks(offline_tracks)
 
-        cached = self.db.search_cached_tracks(query, limit=limit)
+        cached = self.db.search_cached_tracks(query, limit=limit, owner_id=owner_id)
         matched_local = [
             t
             for t in offline_tracks
@@ -543,7 +557,7 @@ class CatalogService:
         elif search_type == "albums":
             tracks, artists = [], []
 
-        annotated = self.db.annotate_tracks(tracks)
+        annotated = self.db.annotate_tracks(tracks, owner_id=owner_id)
         top_result = self._pick_top_result(query, annotated, artists, albums)
         return {
             "query": query,
@@ -573,7 +587,9 @@ class CatalogService:
             return {"kind": "album", "item": albums[0]}
         return None
 
-    def search(self, query: str, search_type: str = "all", limit: int = 20) -> Dict[str, Any]:
+    def search(
+        self, query: str, search_type: str = "all", limit: int = 20, owner_id: str = "default"
+    ) -> Dict[str, Any]:
         q = (query or "").strip()
         stype = (search_type or "all").lower()
         if stype not in ("all", "tracks", "artists", "albums"):
@@ -596,14 +612,18 @@ class CatalogService:
             entry = self._search_cache.get(cache_key)
             if entry and (now - entry[0]) < config.SEARCH_CACHE_TTL:
                 cached_res = dict(entry[1])
-                cached_res["tracks"] = self.db.annotate_tracks(cached_res.get("tracks") or [])
+                cached_res["tracks"] = self.db.annotate_tracks(
+                    cached_res.get("tracks") or [], owner_id=owner_id
+                )
                 if cached_res.get("topResult") and cached_res["topResult"].get("kind") == "track":
-                    top_list = self.db.annotate_tracks([cached_res["topResult"]["item"]])
+                    top_list = self.db.annotate_tracks(
+                        [cached_res["topResult"]["item"]], owner_id=owner_id
+                    )
                     cached_res["topResult"] = {"kind": "track", "item": top_list[0]}
                 return cached_res
 
         if http_client.is_offline_mode():
-            return self._search_offline(q, stype, lim)
+            return self._search_offline(q, stype, lim, owner_id=owner_id)
 
         def _safe(fn, *args, **kwargs):
             try:
@@ -644,7 +664,7 @@ class CatalogService:
         ]
         # If every submitted upstream provider failed (returned None), network is unreachable -> offline fallback
         if not any(res is not None for res in submitted_results):
-            return self._search_offline(q, stype, lim)
+            return self._search_offline(q, stype, lim, owner_id=owner_id)
 
         combined_tracks = (dz_tracks or []) + (it_tracks or []) + (js_tracks or []) + (au_tracks or [])
         # If standard providers found < 3 tracks, also supplement with YTM InnerTube search
@@ -656,7 +676,7 @@ class CatalogService:
         if ranked_tracks:
             self.db.upsert_tracks(ranked_tracks)
 
-        annotated = self.db.annotate_tracks(ranked_tracks)
+        annotated = self.db.annotate_tracks(ranked_tracks, owner_id=owner_id)
         artists_list = artists or []
         albums_list = albums or []
         top_result = self._pick_top_result(q, annotated, artists_list, albums_list)
@@ -675,7 +695,7 @@ class CatalogService:
             self._search_cache[cache_key] = (now, result)
         return result
 
-    def get_artist(self, artist_id: str) -> Optional[Dict[str, Any]]:
+    def get_artist(self, artist_id: str, owner_id: str = "default") -> Optional[Dict[str, Any]]:
         if not artist_id:
             return None
         prefix, _, raw_id = artist_id.partition(":")
@@ -688,7 +708,7 @@ class CatalogService:
             self.db.upsert_tracks(tracks)
             return {
                 "artist": artist,
-                "topTracks": self.db.annotate_tracks(tracks),
+                "topTracks": self.db.annotate_tracks(tracks, owner_id=owner_id),
                 "albums": albums,
             }
 
@@ -707,14 +727,14 @@ class CatalogService:
                         self.db.upsert_tracks(tracks)
                     return {
                         "artist": artist,
-                        "topTracks": self.db.annotate_tracks(tracks),
+                        "topTracks": self.db.annotate_tracks(tracks, owner_id=owner_id),
                         "albums": albums,
                     }
             except Exception:
                 pass
 
         # Fallback to cached tracks for this artist_id
-        cached_tracks = self.db.get_tracks_by_artist_id(artist_id)
+        cached_tracks = self.db.get_tracks_by_artist_id(artist_id, owner_id=owner_id)
         if cached_tracks:
             first = cached_tracks[0]
             return {
@@ -731,7 +751,7 @@ class CatalogService:
             }
         return None
 
-    def get_album(self, album_id: str) -> Optional[Dict[str, Any]]:
+    def get_album(self, album_id: str, owner_id: str = "default") -> Optional[Dict[str, Any]]:
         if not album_id:
             return None
         prefix, _, raw_id = album_id.partition(":")
@@ -744,7 +764,7 @@ class CatalogService:
             self.db.upsert_tracks(tracks)
             return {
                 "album": album,
-                "tracks": self.db.annotate_tracks(tracks),
+                "tracks": self.db.annotate_tracks(tracks, owner_id=owner_id),
             }
 
         if not http_client.is_offline_mode():
@@ -760,12 +780,12 @@ class CatalogService:
                         self.db.upsert_tracks(tracks)
                     return {
                         "album": album,
-                        "tracks": self.db.annotate_tracks(tracks),
+                        "tracks": self.db.annotate_tracks(tracks, owner_id=owner_id),
                     }
             except Exception:
                 pass
 
-        cached_tracks = self.db.get_tracks_by_album_id(album_id)
+        cached_tracks = self.db.get_tracks_by_album_id(album_id, owner_id=owner_id)
         if cached_tracks:
             first = cached_tracks[0]
             return {
@@ -899,7 +919,9 @@ class CatalogService:
                 break
         return out
 
-    def get_genre_hub(self, slug: str, region: str = "global") -> Optional[Dict[str, Any]]:
+    def get_genre_hub(
+        self, slug: str, region: str = "global", owner_id: str = "default"
+    ) -> Optional[Dict[str, Any]]:
         clean_slug = (slug or "").strip().lower()
         meta = self.GENRE_HUBS.get(clean_slug)
         if not meta:
@@ -913,7 +935,9 @@ class CatalogService:
                 cached = self._genre_cache.get(cache_key)
                 if cached and (now - cached[0]) < config.HOME_CACHE_TTL:
                     payload = dict(cached[1])
-                    payload["tracks"] = self.db.annotate_tracks(payload.get("tracks") or [])
+                    payload["tracks"] = self.db.annotate_tracks(
+                        payload.get("tracks") or [], owner_id=owner_id
+                    )
                     return payload
 
         if http_client.is_offline_mode():
@@ -926,7 +950,7 @@ class CatalogService:
                     "color": meta["color"],
                     "description": meta["description"],
                 },
-                "tracks": self.db.annotate_tracks(tracks),
+                "tracks": self.db.annotate_tracks(tracks, owner_id=owner_id),
                 "albums": [dict(a) for a in offline_catalog.OFFLINE_ALBUMS],
                 "artists": [dict(a) for a in offline_catalog.OFFLINE_ARTISTS],
             }
@@ -993,11 +1017,11 @@ class CatalogService:
             self._genre_cache[cache_key] = (now, payload)
 
         out = dict(payload)
-        out["tracks"] = self.db.annotate_tracks(merged_tracks)
+        out["tracks"] = self.db.annotate_tracks(merged_tracks, owner_id=owner_id)
         return out
 
     def get_radio(
-        self, track_id: str = "", artist_id: str = "", limit: int = 25
+        self, track_id: str = "", artist_id: str = "", limit: int = 25, owner_id: str = "default"
     ) -> Dict[str, Any]:
         max_items = max(1, min(int(limit or 25), 40))
         seed_type = "track" if track_id else "artist"
@@ -1108,19 +1132,19 @@ class CatalogService:
             "seedType": seed_type,
             "seedTitle": seed_title or seed_artist or "Sonify Radio",
             "seedArtist": seed_artist,
-            "tracks": self.db.annotate_tracks(final_tracks),
+            "tracks": self.db.annotate_tracks(final_tracks, owner_id=owner_id),
         }
 
-    def get_made_for_you(self, region: str = "global") -> Dict[str, Any]:
+    def get_made_for_you(self, region: str = "global", owner_id: str = "default") -> Dict[str, Any]:
         region_key = "vn" if (region or "").lower() == "vn" else "global"
         now = time.time()
 
-        history_items = self.db.get_history(limit=30)
-        liked_tracks, _ = self.db.get_liked_tracks()
-        followed_artists, _ = self.db.get_followed_artists()
+        history_items = self.db.get_history(limit=30, owner_id=owner_id)
+        liked_tracks, _ = self.db.get_liked_tracks(owner_id=owner_id)
+        followed_artists, _ = self.db.get_followed_artists(owner_id=owner_id)
 
         fingerprint = (
-            f"{region_key}:{len(history_items)}:{len(liked_tracks)}:{len(followed_artists)}:"
+            f"{owner_id}:{region_key}:{len(history_items)}:{len(liked_tracks)}:{len(followed_artists)}:"
             f"{history_items[0]['track']['id'] if history_items else ''}"
         )
 
@@ -1131,11 +1155,13 @@ class CatalogService:
                     mixes_copy = []
                     for m in cached[1].get("mixes") or []:
                         mc = dict(m)
-                        mc["tracks"] = self.db.annotate_tracks(mc.get("tracks") or [])
+                        mc["tracks"] = self.db.annotate_tracks(
+                            mc.get("tracks") or [], owner_id=owner_id
+                        )
                         mixes_copy.append(mc)
                     return {"mixes": mixes_copy}
 
-        home = self.get_home(region_key)
+        home = self.get_home(region_key, owner_id=owner_id)
         home_global: List[Dict[str, Any]] = []
         home_vn: List[Dict[str, Any]] = []
         home_indie: List[Dict[str, Any]] = []
@@ -1263,14 +1289,14 @@ class CatalogService:
         annotated_mixes = []
         for m in mixes:
             mc = dict(m)
-            mc["tracks"] = self.db.annotate_tracks(m["tracks"])
+            mc["tracks"] = self.db.annotate_tracks(m["tracks"], owner_id=owner_id)
             annotated_mixes.append(mc)
         return {"mixes": annotated_mixes}
 
     def get_playlist_recommendations(
-        self, playlist_id: str, limit: int = 10
+        self, playlist_id: str, limit: int = 10, owner_id: str = "default"
     ) -> Optional[Dict[str, Any]]:
-        pl_data = self.db.get_playlist(playlist_id)
+        pl_data = self.db.get_playlist(playlist_id, owner_id=owner_id)
         if not pl_data:
             return None
         max_items = max(1, min(int(limit or 10), 25))
@@ -1291,7 +1317,7 @@ class CatalogService:
                 if len(seen_seed_artists) >= 2:
                     break
         else:
-            home = self.get_home("global")
+            home = self.get_home("global", owner_id=owner_id)
             for sec in home.get("sections") or []:
                 if sec.get("type") == "tracks":
                     candidates.extend(sec.get("items") or [])
@@ -1303,13 +1329,13 @@ class CatalogService:
             self.db.upsert_tracks(recs)
         return {
             "playlistId": playlist_id,
-            "tracks": self.db.annotate_tracks(recs),
+            "tracks": self.db.annotate_tracks(recs, owner_id=owner_id),
         }
 
-    def get_track_detail(self, track_id: str) -> Optional[Dict[str, Any]]:
+    def get_track_detail(self, track_id: str, owner_id: str = "default") -> Optional[Dict[str, Any]]:
         if not track_id:
             return None
-        track = self.db.get_track(track_id)
+        track = self.db.get_track(track_id, owner_id=owner_id)
         if not track:
             prefix, _, raw_id = track_id.partition(":")
             if prefix == "local":
@@ -1328,11 +1354,11 @@ class CatalogService:
                     track = None
             if track:
                 self.db.upsert_track(track)
-                track = self.db.get_track(track_id) or track
+                track = self.db.get_track(track_id, owner_id=owner_id) or track
         if not track:
             return None
 
-        radio = self.get_radio(track_id=track_id, limit=10)
+        radio = self.get_radio(track_id=track_id, limit=10, owner_id=owner_id)
         return {
             "track": track,
             "relatedTracks": radio.get("tracks") or [],

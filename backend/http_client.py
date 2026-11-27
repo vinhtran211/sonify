@@ -13,7 +13,7 @@ import urllib.request
 import zlib
 from typing import Any, Dict, Optional, Tuple
 
-from backend import config
+from backend import config, security
 
 try:
     import certifi  # type: ignore
@@ -60,7 +60,12 @@ class OfflineModeError(OSError):
     """Raised when outbound network requests are disabled via offline mode."""
 
 
+class DisallowedURLError(urllib.error.URLError):
+    """Raised when an outbound URL fails SSRF / scheme / IP safety validation."""
+
+
 _OFFLINE_OVERRIDE: Optional[bool] = None
+_ALLOW_LOOPBACK_FOR_TESTS: bool = False
 
 
 def set_offline_mode(enabled: Optional[bool]) -> None:
@@ -75,6 +80,24 @@ def is_offline_mode() -> bool:
     return config.is_offline_env()
 
 
+def set_allow_loopback_for_tests(enabled: bool) -> None:
+    """Explicitly allow loopback URLs during local mock-CDN unit tests."""
+    global _ALLOW_LOOPBACK_FOR_TESTS
+    _ALLOW_LOOPBACK_FOR_TESTS = bool(enabled)
+
+
+def validate_outbound_url(url: str, *, allow_loopback: Optional[bool] = None) -> Tuple[bool, str]:
+    """Validate outbound URL against SSRF rules (respecting test loopback opt-in)."""
+    allow_lb = _ALLOW_LOOPBACK_FOR_TESTS if allow_loopback is None else bool(allow_loopback)
+    return security.validate_outbound_url(url, allow_loopback=allow_lb)
+
+
+def _assert_safe_outbound_url(url: str) -> None:
+    ok, reason = validate_outbound_url(url)
+    if not ok:
+        raise DisallowedURLError(f"Blocked unsafe outbound URL: {reason}")
+
+
 def _build_ssl_context() -> ssl.SSLContext:
     if certifi is not None:
         try:
@@ -85,6 +108,17 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 
 _SSL_CONTEXT = _build_ssl_context()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=_SSL_CONTEXT),
+    _NoRedirectHandler(),
+)
 
 
 def _default_headers(extra: Optional[Dict[str, str]] = None, accept_encoding: bool = True) -> Dict[str, str]:
@@ -127,6 +161,7 @@ def fetch_bytes(
     data: Optional[bytes] = None,
     json_body: Any = None,
     timeout: float = config.PROVIDER_TIMEOUT,
+    max_redirects: int = 5,
 ) -> Tuple[int, Dict[str, str], bytes]:
     if is_offline_mode():
         raise OfflineModeError("Network access disabled in offline mode")
@@ -137,36 +172,73 @@ def fetch_bytes(
         body = json.dumps(json_body).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
 
+    current_url = url
+    current_method = method
+    current_body = body
+
     sess = _get_pooled_session()
     if sess is not None:
         try:
-            resp = sess.request(
-                method=method,
-                url=url,
-                headers=req_headers,
-                data=body,
-                timeout=timeout,
-                allow_redirects=True,
-            )
-            status = int(resp.status_code)
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-            if status >= 400:
-                raise urllib.error.HTTPError(
-                    url, status, resp.reason or f"HTTP {status}", resp.headers, None
+            for _ in range(max_redirects + 1):
+                _assert_safe_outbound_url(current_url)
+                resp = sess.request(
+                    method=current_method,
+                    url=current_url,
+                    headers=req_headers,
+                    data=current_body,
+                    timeout=timeout,
+                    allow_redirects=False,
                 )
-            return status, resp_headers, resp.content
-        except urllib.error.HTTPError:
+                status = int(resp.status_code)
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                if status in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location")
+                    resp.close()
+                    if not location:
+                        raise urllib.error.HTTPError(
+                            current_url, status, resp.reason or f"HTTP {status}", resp.headers, None
+                        )
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    if status == 303 or (status in (301, 302) and current_method == "POST"):
+                        current_method = "GET"
+                        current_body = None
+                    continue
+                if status >= 400:
+                    raise urllib.error.HTTPError(
+                        current_url, status, resp.reason or f"HTTP {status}", resp.headers, None
+                    )
+                return status, resp_headers, resp.content
+            raise urllib.error.URLError("Too many redirects")
+        except (urllib.error.HTTPError, DisallowedURLError):
             raise
         except Exception as exc:
             raise urllib.error.URLError(str(exc)) from exc
 
-    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-        status = getattr(resp, "status", resp.getcode())
-        resp_headers = {k.lower(): v for k, v in resp.headers.items()}
-        raw = resp.read()
-        decoded = _decode_body(raw, resp_headers.get("content-encoding", ""))
-        return status, resp_headers, decoded
+    for _ in range(max_redirects + 1):
+        _assert_safe_outbound_url(current_url)
+        req = urllib.request.Request(
+            current_url, data=current_body, headers=req_headers, method=current_method
+        )
+        try:
+            with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", resp.getcode())
+                resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                raw = resp.read()
+                decoded = _decode_body(raw, resp_headers.get("content-encoding", ""))
+                return status, resp_headers, decoded
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                location = exc.headers.get("Location")
+                exc.close()
+                if not location:
+                    raise
+                current_url = urllib.parse.urljoin(current_url, location)
+                if exc.code == 303 or (exc.code in (301, 302) and current_method == "POST"):
+                    current_method = "GET"
+                    current_body = None
+                continue
+            raise
+    raise urllib.error.URLError("Too many redirects")
 
 
 def fetch_text(
@@ -267,13 +339,27 @@ def probe_url(
         req_headers["Accept-Encoding"] = "identity"
         if range_val is not None:
             req_headers["Range"] = range_val
-        req = urllib.request.Request(target_url, headers=req_headers, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-            st = getattr(resp, "status", resp.getcode())
-            rh = {k.lower(): v for k, v in resp.headers.items()}
-            f_url = resp.geturl()
-            chunk = resp.read(1024)
-            return st, rh, f_url, chunk
+        current_url = target_url
+        for _ in range(6):
+            _assert_safe_outbound_url(current_url)
+            req = urllib.request.Request(current_url, headers=req_headers, method="GET")
+            try:
+                with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+                    st = getattr(resp, "status", resp.getcode())
+                    rh = {k.lower(): v for k, v in resp.headers.items()}
+                    f_url = resp.geturl()
+                    chunk = resp.read(1024)
+                    return st, rh, f_url, chunk
+            except urllib.error.HTTPError as redir_exc:
+                if redir_exc.code in (301, 302, 303, 307, 308):
+                    location = redir_exc.headers.get("Location")
+                    redir_exc.close()
+                    if not location:
+                        raise
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
+                raise
+        raise urllib.error.URLError("Too many redirects while probing URL")
 
     try:
         status, resp_headers, final_url, sample = _run_probe(url, initial_range)
@@ -333,17 +419,6 @@ def probe_url(
     return True, status, resp_headers, final_url
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(
-    urllib.request.HTTPSHandler(context=_SSL_CONTEXT),
-    _NoRedirectHandler(),
-)
-
-
 def open_stream(
     url: str,
     headers: Optional[Dict[str, str]] = None,
@@ -352,7 +427,7 @@ def open_stream(
     timeout: float = config.STREAM_READ_TIMEOUT,
     max_redirects: int = 6,
 ) -> Tuple[int, Dict[str, str], Any]:
-    """Open an upstream audio stream, following redirects while preserving Range/UA headers."""
+    """Open an upstream audio stream, validating every URL/redirect hop against SSRF."""
     if is_offline_mode():
         raise OfflineModeError("Network access disabled in offline mode")
 
@@ -363,6 +438,7 @@ def open_stream(
         req_headers["Range"] = range_header
 
     for _ in range(max_redirects + 1):
+        _assert_safe_outbound_url(current_url)
         req = urllib.request.Request(current_url, headers=req_headers, method=method)
         try:
             resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)

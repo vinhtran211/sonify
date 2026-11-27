@@ -4,7 +4,7 @@
 
 import { api } from '../api.js';
 import { ICONS } from '../icons.js';
-import { coverUrlFor, escapeHtml, findActiveLineIndex } from '../lrc.js';
+import { coverUrlFor, escapeHtml, findActiveLineIndex, sanitizeSafeUrl } from '../lrc.js';
 import { getAudioElement, seekTo } from '../player.js';
 import { getState, setState } from '../store.js';
 
@@ -248,12 +248,12 @@ export function renderFullStageLyrics(mainContainer) {
   const st = getState();
   const track = st.currentTrack;
   const data = st.lyricsData;
-  const art = track ? coverUrlFor(track, true) : '/api/artwork/sonify';
+  const art = sanitizeSafeUrl(track ? coverUrlFor(track, true) : '/api/artwork/sonify') || '/api/artwork/sonify';
 
   mainContainer.classList.add('no-padding');
   mainContainer.innerHTML = `
     <div class="lyrics-stage">
-      <div class="lyrics-stage-ambient" style="background-image: url('${escapeHtml(art)}');"></div>
+      <div class="lyrics-stage-ambient" data-lyrics-ambient></div>
       <div class="lyrics-stage-inner">
         <div class="lyrics-stage-header">
           <div class="lyrics-track-banner">
@@ -284,6 +284,11 @@ export function renderFullStageLyrics(mainContainer) {
       </div>
     </div>
   `;
+
+  const ambientEl = mainContainer.querySelector('[data-lyrics-ambient]');
+  if (ambientEl && art) {
+    ambientEl.style.backgroundImage = `url("${art}")`;
+  }
 
   mainContainer.querySelector('#btn-refresh-lyrics')?.addEventListener('click', () => {
     loadLyricsForCurrentTrack(null, true);
