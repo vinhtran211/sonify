@@ -354,9 +354,14 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     debug = self._qparam(qs, "debug", "0").strip().lower() in ("1", "true", "yes")
                     quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
                     prewarm = self._qparam(qs, "prewarm", "0").strip().lower() in ("1", "true", "yes")
+                    refresh = self._qparam(qs, "refresh", "0").strip().lower() in ("1", "true", "yes")
                     self._send_json(
                         self.server.stream.get_stream_info(
-                            track_id, debug=debug, quality=quality, prewarm=prewarm
+                            track_id,
+                            debug=debug,
+                            quality=quality,
+                            prewarm=prewarm,
+                            force_refresh=refresh,
                         )
                     )
                     return

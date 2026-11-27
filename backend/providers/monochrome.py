@@ -66,6 +66,30 @@ _MIME_CACHE: Dict[str, str] = {}
 
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE_DOWNLOADS: Dict[str, "ProgressiveCacheEntry"] = {}
+RATE_LIMIT_COOLDOWN_SEC = 4.0
+_RATE_LIMITED_UNTIL: float = 0.0
+
+
+def is_rate_limited() -> bool:
+    """Return True during the brief cooldown immediately following an upstream HTTP 429."""
+    return time.monotonic() < _RATE_LIMITED_UNTIL
+
+
+def _mark_rate_limited(cooldown: float = RATE_LIMIT_COOLDOWN_SEC) -> None:
+    global _RATE_LIMITED_UNTIL
+    _RATE_LIMITED_UNTIL = max(_RATE_LIMITED_UNTIL, time.monotonic() + max(0.0, cooldown))
+
+
+def is_cached_on_disk(raw_id: str) -> bool:
+    """Return True if a completed full-size Monochrome track is already cached on disk."""
+    clean_id = str(raw_id or "").strip()
+    if not clean_id:
+        return False
+    try:
+        p = _safe_cache_path(clean_id)
+        return p.is_file() and p.stat().st_size >= MIN_TRACK_BYTES
+    except OSError:
+        return False
 
 
 @dataclass
@@ -365,10 +389,12 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                     break
                 if status not in (200, 206):
                     if status == 429:
-                        if not is_resume and initial_attempt < len(backoffs):
-                            time.sleep(backoffs[initial_attempt])
+                        if not is_resume and initial_attempt < 1:
+                            time.sleep(0.75)
                             initial_attempt += 1
                             continue
+                        if not is_resume:
+                            _mark_rate_limited()
                         if is_resume and resume_attempt < MAX_RESUME_ATTEMPTS:
                             time.sleep(backoffs[min(resume_attempt, len(backoffs) - 1)])
                             resume_attempt += 1
@@ -449,10 +475,12 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                 leg_error = True
                 if not is_resume:
                     entry.part_path.unlink(missing_ok=True)
-                    if code == 429 and initial_attempt < len(backoffs):
-                        time.sleep(backoffs[initial_attempt])
+                    if code == 429 and initial_attempt < 1:
+                        time.sleep(0.75)
                         initial_attempt += 1
                         continue
+                    if code == 429:
+                        _mark_rate_limited()
                     break
                 if code == 429 and resume_attempt < MAX_RESUME_ATTEMPTS:
                     time.sleep(backoffs[min(resume_attempt, len(backoffs) - 1)])
@@ -463,8 +491,8 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                 leg_error = True
                 if not is_resume and total_written == 0:
                     entry.part_path.unlink(missing_ok=True)
-                    if initial_attempt == 0:
-                        time.sleep(1.0)
+                    if initial_attempt < 1:
+                        time.sleep(0.75)
                         initial_attempt += 1
                         continue
                     break
@@ -679,24 +707,29 @@ def score_candidate(
     cand_isrc = str(cand.get("isrc") or "").strip().upper()
     norm_target_isrc = (target_isrc or "").strip().upper()
 
-    # Universal anti-short-clip floor (>= 60s unless genuine short interlude)
-    if not is_valid_full_duration(cand_dur, target_duration):
+    # Asymmetric duration & short-clip gate (blocks chopped/sped-up edits)
+    if not lrc_parser.is_duration_compatible(
+        cand_dur, target_duration, relaxed=relaxed, mv_capable=False
+    ):
         return -1.0
-    if relaxed and cand_dur > 900:
+
+    target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
+    ver_class = lrc_parser.classify_unwanted_version(f"{cand_title} {cand_artist}", target_context)
+    if ver_class == "hard_reject":
+        return -1.0
+    if not relaxed and ver_class != "ok":
         return -1.0
 
     # 1. Exact ISRC match -> studio master match
     if norm_target_isrc and cand_isrc and cand_isrc == norm_target_isrc:
-        if not relaxed and target_duration > 30 and cand_dur > 0 and abs(cand_dur - target_duration) > 30:
-            return -1.0
         return 1.0
 
-    # 2. Hard Gate 1: Title similarity (>= 0.55 strict, >= 0.52 relaxed)
+    # 2. Hard Gate 1: Title similarity (>= 0.55 strict, >= 0.60 relaxed)
     title_sim = max(
         lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
         lrc_parser.token_similarity(cand_title, clean_title),
     )
-    if title_sim < (0.52 if relaxed else 0.55):
+    if title_sim < (0.60 if relaxed else 0.55):
         return -1.0
 
     # 3. Hard Gate 2: Artist similarity when target artist is known
@@ -712,39 +745,33 @@ def score_candidate(
         norm_ca = lrc_parser.normalize_key(cand_artist)
         norm_ct = lrc_parser.normalize_key(cand_title)
         norm_pa_compact = norm_pa.replace(" ", "")
+        pad_pa = f" {norm_pa} "
         if (
-            norm_pa in norm_ca
-            or norm_pa in norm_ct
+            pad_pa in f" {norm_ca} "
+            or pad_pa in f" {norm_ct} "
+            or (lrc_parser._has_cjk(norm_pa) and (norm_pa in norm_ca or norm_pa in norm_ct))
             or (
-                len(norm_pa_compact) >= 3
+                len(norm_pa_compact) >= 5
                 and (norm_pa_compact in norm_ca.replace(" ", "") or norm_pa_compact in norm_ct.replace(" ", ""))
             )
         ):
             artist_sim = max(artist_sim, 0.55)
 
     if relaxed:
-        if (
-            artist_sim >= 0.25
-            or lrc_parser.has_primary_artist_token(primary_artist, f"{cand_title} {cand_artist}")
-            or (
-                title_sim >= 0.85
-                and (
-                    target_duration <= 30
-                    or (cand_dur > 0 and abs(cand_dur - target_duration) <= 45)
-                )
-            )
+        if lrc_parser.passes_relaxed_artist_gate(
+            artist_sim=artist_sim,
+            primary_artist=primary_artist,
+            haystack=f"{cand_title} {cand_artist}",
+            clean_title=clean_title,
+            title_sim=title_sim,
+            cand_dur=cand_dur,
+            target_duration=target_duration,
         ):
             artist_sim = max(artist_sim, 0.50)
         elif target_has_artist:
             return -1.0
     else:
         if target_has_artist and artist_sim < 0.40:
-            return -1.0
-
-    # 4. Hard Gate 3: Duration within max(20s, 15% of target) in strict mode; [60, 900] in relaxed mode
-    if not relaxed and target_duration > 30 and cand_dur > 0:
-        max_diff = max(20, int(target_duration * 0.15))
-        if abs(cand_dur - target_duration) > max_diff:
             return -1.0
 
     if target_duration > 0 and cand_dur > 0:
@@ -758,11 +785,10 @@ def score_candidate(
     if target_duration > 0 and cand_dur > 0 and abs(cand_dur - target_duration) <= 4:
         score += 0.08
 
-    target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
-    noise_pen = _noise_penalty(f"{cand_title} {cand_artist}", target_context)
-    if relaxed:
-        noise_pen *= 0.25
-    score -= noise_pen
+    if ver_class == "derivative":
+        score -= 0.35
+    elif ver_class == "live_acoustic":
+        score -= 0.12
     return score
 
 
@@ -791,6 +817,8 @@ def find_best_stream(
     happens once via single-flight progressive background cache when playback begins.
     Returns (stream_url, "audio/flac", monochrome_track_id) or None.
     """
+    if not relaxed and is_rate_limited():
+        return None
     clean_title = lrc_parser.clean_track_title(title)
     search_title = _clean_search_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)

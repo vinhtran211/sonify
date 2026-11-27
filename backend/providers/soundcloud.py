@@ -32,8 +32,8 @@ _SEP_SPLIT_RE = re.compile(r"\s*[-–—|/:]\s*")
 
 _UPLOAD_JUNK_RE = re.compile(
     r"(?:\b(?:official\s*(?:music\s*)?(?:video|audio|mv|lyric\s*video|visualizer)|"
-    r"bản\s*chuẩn|ban\s*chuan|full\s*hd|full\s*audio|full\s*track|free\s*download|"
-    r"download|original\s*mix|visualizer|mv|audio|lyrics?)\b)",
+    r"bản\s*chuẩn|ban\s*chuan|full\s*hd|full\s*audio|full\s*track|"
+    r"original\s*mix|visualizer|mv|audio|lyrics?)\b)",
     re.IGNORECASE,
 )
 
@@ -195,7 +195,7 @@ def has_playable_transcoding(item: Dict[str, Any]) -> bool:
 
 
 def is_full_allow_track(item: Dict[str, Any], target_duration: int = 0, relaxed: bool = False) -> bool:
-    """Return True ONLY if the SoundCloud item is a full-length playable track (never a 30s Go+ SNIP or DRM-only)."""
+    """Return True ONLY if the SoundCloud item is a full-length playable track (never SNIP, DRM-only, or chopped/sped-up)."""
     if str(item.get("policy") or "").upper() != "ALLOW":
         return False
     if "media" in item and not has_playable_transcoding(item):
@@ -208,20 +208,12 @@ def is_full_allow_track(item: Dict[str, Any], target_duration: int = 0, relaxed:
         return False
     dur_sec = dur_ms // 1000
     full_sec = full_dur_ms // 1000
-    if not is_valid_full_duration(dur_sec, target_duration) or not is_valid_full_duration(full_sec, target_duration):
+    if not lrc_parser.is_duration_compatible(dur_sec, target_duration, relaxed=relaxed, mv_capable=True):
         return False
-    if relaxed:
-        if dur_sec > 900:
-            return False
-        return True
-    if (target_duration == 0 or target_duration >= 90) and (dur_ms < 90_000 or full_dur_ms < 90_000):
+    if not lrc_parser.is_duration_compatible(full_sec, target_duration, relaxed=relaxed, mv_capable=True):
         return False
-    if dur_sec > 900:
+    if not relaxed and (target_duration == 0 or target_duration >= 90) and (dur_ms < 90_000 or full_dur_ms < 90_000):
         return False
-    if target_duration > 30:
-        max_diff = max(140, int(target_duration * 0.75))
-        if abs(dur_sec - target_duration) > max_diff:
-            return False
     return True
 
 
@@ -313,14 +305,16 @@ def score_candidate(
         lrc_parser.token_similarity(cleaned_raw, clean_title),
         lrc_parser.token_similarity(lrc_parser.clean_track_title(raw_title), clean_title),
     )
-    if title_sim < (0.52 if relaxed else 0.58):
+    if title_sim < (0.60 if relaxed else 0.58):
         return -1.0
 
     dur_sec = int(item.get("duration") or 0) // 1000
     target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
-    noise_pen = _noise_penalty(f"{raw_title} {username}", target_context)
-    if relaxed:
-        noise_pen *= 0.25
+    ver_class = lrc_parser.classify_unwanted_version(f"{raw_title} {username}", target_context)
+    if ver_class == "hard_reject":
+        return -1.0
+    if not relaxed and ver_class != "ok":
+        return -1.0
 
     target_has_artist = bool(
         primary_artist and primary_artist.lower() not in ("unknown artist", "various artists")
@@ -336,36 +330,42 @@ def score_candidate(
     norm_user = lrc_parser.normalize_key(username)
 
     if norm_pa and len(norm_pa) >= 2:
-        if norm_pa in norm_cand_art or norm_pa in norm_raw_title or norm_pa in norm_user:
+        pad_pa = f" {norm_pa} "
+        if (
+            pad_pa in f" {norm_cand_art} "
+            or pad_pa in f" {norm_raw_title} "
+            or pad_pa in f" {norm_user} "
+            or (
+                lrc_parser._has_cjk(norm_pa)
+                and (norm_pa in norm_cand_art or norm_pa in norm_raw_title or norm_pa in norm_user)
+            )
+        ):
             artist_sim = max(artist_sim, 0.88)
-    if len(norm_pa_compact) >= 3:
+    if len(norm_pa_compact) >= 5:
         if (
             norm_pa_compact in norm_raw_title.replace(" ", "")
             or norm_pa_compact in norm_cand_art.replace(" ", "")
             or norm_pa_compact in norm_user.replace(" ", "")
         ):
             artist_sim = max(artist_sim, 0.88)
-    if len(norm_full_compact) >= 4:
+    if len(norm_full_compact) >= 5:
         if (
             norm_full_compact in norm_raw_title.replace(" ", "")
             or norm_full_compact in norm_cand_art.replace(" ", "")
         ):
             artist_sim = max(artist_sim, 0.88)
 
-    # Studio master / reupload match when uploader username is a label/fan channel but title & duration match closely
-    if (
-        artist_sim < 0.40
-        and title_sim >= (0.85 if relaxed else 0.88)
-        and (
-            target_duration <= 30
-            or (dur_sec > 0 and abs(dur_sec - target_duration) <= 45)
-        )
-    ):
-        artist_sim = 0.55
-
     if relaxed:
         haystack = f"{raw_title} {cand_artist} {username} {description[:300]}"
-        if artist_sim >= 0.25 or lrc_parser.has_primary_artist_token(primary_artist, haystack):
+        if lrc_parser.passes_relaxed_artist_gate(
+            artist_sim=artist_sim,
+            primary_artist=primary_artist,
+            haystack=haystack,
+            clean_title=clean_title,
+            title_sim=title_sim,
+            cand_dur=dur_sec,
+            target_duration=target_duration,
+        ):
             artist_sim = max(artist_sim, 0.50)
         elif target_has_artist:
             return -1.0
@@ -380,6 +380,7 @@ def score_candidate(
     else:
         dur_prox = 0.65
 
+    noise_pen = 0.35 if ver_class == "derivative" else (0.12 if ver_class == "live_acoustic" else 0.0)
     score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox - noise_pen
     return score
 

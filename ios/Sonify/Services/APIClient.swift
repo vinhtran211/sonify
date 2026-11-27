@@ -235,7 +235,8 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         trackId: String,
         debug: Bool = false,
         quality: String? = nil,
-        prewarm: Bool = false
+        prewarm: Bool = false,
+        refresh: Bool = false
     ) async throws -> StreamInfoResponse {
         let encoded = Self.encodePathSegment(trackId)
         var items: [URLQueryItem] = []
@@ -247,6 +248,9 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         }
         if prewarm {
             items.append(URLQueryItem(name: "prewarm", value: "1"))
+        }
+        if refresh {
+            items.append(URLQueryItem(name: "refresh", value: "1"))
         }
         return try await send(path: "/api/stream/\(encoded)/info", queryItems: items, timeout: 30)
     }

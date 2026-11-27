@@ -169,6 +169,7 @@ final class AudioPlayerService: ObservableObject {
     private var currentRoute: PlaybackRoute?
     private var didFallbackToProxy: Bool = false
     private var didAttemptYouTubeRescue: Bool = false
+    private var didRetryFreshProxy: Bool = false
     private var timeObserverToken: Any?
     private var itemStatusObserver: NSKeyValueObservation?
     private var timeControlObserver: NSKeyValueObservation?
@@ -266,6 +267,7 @@ final class AudioPlayerService: ObservableObject {
     func setPlaybackRate(_ rate: Float) {
         let clamped = max(0.5, min(2.0, rate))
         playbackRate = clamped
+        player.defaultRate = clamped
         if isPlaying {
             player.rate = clamped
         }
@@ -342,6 +344,7 @@ final class AudioPlayerService: ObservableObject {
     func resume() {
         guard currentTrack != nil else { return }
         activateAudioSession()
+        player.defaultRate = playbackRate
         player.play()
         if abs(playbackRate - 1.0) > 0.01 {
             player.rate = playbackRate
@@ -479,7 +482,7 @@ final class AudioPlayerService: ObservableObject {
         if !headers.isEmpty && !route.isLocal {
             assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
         }
-        if !route.isHLS && !route.isLocal {
+        if !route.isHLS && !route.isLocal && !route.isProxy {
             if #available(iOS 17.0, *) {
                 assetOptions[AVURLAssetOverrideMIMETypeKey] = StreamInfoResponse.normalizedMIME(contentType)
             }
@@ -510,6 +513,7 @@ final class AudioPlayerService: ObservableObject {
         currentRoute = nil
         didFallbackToProxy = false
         didAttemptYouTubeRescue = false
+        didRetryFreshProxy = false
         currentTime = 0
         duration = Double(max(track.duration, 0))
         isPlaying = false
@@ -541,6 +545,7 @@ final class AudioPlayerService: ObservableObject {
             let item = self.makePlayerItem(for: localRoute, contentType: offlineInfo.contentType)
             self.observePlayerItem(item, seq: seq)
             self.player.replaceCurrentItem(with: item)
+            self.player.defaultRate = self.playbackRate
             self.player.play()
             if abs(self.playbackRate - 1.0) > 0.01 {
                 self.player.rate = self.playbackRate
@@ -638,6 +643,7 @@ final class AudioPlayerService: ObservableObject {
                 let item = self.makePlayerItem(for: route, contentType: info.contentType, headers: customHeaders)
                 self.observePlayerItem(item, seq: seq)
                 self.player.replaceCurrentItem(with: item)
+                self.player.defaultRate = self.playbackRate
                 self.player.play()
                 if abs(self.playbackRate - 1.0) > 0.01 {
                     self.player.rate = self.playbackRate
@@ -688,22 +694,25 @@ final class AudioPlayerService: ObservableObject {
                         let fallbackItem = self.makePlayerItem(for: proxyRoute, contentType: info.contentType)
                         self.observePlayerItem(fallbackItem, seq: seq)
                         self.player.replaceCurrentItem(with: fallbackItem)
+                        self.player.defaultRate = self.playbackRate
                         self.player.play()
                         if abs(self.playbackRate - 1.0) > 0.01 {
                             self.player.rate = self.playbackRate
                         }
                         return
                     }
-                    if !self.didAttemptYouTubeRescue,
+                    if (!self.didAttemptYouTubeRescue || !self.didRetryFreshProxy),
                        let track = self.currentTrack,
                        self.offlineDownloads?.offlineModeEnabled != true {
+                        let tryYT = !self.didAttemptYouTubeRescue
                         self.didAttemptYouTubeRescue = true
                         self.itemStatusObserver?.invalidate()
                         self.itemStatusObserver = nil
                         self.isLoading = true
+                        let qual = self.libraryStore?.settings.audioQuality ?? "auto"
                         Task { @MainActor [weak self] in
                             guard let self, seq == self.playbackSeq else { return }
-                            if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                            if tryYT, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
                                 guard seq == self.playbackSeq else { return }
                                 let ytInfo = StreamInfoResponse(
                                     trackId: track.id,
@@ -724,12 +733,44 @@ final class AudioPlayerService: ObservableObject {
                                 )
                                 self.observePlayerItem(rescuedItem, seq: seq)
                                 self.player.replaceCurrentItem(with: rescuedItem)
+                                self.player.defaultRate = self.playbackRate
                                 self.player.play()
                                 if abs(self.playbackRate - 1.0) > 0.01 {
                                     self.player.rate = self.playbackRate
                                 }
                                 self.updateNowPlayingInfo()
                                 return
+                            }
+                            if !self.didRetryFreshProxy {
+                                self.didRetryFreshProxy = true
+                                let cacheKey = self.prefetchCacheKey(trackId: track.id)
+                                self.prefetchedInfo.removeValue(forKey: cacheKey)
+                                if let fresh = try? await self.api.getStreamInfo(
+                                    trackId: track.id,
+                                    quality: qual,
+                                    refresh: true
+                                ) {
+                                    guard seq == self.playbackSeq else { return }
+                                    self.storePrefetchInfo(fresh, for: track.id)
+                                    let pURL = self.api.streamURL(for: fresh)
+                                    if let freshRoute = fresh.preferredPlaybackRoute(proxyURL: pURL) {
+                                        self.streamInfo = fresh
+                                        self.currentRoute = freshRoute
+                                        let retryItem = self.makePlayerItem(
+                                            for: freshRoute,
+                                            contentType: fresh.contentType
+                                        )
+                                        self.observePlayerItem(retryItem, seq: seq)
+                                        self.player.replaceCurrentItem(with: retryItem)
+                                        self.player.defaultRate = self.playbackRate
+                                        self.player.play()
+                                        if abs(self.playbackRate - 1.0) > 0.01 {
+                                            self.player.rate = self.playbackRate
+                                        }
+                                        self.updateNowPlayingInfo()
+                                        return
+                                    }
+                                }
                             }
                             guard seq == self.playbackSeq else { return }
                             self.isLoading = false

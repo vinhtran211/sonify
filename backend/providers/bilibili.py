@@ -215,28 +215,27 @@ def score_candidate(
     author = str(item.get("author") or "").strip()
     cand_dur = int(item.get("duration") or 0)
 
-    # Hard Gate 1: Full-track duration + universal anti-short-clip floor
-    if cand_dur <= 0 or not is_valid_full_duration(cand_dur, target_duration):
+    # Hard Gate 1: Asymmetric duration + universal anti-short-clip floor
+    if cand_dur <= 0 or not lrc_parser.is_duration_compatible(
+        cand_dur, target_duration, relaxed=relaxed, mv_capable=True
+    ):
         return -1.0
-    if relaxed:
-        if cand_dur > 900:
-            return -1.0
-    else:
-        if (target_duration == 0 or target_duration >= 90) and cand_dur < 90:
-            return -1.0
-        if cand_dur > 720:
-            return -1.0
-        if target_duration > 30:
-            max_diff = max(35, int(target_duration * 0.25))
-            if abs(cand_dur - target_duration) > max_diff:
-                return -1.0
+    if not relaxed and (target_duration == 0 or target_duration >= 90) and cand_dur < 90:
+        return -1.0
+
+    target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
+    ver_class = lrc_parser.classify_unwanted_version(f"{raw_title} {author}", target_context)
+    if ver_class == "hard_reject":
+        return -1.0
+    if not relaxed and ver_class != "ok":
+        return -1.0
 
     # Clean decorative brackets for title comparison while preserving raw title for artist & noise gates
     stripped_brackets = _DECORATIVE_BRACKETS_RE.sub(" ", raw_title)
     stripped_brackets = re.sub(r"\s+", " ", stripped_brackets).strip(" -–—|/:：")
     cleaned_cand = lrc_parser.clean_track_title(stripped_brackets or raw_title)
 
-    # Hard Gate 2: Title similarity (>= 0.58 strict, >= 0.52 relaxed)
+    # Hard Gate 2: Title similarity (>= 0.58 strict, >= 0.60 relaxed)
     title_sim = max(
         lrc_parser.token_similarity(cleaned_cand, clean_title),
         lrc_parser.token_similarity(stripped_brackets, clean_title),
@@ -248,7 +247,7 @@ def score_candidate(
             title_sim,
             lrc_parser.token_similarity(lrc_parser.clean_track_title(part), clean_title),
         )
-    if title_sim < (0.52 if relaxed else 0.58):
+    if title_sim < (0.60 if relaxed else 0.58):
         return -1.0
 
     # Hard Gate 3: Artist similarity when target artist is known
@@ -275,20 +274,26 @@ def score_candidate(
     norm_author_compact = norm_author.replace(" ", "")
 
     if norm_pa and len(norm_pa) >= 2:
-        if norm_pa in norm_raw or norm_pa in norm_author:
+        pad_pa = f" {norm_pa} "
+        if (
+            pad_pa in f" {norm_raw} "
+            or pad_pa in f" {norm_author} "
+            or (lrc_parser._has_cjk(norm_pa) and (norm_pa in norm_raw or norm_pa in norm_author))
+        ):
             artist_sim = max(artist_sim, 0.85)
-    if len(norm_pa_compact) >= 3:
+    if len(norm_pa_compact) >= 5:
         if norm_pa_compact in norm_raw_compact or norm_pa_compact in norm_author_compact:
             artist_sim = max(artist_sim, 0.85)
 
     if relaxed:
-        if (
-            artist_sim >= 0.25
-            or lrc_parser.has_primary_artist_token(primary_artist, f"{raw_title} {author}")
-            or (
-                title_sim >= 0.85
-                and (target_duration <= 30 or abs(cand_dur - target_duration) <= 45)
-            )
+        if lrc_parser.passes_relaxed_artist_gate(
+            artist_sim=artist_sim,
+            primary_artist=primary_artist,
+            haystack=f"{raw_title} {author}",
+            clean_title=clean_title,
+            title_sim=title_sim,
+            cand_dur=cand_dur,
+            target_duration=target_duration,
         ):
             artist_sim = max(artist_sim, 0.50)
         elif target_has_artist:
@@ -305,11 +310,7 @@ def score_candidate(
     else:
         dur_prox = 0.65
 
-    target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
-    noise_pen = _noise_penalty(f"{raw_title} {author}", target_context)
-    if relaxed:
-        noise_pen *= 0.25
-
+    noise_pen = 0.35 if ver_class == "derivative" else (0.12 if ver_class == "live_acoustic" else 0.0)
     score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox - noise_pen
     return score
 

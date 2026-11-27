@@ -214,7 +214,8 @@ class TestSoundCloudDRMMonochromeCapAndShortClipFloors(unittest.TestCase):
                     self.assertFalse(h3.cancel_event.is_set())
                     self.assertLessEqual(len(monochrome._ACTIVE_DOWNLOADS), monochrome.MAX_CONCURRENT_PRODUCERS)
 
-                    # Bare get_stream_info(prewarm=False) must NOT start extra downloads while active > 0
+                    # Speculative ?prewarm=1 must NOT preempt active downloads; active playback (prewarm=False)
+                    # verifies Monochrome readiness so /info and /stream never disagree on codec!
                     db = Database(os.path.join(tmp, "prewarm.db"))
                     svc = StreamService(db)
                     db.upsert_track(
@@ -229,10 +230,10 @@ class TestSoundCloudDRMMonochromeCapAndShortClipFloors(unittest.TestCase):
                     )
                     with mock.patch.dict(os.environ, {"RENDER": "true"}, clear=True), \
                          mock.patch("backend.providers.monochrome.start_background_cache") as m_bg:
-                        svc.get_stream_info("dz:prewarm_test", prewarm=False)
+                        svc.get_stream_info("dz:prewarm_test", prewarm=True)
                         m_bg.assert_not_called()
 
-                        svc.get_stream_info("dz:prewarm_test", prewarm=True)
+                        svc.get_stream_info("dz:prewarm_test", prewarm=False)
                         m_bg.assert_called_once_with("cap_999")
                 finally:
                     block_event.set()

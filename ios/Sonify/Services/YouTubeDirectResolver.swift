@@ -25,9 +25,18 @@ final class YouTubeDirectResolver: @unchecked Sendable {
     private static let cacheTTL: TimeInterval = 20 * 60
     private static let minProbeBytes: Int64 = 350_000
 
-    private static let noiseKeywords: [String] = [
-        "cover", "karaoke", "remix", "slowed", "sped up", "speed up",
-        "nightcore", "8d", "live", "reaction", "1 hour", "instrumental", "piano",
+    private static let hardRejectKeywords: [String] = [
+        "sped up", "speed up", "slowed", "slower", "nightcore", "8d",
+        "karaoke", "instrumental", "mashup", "reaction", "1 hour",
+        "ringtone", "snippet", "teaser", "demo", "parody",
+    ]
+
+    private static let derivativeKeywords: [String] = [
+        "remix", "cover", "piano", "lofi", "lo fi", "edit",
+    ]
+
+    private static let liveAcousticKeywords: [String] = [
+        "live", "acoustic", "unplugged",
     ]
 
     private struct CacheEntry {
@@ -466,24 +475,65 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         rawTargetTitle: String,
         relaxed: Bool = false
     ) -> Double {
-        // Duration gate (universal >= 60s full-track floor unless genuine short interlude)
+        // Asymmetric duration gate (blocks chopped/sped-up edits while allowing MV intros/outros)
         if cand.duration > 0 {
-            let minDur: Int
-            if targetDuration >= 30 && targetDuration < 60 {
-                minDur = max(30, targetDuration - 10)
-            } else {
-                minDur = relaxed ? 60 : 75
+            if cand.duration > 720 {
+                return -1.0
             }
-            let maxDur = relaxed ? 900 : 720
-            if cand.duration < minDur || cand.duration > maxDur {
+            if targetDuration >= 60 {
+                let maxShorter = relaxed
+                    ? max(12, Int(Double(targetDuration) * 0.06))
+                    : max(10, Int(Double(targetDuration) * 0.05))
+                let maxLonger = relaxed
+                    ? max(65, Int(Double(targetDuration) * 0.40))
+                    : max(35, Int(Double(targetDuration) * 0.20))
+                if cand.duration < max(60, targetDuration - maxShorter)
+                    || cand.duration > min(720, targetDuration + maxLonger) {
+                    return -1.0
+                }
+            } else if targetDuration >= 30 {
+                let minDur = max(30, targetDuration - 10)
+                let maxDiff = relaxed ? 20 : 12
+                if cand.duration < minDur || abs(cand.duration - targetDuration) > maxDiff {
+                    return -1.0
+                }
+            } else {
+                let minDur = relaxed ? 60 : 75
+                if cand.duration < minDur {
+                    return -1.0
+                }
+            }
+        }
+
+        // Unwanted version classification (hard-reject in both passes; derivatives rejected in Pass 1 / -0.35 in Pass 2)
+        let paddedCandAll = " \(normalizeKey("\(cand.title) \(cand.artist)")) "
+        let paddedTargetAll = " \(normalizeKey("\(rawTargetTitle.isEmpty ? cleanTitle : rawTargetTitle) \(fullArtist)")) "
+        for kw in hardRejectKeywords {
+            let nkw = normalizeKey(kw)
+            if !nkw.isEmpty && paddedCandAll.contains(" \(nkw) ") && !paddedTargetAll.contains(" \(nkw) ") {
                 return -1.0
             }
         }
-        if !relaxed && targetDuration > 30 && cand.duration > 0 {
-            let maxDiff = max(25, Int(Double(targetDuration) * 0.25))
-            if abs(cand.duration - targetDuration) > maxDiff {
-                return -1.0
+        let maskedCandDeriv = paddedCandAll.replacingOccurrences(of: " radio edit ", with: " ")
+        let maskedTargetDeriv = paddedTargetAll.replacingOccurrences(of: " radio edit ", with: " ")
+        var isDerivative = false
+        for kw in derivativeKeywords {
+            let nkw = normalizeKey(kw)
+            if !nkw.isEmpty && maskedCandDeriv.contains(" \(nkw) ") && !maskedTargetDeriv.contains(" \(nkw) ") {
+                isDerivative = true
+                break
             }
+        }
+        var isLiveAcoustic = false
+        for kw in liveAcousticKeywords {
+            let nkw = normalizeKey(kw)
+            if !nkw.isEmpty && paddedCandAll.contains(" \(nkw) ") && !paddedTargetAll.contains(" \(nkw) ") {
+                isLiveAcoustic = true
+                break
+            }
+        }
+        if !relaxed && (isDerivative || isLiveAcoustic) {
+            return -1.0
         }
 
         let candClean = Self.cleanTitle(cand.title)
@@ -491,7 +541,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             tokenSimilarity(candClean, cleanTitle),
             tokenSimilarity(cand.title, cleanTitle)
         )
-        if titleSim < (relaxed ? 0.48 : 0.50) {
+        if titleSim < (relaxed ? 0.60 : 0.50) {
             return -1.0
         }
 
@@ -507,9 +557,9 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         let normPACompact = normPA.replacingOccurrences(of: " ", with: "")
         let normCandArt = normalizeKey(cand.artist)
         let normCandTitle = normalizeKey(cand.title)
-        if normPA.count >= 2 && (normCandArt.contains(normPA) || normCandTitle.contains(normPA)) {
+        if normPA.count >= 2 && (" \(normCandArt) ".contains(" \(normPA) ") || " \(normCandTitle) ".contains(" \(normPA) ")) {
             artistSim = max(artistSim, 0.85)
-        } else if normPACompact.count >= 3 && (
+        } else if normPACompact.count >= 5 && (
             normCandArt.replacingOccurrences(of: " ", with: "").contains(normPACompact)
             || normCandTitle.replacingOccurrences(of: " ", with: "").contains(normPACompact)
         ) {
@@ -521,10 +571,14 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             let hasArtistToken = normPA.split(separator: " ").map(String.init).contains { tok in
                 tok.count >= 3 && hayWords.contains(tok)
             }
-            let closeTitleAndDur = titleSim >= 0.85 && (
-                targetDuration <= 30 || cand.duration == 0 || abs(cand.duration - targetDuration) <= 45
-            )
-            if artistSim >= 0.25 || hasArtistToken || closeTitleAndDur {
+            let normCleanTitle = normalizeKey(cleanTitle)
+            let multiWordExactMatch = normCleanTitle.count >= 12
+                && normCleanTitle.split(separator: " ").count >= 3
+                && titleSim >= 0.95
+                && targetDuration > 60
+                && cand.duration > 0
+                && abs(cand.duration - targetDuration) <= 5
+            if artistSim >= 0.30 || hasArtistToken || multiWordExactMatch {
                 artistSim = max(artistSim, 0.50)
             } else if targetHasArtist {
                 return -1.0
@@ -542,19 +596,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             durProx = 0.65
         }
 
-        let paddedCandAll = " \(normalizeKey("\(cand.title) \(cand.artist)")) "
-        let paddedTargetAll = " \(normalizeKey("\(rawTargetTitle.isEmpty ? cleanTitle : rawTargetTitle) \(fullArtist)")) "
-        var noisePen = 0.0
-        for kw in noiseKeywords {
-            let nkw = normalizeKey(kw)
-            if !nkw.isEmpty && paddedCandAll.contains(" \(nkw) ") && !paddedTargetAll.contains(" \(nkw) ") {
-                noisePen += 0.25
-            }
-        }
-        if relaxed {
-            noisePen *= 0.25
-        }
-
+        let noisePen = isDerivative ? 0.35 : (isLiveAcoustic ? 0.12 : 0.0)
         return 0.55 * titleSim + 0.30 * artistSim + 0.15 * durProx - noisePen
     }
 

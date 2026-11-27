@@ -287,6 +287,17 @@ def find_best_video_id(title: str, artist: str, duration: int = 0) -> Optional[s
         cand_artist_clean = _clean_candidate_artist(cand_artist_raw)
         cand_dur = int(cand.get("duration") or 0)
 
+        # Asymmetric duration & anti-unwanted-version gates
+        if not lrc_parser.is_duration_compatible(
+            cand_dur, duration, relaxed=False, mv_capable=True
+        ):
+            continue
+        ver_class = lrc_parser.classify_unwanted_version(
+            f"{cand_title} {cand_artist_clean}", target_context
+        )
+        if ver_class != "ok":
+            continue
+
         # Hard Gate 1: Title similarity >= 0.55
         title_sim = max(
             lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
@@ -303,16 +314,14 @@ def find_best_video_id(title: str, artist: str, duration: int = 0) -> Optional[s
         if norm_pa and len(norm_pa) >= 2:
             norm_ca = lrc_parser.normalize_key(cand_artist_clean)
             norm_ct = lrc_parser.normalize_key(cand_title)
-            if norm_pa in norm_ca or norm_pa in norm_ct:
+            if (
+                f" {norm_pa} " in f" {norm_ca} "
+                or f" {norm_pa} " in f" {norm_ct} "
+                or (lrc_parser._has_cjk(norm_pa) and (norm_pa in norm_ca or norm_pa in norm_ct))
+            ):
                 artist_sim = max(artist_sim, 0.55)
         if target_has_artist and artist_sim < 0.40:
             continue
-
-        # Hard Gate 3: Duration tolerance when both durations are known
-        if duration > 30 and cand_dur > 0:
-            max_diff = max(35, int(duration * 0.25))
-            if abs(cand_dur - duration) > max_diff:
-                continue
 
         if duration > 0 and cand_dur > 0:
             dur_prox = max(0.0, 1.0 - abs(cand_dur - duration) / 30.0)

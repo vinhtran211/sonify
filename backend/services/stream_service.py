@@ -1378,24 +1378,72 @@ class StreamService:
         debug: bool = False,
         quality: str = "auto",
         prewarm: bool = False,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        resolved = self.resolve_stream(track_id, quality=quality)
-        norm_mime = normalize_stream_mime(resolved.content_type)
-        ext = mime_to_extension(norm_mime)
+        resolved = self.resolve_stream(track_id, force_refresh=force_refresh, quality=quality)
 
-        # Avoid spawning 30-80 MB zombie background downloads on rapid bare /info clicks:
-        # only pre-warm when explicitly requested (?prewarm=1 from 2s-delayed next-track prefetch)
-        # OR when 0 Monochrome downloads are currently active (instant cold-start warmup!).
+        # Active playback (/info, prewarm=False) ALWAYS starts & verifies Monochrome first-chunk
+        # readiness (MAX_CONCURRENT_PRODUCERS=2 preempts stale producers) so /info and /stream NEVER disagree.
+        # Speculative next-track prefetch (?prewarm=1) only pre-warms when idle (0 active downloads)
+        # so background prefetch NEVER preempts the currently playing song's FLAC download.
         with monochrome._ACTIVE_LOCK:
             has_active_mc = len(monochrome._ACTIVE_DOWNLOADS) > 0
-        should_prewarm = prewarm or not has_active_mc
+        should_prewarm = (not prewarm) or (not has_active_mc)
 
         mc_id = _extract_monochrome_id(resolved)
+        if mc_id and not prewarm and monochrome.is_rate_limited() and not monochrome.is_cached_on_disk(mc_id):
+            # Cached Monochrome entry during an active 429 cooldown -> cascade cleanly inside /info
+            self.invalidate(track_id)
+            resolved = self.resolve_stream(
+                track_id,
+                force_refresh=True,
+                exclude_sources={"monochrome"},
+                quality=quality,
+            )
+            mc_id = _extract_monochrome_id(resolved)
+
         if mc_id and should_prewarm:
+            handle = None
             try:
-                monochrome.start_background_cache(mc_id)
+                handle = monochrome.start_background_cache(mc_id)
             except Exception:
-                pass
+                handle = None
+
+            # For active playback /info requests (not background ?prewarm=1 prefetch),
+            # verify first-chunk 200/206 readiness up to 3.8s so /info and /stream NEVER disagree!
+            if not prewarm and isinstance(handle, monochrome.ProgressiveCacheEntry):
+                is_ready = handle.wait_until_ready(timeout=3.8)
+                if is_ready and handle.content_type:
+                    resolved.content_type = handle.content_type
+                elif (
+                    handle.failed
+                    or (handle.done and handle.bytes_written < monochrome.MIN_TRACK_BYTES)
+                    or handle.bytes_written == 0
+                ):
+                    try:
+                        alt_resolved = self.resolve_stream(
+                            track_id,
+                            force_refresh=True,
+                            exclude_sources={"monochrome"},
+                            quality=quality,
+                        )
+                    except StreamUnavailableError:
+                        # If Monochrome did not fail (just slow cold-cache) and no other provider has the track,
+                        # give Monochrome 3.0s more to deliver its first 64 KiB before giving up!
+                        if not handle.failed and handle.wait_until_ready(timeout=3.0):
+                            if handle.content_type:
+                                resolved.content_type = handle.content_type
+                        else:
+                            handle.cancel_event.set()
+                            self.invalidate(track_id)
+                            raise
+                    else:
+                        handle.cancel_event.set()
+                        resolved = alt_resolved
+                        mc_id = _extract_monochrome_id(resolved)
+
+        norm_mime = normalize_stream_mime(resolved.content_type)
+        ext = mime_to_extension(norm_mime)
 
         sc_m3u8 = resolved.headers.get("X-SC-M3U8") if resolved.source == "soundcloud" else None
         if sc_m3u8 and should_prewarm:
@@ -1565,12 +1613,15 @@ class StreamService:
         if not handle:
             return False
 
-        handle.wait_until_ready(timeout=20.0)
+        ready_timeout = 4.5 if handle.bytes_written == 0 else 12.0
+        handle.wait_until_ready(timeout=ready_timeout)
         if (
             handle.failed
             or (handle.done and handle.bytes_written < monochrome.MIN_TRACK_BYTES)
             or not (handle.ready or handle.done)
         ):
+            if not (handle.ready or handle.done) and handle.bytes_written == 0:
+                handle.cancel_event.set()
             return False
 
         if handle.content_type:
@@ -1851,7 +1902,9 @@ class StreamService:
 
                 ctype = up_headers.get("content-type", resolved.content_type).split(";")[0].strip().lower()
                 if ctype.startswith(_VALID_STREAM_MIME_PREFIXES):
-                    resolved.content_type = ctype
+                    # Preserve audio/mp4 for audio-only DASH streams (e.g. Bilibili .m4s CDN sends generic video/mp4)
+                    if not (ctype == "video/mp4" and normalize_stream_mime(resolved.content_type) == "audio/mp4"):
+                        resolved.content_type = ctype
 
                 has_content_length = "content-length" in up_headers
                 handler.send_response(status)

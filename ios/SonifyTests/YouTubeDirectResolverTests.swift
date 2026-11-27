@@ -105,13 +105,13 @@ final class YouTubeDirectResolverTests: XCTestCase {
         )
         XCTAssertGreaterThanOrEqual(aliveScore, 0.95)
 
-        // Pass-2 relaxed rescue: label uploader (HYBE LABELS) + Official MV (+25s) rescued in relaxed=true,
-        // while < 60s short clips remain strictly rejected!
+        // Pass-2 relaxed rescue: label uploader (HYBE LABELS) + Official MV (+44s) rescued in relaxed=true,
+        // while < 60s short clips, chopped edits (119s for 177s), and generic-title wrong artists remain rejected!
         let labelMV = YouTubeSearchCandidate(
             videoId: "hybeMV123",
-            title: "Magnetic (Official MV)",
+            title: "ILLIT (아일릿) 'Magnetic' Official MV",
             artist: "HYBE LABELS",
-            duration: 186
+            duration: 205
         )
         let strictMV = YouTubeDirectResolver.scoreCandidate(
             labelMV,
@@ -133,6 +133,56 @@ final class YouTubeDirectResolverTests: XCTestCase {
             relaxed: true
         )
         XCTAssertGreaterThanOrEqual(relaxedMV, 0.45)
+
+        let choppedEdit = YouTubeSearchCandidate(
+            videoId: "chop119",
+            title: "Như Một Người Rưng",
+            artist: "OSAD",
+            duration: 119
+        )
+        XCTAssertLessThan(
+            YouTubeDirectResolver.scoreCandidate(
+                choppedEdit,
+                cleanTitle: "Như Một Người Rưng",
+                primaryArtist: "OSAD",
+                fullArtist: "OSAD, Hà An Huy",
+                targetDuration: 177,
+                rawTargetTitle: "Như Một Người Rưng",
+                relaxed: false
+            ),
+            0.0
+        )
+        XCTAssertLessThan(
+            YouTubeDirectResolver.scoreCandidate(
+                choppedEdit,
+                cleanTitle: "Như Một Người Rưng",
+                primaryArtist: "OSAD",
+                fullArtist: "OSAD, Hà An Huy",
+                targetDuration: 177,
+                rawTargetTitle: "Như Một Người Rưng",
+                relaxed: true
+            ),
+            0.0
+        )
+
+        let genericWrongArtist = YouTubeSearchCandidate(
+            videoId: "stayWrong",
+            title: "Stay",
+            artist: "Random Stranger",
+            duration: 150
+        )
+        XCTAssertLessThan(
+            YouTubeDirectResolver.scoreCandidate(
+                genericWrongArtist,
+                cleanTitle: "Stay",
+                primaryArtist: "The Kid LAROI",
+                fullArtist: "The Kid LAROI, Justin Bieber",
+                targetDuration: 141,
+                rawTargetTitle: "Stay",
+                relaxed: true
+            ),
+            0.0
+        )
 
         let shortClip = YouTubeSearchCandidate(
             videoId: "short30s",

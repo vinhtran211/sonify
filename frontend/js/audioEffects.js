@@ -20,6 +20,7 @@ let mediaSource = null;
 let filters = [];
 let attachedElement = null;
 let currentBands = [0, 0, 0, 0, 0];
+let gestureUnlocked = false;
 
 export function isEqNonFlat(bands = currentBands) {
   return Array.isArray(bands) && bands.some((v) => Math.abs(Number(v) || 0) > 0.05);
@@ -58,13 +59,29 @@ export function ensureEqGraph(audioEl) {
   }
 }
 
+export function unlockAudioContextFromGesture(audioEl = null) {
+  gestureUnlocked = true;
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+  if (!isEqGraphAttached() && isEqNonFlat(currentBands) && audioEl) {
+    if (ensureEqGraph(audioEl) && audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+  }
+}
+
 export function applyEqBands(audioEl, bands) {
   if (!Array.isArray(bands) || bands.length !== 5) return;
   currentBands = bands.map((v) => Math.max(-12, Math.min(12, Number(v) || 0)));
 
-  // Lazy attach: NEVER attach Web Audio graph unless user has enabled non-flat EQ
+  // Lazy attach: NEVER attach Web Audio graph unless non-flat EQ AND active user gesture!
+  // Prevents cold page bootstrap() from locking #audio-engine into a suspended AudioContext.
   if (!isEqGraphAttached()) {
     if (!isEqNonFlat(currentBands)) return;
+    const hasGesture =
+      gestureUnlocked || Boolean(typeof navigator !== 'undefined' && navigator.userActivation?.isActive);
+    if (!hasGesture) return;
     if (!ensureEqGraph(audioEl)) return;
   }
 

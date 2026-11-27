@@ -335,40 +335,50 @@ def find_best_stream(
             cand_artist = str(cand.get("artist") or "")
             cand_dur = int(cand.get("duration") or 0)
 
-            # Universal anti-short-clip floor (>= 60s unless genuine short interlude)
-            if not is_valid_full_duration(cand_dur, duration):
-                continue
-            if relaxed and cand_dur > 900:
+            # Asymmetric duration & anti-short-clip gate
+            if not lrc_parser.is_duration_compatible(
+                cand_dur, duration, relaxed=relaxed, mv_capable=False
+            ):
                 continue
 
-            # Hard Gate 1: Title similarity (>= 0.60 strict, >= 0.52 relaxed)
+            ver_class = lrc_parser.classify_unwanted_version(
+                f"{cand_title} {cand_artist}", target_context
+            )
+            if ver_class == "hard_reject":
+                continue
+            if not relaxed and ver_class != "ok":
+                continue
+
+            # Hard Gate 1: Title similarity >= 0.60
             title_sim = max(
                 lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
                 lrc_parser.token_similarity(cand_title, clean_title),
             )
-            if title_sim < (0.52 if relaxed else 0.60):
+            if title_sim < 0.60:
                 continue
 
-            # Hard Gate 2: Artist similarity (with multi-artist substring match & Pass-2 rescue)
+            # Hard Gate 2: Artist similarity (with multi-artist word-bounded match & Pass-2 rescue)
             artist_sim = max(
                 lrc_parser.token_similarity(cand_artist, primary_artist),
                 lrc_parser.token_similarity(cand_artist, artist or primary_artist),
             )
             norm_ca = lrc_parser.normalize_key(cand_artist)
             if norm_pa and len(norm_pa) >= 2 and (
-                norm_pa in norm_ca
-                or (len(norm_pa_compact) >= 3 and norm_pa_compact in norm_ca.replace(" ", ""))
+                f" {norm_pa} " in f" {norm_ca} "
+                or (lrc_parser._has_cjk(norm_pa) and norm_pa in norm_ca)
+                or (len(norm_pa_compact) >= 5 and norm_pa_compact in norm_ca.replace(" ", ""))
             ):
                 artist_sim = max(artist_sim, 0.70)
 
             if relaxed:
-                if (
-                    artist_sim >= 0.25
-                    or lrc_parser.has_primary_artist_token(primary_artist, f"{cand_title} {cand_artist}")
-                    or (
-                        title_sim >= 0.85
-                        and (duration <= 30 or (cand_dur > 0 and abs(cand_dur - duration) <= 45))
-                    )
+                if lrc_parser.passes_relaxed_artist_gate(
+                    artist_sim=artist_sim,
+                    primary_artist=primary_artist,
+                    haystack=f"{cand_title} {cand_artist}",
+                    clean_title=clean_title,
+                    title_sim=title_sim,
+                    cand_dur=cand_dur,
+                    target_duration=duration,
                 ):
                     artist_sim = max(artist_sim, 0.50)
                 elif target_has_artist:
@@ -377,22 +387,16 @@ def find_best_stream(
                 if target_has_artist and artist_sim < 0.50:
                     continue
 
-            # Hard Gate 3: Duration within max(25s, 20%) in strict mode; [60, 900] in relaxed mode
-            if not relaxed and duration > 30 and cand_dur > 0:
-                max_diff = max(25, int(duration * 0.20))
-                if abs(cand_dur - duration) > max_diff:
-                    continue
-
             dur_prox = (
                 max(0.25 if relaxed else 0.0, 1.0 - abs(cand_dur - duration) / (90.0 if relaxed else 25.0))
                 if (duration > 0 and cand_dur > 0)
                 else 0.7
             )
             sc = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox
-            noise_pen = _noise_penalty(f"{cand_title} {cand_artist}", target_context)
-            if relaxed:
-                noise_pen *= 0.25
-            sc -= noise_pen
+            if ver_class == "derivative":
+                sc -= 0.35
+            elif ver_class == "live_acoustic":
+                sc -= 0.12
             if sc >= eff_min_score:
                 scored.append((sc, cand))
 

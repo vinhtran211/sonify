@@ -310,15 +310,15 @@ final class OfflineDownloadManager: ObservableObject {
 
         do {
             // 1. Resolve stream metadata & ALWAYS download a full-length file (never ephemeral .m3u8 HLS)
-            let downloadURL: URL
-            let downloadHeaders: [String: String]
-            let resolvedContentType: String
-            let resolvedSource: String
+            var resolvedContentType: String
+            var resolvedSource: String
+            var downloadURL: URL
+            var downloadHeaders: [String: String] = [:]
+            var usedYouTubeDirect = false
 
             let backendInfo = try? await api.getStreamInfo(trackId: track.id, quality: quality)
             if let info = backendInfo, !info.isPreview, let proxyURL = api.streamURL(for: info) {
                 downloadURL = proxyURL
-                downloadHeaders = [:]
                 resolvedContentType = info.contentType
                 resolvedSource = info.streamSource
             } else if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
@@ -326,34 +326,90 @@ final class OfflineDownloadManager: ObservableObject {
                 downloadHeaders = yt.headers
                 resolvedContentType = yt.mimeType
                 resolvedSource = "youtube-direct"
+                usedYouTubeDirect = true
             } else if let info = backendInfo, let proxyURL = api.streamURL(for: info) {
                 downloadURL = proxyURL
-                downloadHeaders = [:]
                 resolvedContentType = info.contentType
                 resolvedSource = info.streamSource
             } else {
                 throw OfflineDownloadError.invalidStreamURL
             }
 
-            let ext = StreamInfoResponse.extensionForMIME(resolvedContentType)
             let safeId = Self.safeFilename(for: track.id)
-            let audioFilename = "\(safeId)\(ext)"
-            let audioDestURL = audioDirectory.appendingPathComponent(audioFilename, isDirectory: false)
+            var ext = StreamInfoResponse.extensionForMIME(resolvedContentType)
+            var audioFilename = "\(safeId)\(ext)"
+            var audioDestURL = audioDirectory.appendingPathComponent(audioFilename, isDirectory: false)
 
             // 2. Kick off best-effort artwork & lyrics fetches concurrently with audio download
             async let artworkTask: Data? = Self.fetchArtworkData(for: track)
             async let lyricsTask: LyricsResponse? = try? api.getLyrics(for: track, refresh: false)
 
             let trackId = track.id
-            let audioBytes = try await bridge.download(
-                from: downloadURL,
-                headers: downloadHeaders,
-                to: audioDestURL,
-                trackId: trackId
-            ) { [weak self] fraction in
+            let minNetworkBytes: Int64 = 350_000
+            let progressHandler: @Sendable (Double) -> Void = { [weak self] fraction in
                 Task { @MainActor [weak self] in
                     guard let self, self.activeDownloads[trackId] != nil else { return }
                     self.activeDownloads[trackId] = max(0.05, min(0.96, fraction))
+                }
+            }
+
+            var audioBytes: Int64
+            do {
+                let downloaded = try await bridge.download(
+                    from: downloadURL,
+                    headers: downloadHeaders,
+                    to: audioDestURL,
+                    trackId: trackId,
+                    onProgress: progressHandler
+                )
+                guard downloaded >= minNetworkBytes else {
+                    try? fileManager.removeItem(at: audioDestURL)
+                    throw OfflineDownloadError.emptyAudioFile
+                }
+                audioBytes = downloaded
+            } catch {
+                // If backend proxy download failed (e.g. HTTP 502/timeout), fall back to YouTubeDirectResolver!
+                if !usedYouTubeDirect, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                    try? fileManager.removeItem(at: audioDestURL)
+                    resolvedContentType = yt.mimeType
+                    resolvedSource = "youtube-direct"
+                    ext = StreamInfoResponse.extensionForMIME(resolvedContentType)
+                    audioFilename = "\(safeId)\(ext)"
+                    audioDestURL = audioDirectory.appendingPathComponent(audioFilename, isDirectory: false)
+                    let ytBytes = try await bridge.download(
+                        from: yt.url,
+                        headers: yt.headers,
+                        to: audioDestURL,
+                        trackId: trackId,
+                        onProgress: progressHandler
+                    )
+                    guard ytBytes >= minNetworkBytes else {
+                        try? fileManager.removeItem(at: audioDestURL)
+                        throw OfflineDownloadError.emptyAudioFile
+                    }
+                    audioBytes = ytBytes
+                } else {
+                    throw error
+                }
+            }
+
+            // 3. Sniff actual downloaded magic bytes so extension & contentType ALWAYS match the bytes on disk
+            if let handle = try? FileHandle(forReadingFrom: audioDestURL) {
+                let headData = (try? handle.read(upToCount: 16)) ?? Data()
+                try? handle.close()
+                let sniffedMIME = Self.sniffAudioMIME(head: headData, fallback: resolvedContentType)
+                resolvedContentType = sniffedMIME
+                let trueExt = StreamInfoResponse.extensionForMIME(sniffedMIME)
+                if trueExt != ext {
+                    let trueFilename = "\(safeId)\(trueExt)"
+                    let trueURL = audioDirectory.appendingPathComponent(trueFilename, isDirectory: false)
+                    if fileManager.fileExists(atPath: trueURL.path) {
+                        try? fileManager.removeItem(at: trueURL)
+                    }
+                    if (try? fileManager.moveItem(at: audioDestURL, to: trueURL)) != nil {
+                        audioFilename = trueFilename
+                        audioDestURL = trueURL
+                    }
                 }
             }
 
@@ -533,6 +589,42 @@ final class OfflineDownloadManager: ObservableObject {
     }
 
     // MARK: - Internal Helpers
+
+    static func sniffAudioMIME(head: Data, fallback: String) -> String {
+        let bytes = [UInt8](head)
+        if bytes.count >= 4 {
+            // fLaC
+            if bytes[0] == 0x66 && bytes[1] == 0x4C && bytes[2] == 0x61 && bytes[3] == 0x43 {
+                return "audio/flac"
+            }
+            // ID3
+            if bytes[0] == 0x49 && bytes[1] == 0x44 && bytes[2] == 0x33 {
+                return "audio/mpeg"
+            }
+            // OggS
+            if bytes[0] == 0x4F && bytes[1] == 0x67 && bytes[2] == 0x67 && bytes[3] == 0x53 {
+                return "audio/ogg"
+            }
+        }
+        if bytes.count >= 8 {
+            // MP4/M4A ftyp box at offset 4
+            if bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70 {
+                let fb = StreamInfoResponse.normalizedMIME(fallback)
+                return fb == "video/mp4" ? "video/mp4" : "audio/mp4"
+            }
+        }
+        if bytes.count >= 12 {
+            // RIFF....WAVE
+            if bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46
+                && bytes[8] == 0x57 && bytes[9] == 0x41 && bytes[10] == 0x56 && bytes[11] == 0x45 {
+                return "audio/wav"
+            }
+        }
+        if bytes.count >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
+            return "audio/mpeg"
+        }
+        return StreamInfoResponse.normalizedMIME(fallback)
+    }
 
     private static func safeFilename(for trackId: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))

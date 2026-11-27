@@ -6,6 +6,7 @@ import {
   isEqGraphAttached,
   isEqNonFlat,
   resumeEqContext,
+  unlockAudioContextFromGesture,
 } from './audioEffects.js';
 import { showToast } from './components/modals.js';
 import { coverUrlFor } from './lrc.js';
@@ -33,6 +34,74 @@ let crossfadeTriggeredForSeq = -1;
 let fadeInRaf = null;
 let autoplayFetching = false;
 let consecutiveSkips = 0;
+let isCrossfadeRampingOut = false;
+
+const _ALT_REJECT_WORDS = [
+  'remix', 'cover', 'karaoke', 'instrumental', 'sped up', 'speed up',
+  'slowed', 'slower', 'nightcore', 'mashup', 'edit', 'live',
+];
+
+function _normSongKey(text) {
+  return String(text || '')
+    .replace(/[đĐ]/g, 'd')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u00c0-\uffff\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _stripTitleMeta(title) {
+  return String(title || '')
+    .replace(/\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with|official[^)\]]*|remaster[^)\]]*|mv|audio|video|lyrics?)[\)\]]/gi, '')
+    .replace(/\s+(?:feat\.?|ft\.?|featuring)\s+.*$/i, '')
+    .trim();
+}
+
+function isSameSongCandidate(alt, target) {
+  if (!alt || !alt.id || !target || alt.id === target.id) return false;
+  const rawAltTitle = _normSongKey(alt.title);
+  const rawTargetTitle = _normSongKey(target.title);
+  if (!rawAltTitle || !rawTargetTitle) return false;
+
+  const padAlt = ` ${rawAltTitle} `;
+  const padTarget = ` ${rawTargetTitle} `;
+  for (const w of _ALT_REJECT_WORDS) {
+    if (w === 'edit' && padAlt.includes(' radio edit ')) continue;
+    if (padAlt.includes(` ${w} `) && !padTarget.includes(` ${w} `)) return false;
+  }
+
+  const altToks = _normSongKey(_stripTitleMeta(alt.title)).split(' ').filter(Boolean);
+  const targetToks = _normSongKey(_stripTitleMeta(target.title)).split(' ').filter(Boolean);
+  if (!altToks.length || !targetToks.length) return false;
+  const altSet = new Set(altToks);
+  const targetSet = new Set(targetToks);
+  let inter = 0;
+  for (const tok of targetSet) {
+    if (altSet.has(tok)) inter += 1;
+  }
+  const overlap = inter / Math.max(1, Math.min(altSet.size, targetSet.size));
+  if (overlap < 0.8) return false;
+
+  const primTargetArt = _normSongKey(String(target.artist || '').split(/,|&|\bfeat\.?\b|\bft\.?\b/i)[0]);
+  const fullAltArt = _normSongKey(alt.artist);
+  if (primTargetArt && primTargetArt !== 'unknown artist' && primTargetArt !== 'various artists') {
+    if (fullAltArt !== primTargetArt && !` ${fullAltArt} `.includes(` ${primTargetArt} `)) {
+      const altArtWords = new Set(fullAltArt.split(' ').filter(Boolean));
+      const sharedArt = primTargetArt.split(' ').some((tok) => tok.length >= 3 && altArtWords.has(tok));
+      if (!sharedArt) return false;
+    }
+  }
+
+  const aDur = Number(alt.duration) || 0;
+  const tDur = Number(target.duration) || 0;
+  if (aDur > 0 && aDur < 60 && tDur >= 60) return false;
+  if (aDur > 30 && tDur > 30) {
+    if (aDur < tDur - 12 || aDur > tDur + 35) return false;
+  }
+  return true;
+}
 
 const PREFETCH_INFO_TTL_MS = 10 * 60 * 1000;
 const PREFETCH_HLS_TTL_MS = 210_000;
@@ -121,6 +190,20 @@ function attemptProxyFallback(seq) {
   audioEl.currentTime = 0;
   syncAudioSettings();
   audioEl.play().catch(() => {});
+  const curTrack = getState().currentTrack;
+  if (curTrack?.id) {
+    api
+      .getStreamInfo(curTrack.id, undefined, getState().audioQuality || 'auto', false)
+      .then((fresh) => {
+        if (seq === playbackSeq && fresh?.streamSource) {
+          setState({
+            streamMode: fresh.streamMode || 'full',
+            streamSource: fresh.streamSource,
+          });
+        }
+      })
+      .catch(() => {});
+  }
   return true;
 }
 
@@ -231,14 +314,16 @@ export function applyEqSettings(bands, preset = 'custom') {
   if (!audioEl) return;
 
   // If EQ is becoming non-flat while streaming from a cross-origin direct CDN URL,
-  // seamlessly switch to same-origin proxy URL before attaching Web Audio so audio is never CORS-muted.
+  // switch audioEl.src to same-origin proxy BEFORE attaching createMediaElementSource so audio is never CORS-muted.
   if (isEqNonFlat(normalized) && !isEqGraphAttached() && activeUsingDirect && activeProxyUrl) {
     const resumeTime = audioEl.currentTime || 0;
     const wasPlaying = !audioEl.paused;
     activeUsingDirect = false;
     didFallbackToProxy = true;
-    applyEqBands(audioEl, normalized);
     audioEl.src = activeProxyUrl;
+    unlockAudioContextFromGesture(audioEl);
+    applyEqBands(audioEl, normalized);
+    resumeEqContext();
     audioEl.addEventListener(
       'loadedmetadata',
       () => {
@@ -256,6 +341,7 @@ export function applyEqSettings(bands, preset = 'custom') {
     return;
   }
 
+  unlockAudioContextFromGesture(audioEl);
   applyEqBands(audioEl, normalized);
   resumeEqContext();
 }
@@ -270,6 +356,17 @@ export function initPlayer() {
   } catch {
     // Ignore
   }
+
+  const onUserGestureUnlock = () => {
+    if (isEqGraphAttached() || isEqNonFlat(getState().eqBands)) {
+      unlockAudioContextFromGesture(audioEl);
+    } else {
+      resumeEqContext();
+    }
+  };
+  document.addEventListener('pointerdown', onUserGestureUnlock, { capture: true, passive: true });
+  document.addEventListener('touchend', onUserGestureUnlock, { capture: true, passive: true });
+  document.addEventListener('keydown', onUserGestureUnlock, { capture: true, passive: true });
 
   audioEl.addEventListener('play', () => {
     resumeEqContext();
@@ -331,6 +428,7 @@ export function initPlayer() {
 
     // Crossfade smooth ramp-out when approaching end of track
     const cf = Number(cur.crossfade) || 0;
+    let cfActive = false;
     if (
       cf > 0 &&
       !audioEl.paused &&
@@ -342,14 +440,20 @@ export function initPlayer() {
       const fadeSec = Math.min(cf, 6);
       const rem = dur - curTime;
       if (rem > 0 && rem <= fadeSec && !cur.muted) {
+        cfActive = true;
+        isCrossfadeRampingOut = true;
         cancelFadeIn();
         const baseVol = Math.max(0, Math.min(1, Number(cur.volume) || 0));
-        audioEl.volume = Math.max(0.02, baseVol * (rem / fadeSec));
+        audioEl.volume = Math.max(0.05, baseVol * (rem / fadeSec));
         if (rem <= 0.45 && crossfadeTriggeredForSeq !== playbackSeq) {
           crossfadeTriggeredForSeq = playbackSeq;
           playNextTrack(true, true);
         }
       }
+    }
+    if (!cfActive && isCrossfadeRampingOut) {
+      isCrossfadeRampingOut = false;
+      audioEl.volume = cur.muted ? 0 : Math.max(0, Math.min(1, Number(cur.volume) || 0));
     }
   });
 
@@ -369,6 +473,10 @@ export function initPlayer() {
       return;
     }
     if (cur.repeat === 'one' && cur.currentTrack) {
+      isCrossfadeRampingOut = false;
+      if (!fadeInRaf) {
+        audioEl.volume = cur.muted ? 0 : Math.max(0, Math.min(1, Number(cur.volume) || 0));
+      }
       audioEl.currentTime = 0;
       audioEl.play().catch(() => {});
       return;
@@ -413,6 +521,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
   const seq = ++playbackSeq;
   clearTimeout(prefetchTimer);
   cancelFadeIn();
+  isCrossfadeRampingOut = false;
   revokeActiveBlob();
   activeProxyUrl = '';
   activeUsingDirect = false;
@@ -491,7 +600,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
           const rescueQuery = `${track.title} ${track.artist || ''}`.trim();
           const searchRes = await api.search(rescueQuery, 'tracks', 5, signal);
           if (seq !== playbackSeq || signal.aborted) return;
-          const alt = (searchRes?.tracks || []).find((t) => t && t.id && t.id !== track.id);
+          const alt = (searchRes?.tracks || []).find((t) => isSameSongCandidate(t, track));
           if (alt) {
             const altInfo = await api.getStreamInfo(alt.id, signal, quality);
             if (altInfo) {
@@ -553,11 +662,15 @@ async function startTrackPlayback(track, withFadeIn = false) {
   activeProxyUrl = proxyUrl;
 
   // Prefer IP-agnostic edge CDN unless Web Audio EQ is attached/non-flat (same-origin proxy required for CORS-safe Web Audio)
+  // Restrict raw .m3u8 hlsUrl to genuine Apple WebKit/Safari (Desktop Chrome/Edge/Firefox use seekable /api/stream proxy!)
   const forceProxyForEq = isEqGraphAttached() || isEqNonFlat(getState().eqBands);
   let chosenUrl = proxyUrl;
-  const canPlayNativeHls = Boolean(audioEl.canPlayType && audioEl.canPlayType('application/vnd.apple.mpegurl'));
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  const isAppleNativeHls =
+    Boolean(audioEl.canPlayType && audioEl.canPlayType('application/vnd.apple.mpegurl')) &&
+    (/iPad|iPhone|iPod/.test(ua) || (/Safari/i.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Firefox/i.test(ua)));
   if (!forceProxyForEq) {
-    if (info?.hlsUrl && canPlayNativeHls) {
+    if (info?.hlsUrl && isAppleNativeHls) {
       chosenUrl = info.hlsUrl;
       activeUsingDirect = true;
     } else if (info?.directUrl) {
@@ -599,6 +712,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
 
 export function playTrack(track, contextList = null, contextIndex = -1) {
   if (!track || !track.id) return;
+  unlockAudioContextFromGesture(audioEl);
   const st = getState();
   let queue = st.queue;
   let qIndex = st.queueIndex;
@@ -627,6 +741,7 @@ export function playTrack(track, contextList = null, contextIndex = -1) {
 
 export function playList(tracks, startIndex = 0, shuffleStart = false) {
   if (!Array.isArray(tracks) || tracks.length === 0) return;
+  unlockAudioContextFromGesture(audioEl);
   consecutiveSkips = 0;
   const list = tracks.slice();
   let idx = Math.max(0, Math.min(startIndex, list.length - 1));
@@ -641,6 +756,7 @@ export function playList(tracks, startIndex = 0, shuffleStart = false) {
 
 export function togglePlay(forcePlay = null) {
   if (!audioEl) return;
+  unlockAudioContextFromGesture(audioEl);
   const st = getState();
   if (!st.currentTrack) {
     const firstSection = st.homeData?.sections?.find((s) => s.type === 'tracks' && s.items?.length);
@@ -689,6 +805,7 @@ async function triggerAutoplayRadio(curTrack, withFadeIn = false) {
 }
 
 export function playNextTrack(fromEnded = false, withFadeIn = false) {
+  if (!fromEnded) unlockAudioContextFromGesture(audioEl);
   const st = getState();
 
   // 1. Always consume explicit userQueue first
@@ -732,10 +849,15 @@ export function playNextTrack(fromEnded = false, withFadeIn = false) {
 
 export function playPrevTrack() {
   if (!audioEl) return;
+  unlockAudioContextFromGesture(audioEl);
   const st = getState();
   if (!st.currentTrack) return;
 
   if (audioEl.currentTime > 3) {
+    isCrossfadeRampingOut = false;
+    if (!fadeInRaf) {
+      audioEl.volume = st.muted ? 0 : Math.max(0, Math.min(1, Number(st.volume) || 0));
+    }
     audioEl.currentTime = 0;
     setState({ currentTime: 0 });
     return;
@@ -753,11 +875,17 @@ export function playPrevTrack() {
 
 export function seekTo(seconds, autoPlay = false) {
   if (!audioEl) return;
-  const dur = Number.isFinite(audioEl.duration) ? audioEl.duration : getState().duration || 0;
+  const st = getState();
+  const dur = Number.isFinite(audioEl.duration) ? audioEl.duration : st.duration || 0;
   const clamped = Math.max(0, dur > 0 ? Math.min(seconds, dur) : seconds);
+  isCrossfadeRampingOut = false;
+  if (!fadeInRaf) {
+    audioEl.volume = st.muted ? 0 : Math.max(0, Math.min(1, Number(st.volume) || 0));
+  }
   audioEl.currentTime = clamped;
   setState({ currentTime: clamped });
   if (autoPlay && audioEl.paused) {
+    unlockAudioContextFromGesture(audioEl);
     audioEl.play().catch(() => {});
   }
 }
@@ -869,6 +997,7 @@ export function clearAllQueue() {
 export function jumpToQueueIndex(index) {
   const st = getState();
   if (index < 0 || index >= st.queue.length) return;
+  unlockAudioContextFromGesture(audioEl);
   setState({ queueIndex: index });
   startTrackPlayback(st.queue[index]);
 }
@@ -876,6 +1005,7 @@ export function jumpToQueueIndex(index) {
 export function playFromUserQueue(index) {
   const st = getState();
   if (index < 0 || index >= st.userQueue.length) return;
+  unlockAudioContextFromGesture(audioEl);
   const chosen = st.userQueue[index];
   const rest = st.userQueue.slice(index + 1);
   setState({ userQueue: rest });
