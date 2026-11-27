@@ -25,11 +25,14 @@ MONOCHROME_BASE = "https://tracks.monochrome.st"
 CACHE_DIR = Path(tempfile.gettempdir()) / "sonify_mc_cache"
 MAX_CACHE_FILES = 12
 MAX_CACHE_BYTES = 300 * 1024 * 1024  # 300 MiB disk cap on Render /tmp
-MIN_TRACK_BYTES = 200_000
+MIN_TRACK_BYTES = 350_000
+MAX_CONCURRENT_PRODUCERS = 2
 READY_THRESHOLD_BYTES = 65_536       # Stream headers+bytes immediately after first 64 KiB
 PRODUCER_BULK_CHUNK_SIZE = 262_144   # 256 KiB reads after initial 64 KiB ready chunk
 PRODUCER_FLUSH_INTERVAL = 524_288    # Flush every 512 KiB for high throughput
 PACE_INTERVAL_SEC = 0.6
+
+is_valid_full_duration = lrc_parser.is_valid_full_duration
 
 _NOISE_KEYWORDS = (
     "remix",
@@ -73,6 +76,8 @@ class ProgressiveCacheEntry:
     part_path: Path
     final_path: Path
     cond: threading.Condition = field(default_factory=threading.Condition)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    started_at: float = field(default_factory=time.monotonic)
     bytes_written: int = 0
     total_size: int = 0          # upstream Content-Length if known (> 0)
     content_type: str = "audio/flac"
@@ -237,7 +242,7 @@ def search_tracks(query: str, limit: int = 8) -> List[Dict[str, Any]]:
             except Exception:
                 pass
             if exc.code == 429 and attempt == 0:
-                time.sleep(1.5)
+                time.sleep(0.6)
                 continue
             return []
         except Exception:
@@ -337,6 +342,8 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
         zero_progress_resumes = 0
 
         while True:
+            if entry.cancel_event.is_set():
+                break
             resp = None
             is_resume = total_written > 0
             range_hdr = f"bytes={total_written}-" if is_resume else None
@@ -345,6 +352,8 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
 
             try:
                 _pace_upstream_request()
+                if entry.cancel_event.is_set():
+                    break
                 status, up_headers, resp = http_client.open_stream(
                     url,
                     headers=hdrs,
@@ -352,6 +361,8 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                     method="GET",
                     timeout=max(45.0, float(config.STREAM_READ_TIMEOUT)),
                 )
+                if entry.cancel_event.is_set():
+                    break
                 if status not in (200, 206):
                     if status == 429:
                         if not is_resume and initial_attempt < len(backoffs):
@@ -390,13 +401,15 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                         out_f.truncate(total_written)
 
                     while True:
+                        if entry.cancel_event.is_set():
+                            break
                         read_size = (
                             PRODUCER_BULK_CHUNK_SIZE
                             if is_ready_signaled
                             else config.STREAM_CHUNK_SIZE
                         )
                         chunk = resp.read(read_size)
-                        if not chunk:
+                        if not chunk or entry.cancel_event.is_set():
                             break
                         if skip_bytes > 0:
                             if len(chunk) <= skip_bytes:
@@ -463,7 +476,9 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                     except Exception:
                         pass
 
-            # Check if download is complete
+            # Check if download is complete or explicitly canceled
+            if entry.cancel_event.is_set():
+                break
             if known_total > 0 and total_written >= known_total:
                 break
             if known_total == 0 and not leg_error:
@@ -483,9 +498,10 @@ def _run_producer(entry: ProgressiveCacheEntry) -> None:
                     continue
             break
 
-        # Strict completeness check: NEVER cache a truncated track when Content-Length is known
+        # Strict completeness check: NEVER cache a truncated or canceled track
         is_complete_size = (
-            total_written >= MIN_TRACK_BYTES
+            not entry.cancel_event.is_set()
+            and total_written >= MIN_TRACK_BYTES
             and (known_total == 0 or total_written >= known_total)
             and entry.part_path.is_file()
         )
@@ -584,8 +600,17 @@ def get_or_start_download(raw_id: str) -> Optional[ProgressiveCacheEntry]:
             pass
 
         existing = _ACTIVE_DOWNLOADS.get(clean_id)
-        if existing is not None and not existing.failed:
+        if existing is not None and not existing.failed and not existing.cancel_event.is_set():
             return existing
+
+        # Cap concurrent upstream .part downloads (MAX_CONCURRENT_PRODUCERS = 2):
+        # abort oldest active download immediately so rapid clicking never saturates upstream!
+        while len(_ACTIVE_DOWNLOADS) >= MAX_CONCURRENT_PRODUCERS:
+            oldest_id, oldest_entry = min(
+                _ACTIVE_DOWNLOADS.items(), key=lambda kv: kv[1].started_at
+            )
+            oldest_entry.cancel_event.set()
+            _ACTIVE_DOWNLOADS.pop(oldest_id, None)
 
         part_name = f"{final_path.stem}.part.{os.getpid()}.{int(time.time() * 1000)}.{threading.get_ident()}"
         part_path = final_path.with_name(part_name)
@@ -642,6 +667,7 @@ def score_candidate(
     target_duration: int = 0,
     target_isrc: str = "",
     raw_target_title: str = "",
+    relaxed: bool = False,
 ) -> float:
     """Score a Monochrome track candidate against target metadata; returns -1.0 if rejected."""
     if cand.get("playable") is False:
@@ -653,21 +679,27 @@ def score_candidate(
     cand_isrc = str(cand.get("isrc") or "").strip().upper()
     norm_target_isrc = (target_isrc or "").strip().upper()
 
+    # Universal anti-short-clip floor (>= 60s unless genuine short interlude)
+    if not is_valid_full_duration(cand_dur, target_duration):
+        return -1.0
+    if relaxed and cand_dur > 900:
+        return -1.0
+
     # 1. Exact ISRC match -> studio master match
     if norm_target_isrc and cand_isrc and cand_isrc == norm_target_isrc:
-        if target_duration > 30 and cand_dur > 0 and abs(cand_dur - target_duration) > 30:
+        if not relaxed and target_duration > 30 and cand_dur > 0 and abs(cand_dur - target_duration) > 30:
             return -1.0
         return 1.0
 
-    # 2. Hard Gate 1: Title similarity >= 0.55
+    # 2. Hard Gate 1: Title similarity (>= 0.55 strict, >= 0.52 relaxed)
     title_sim = max(
         lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
         lrc_parser.token_similarity(cand_title, clean_title),
     )
-    if title_sim < 0.55:
+    if title_sim < (0.52 if relaxed else 0.55):
         return -1.0
 
-    # 3. Hard Gate 2: Artist similarity >= 0.40 when target artist is known
+    # 3. Hard Gate 2: Artist similarity when target artist is known
     target_has_artist = bool(
         primary_artist and primary_artist.lower() not in ("unknown artist", "various artists")
     )
@@ -690,17 +722,35 @@ def score_candidate(
         ):
             artist_sim = max(artist_sim, 0.55)
 
-    if target_has_artist and artist_sim < 0.40:
-        return -1.0
+    if relaxed:
+        if (
+            artist_sim >= 0.25
+            or lrc_parser.has_primary_artist_token(primary_artist, f"{cand_title} {cand_artist}")
+            or (
+                title_sim >= 0.85
+                and (
+                    target_duration <= 30
+                    or (cand_dur > 0 and abs(cand_dur - target_duration) <= 45)
+                )
+            )
+        ):
+            artist_sim = max(artist_sim, 0.50)
+        elif target_has_artist:
+            return -1.0
+    else:
+        if target_has_artist and artist_sim < 0.40:
+            return -1.0
 
-    # 4. Hard Gate 3: Duration within max(20s, 15% of target)
-    if target_duration > 30 and cand_dur > 0:
+    # 4. Hard Gate 3: Duration within max(20s, 15% of target) in strict mode; [60, 900] in relaxed mode
+    if not relaxed and target_duration > 30 and cand_dur > 0:
         max_diff = max(20, int(target_duration * 0.15))
         if abs(cand_dur - target_duration) > max_diff:
             return -1.0
 
     if target_duration > 0 and cand_dur > 0:
-        dur_prox = max(0.0, 1.0 - abs(cand_dur - target_duration) / 25.0)
+        denom = 90.0 if relaxed else 25.0
+        floor_prox = 0.25 if relaxed else 0.0
+        dur_prox = max(floor_prox, 1.0 - abs(cand_dur - target_duration) / denom)
     else:
         dur_prox = 0.65
 
@@ -709,7 +759,10 @@ def score_candidate(
         score += 0.08
 
     target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
-    score -= _noise_penalty(f"{cand_title} {cand_artist}", target_context)
+    noise_pen = _noise_penalty(f"{cand_title} {cand_artist}", target_context)
+    if relaxed:
+        noise_pen *= 0.25
+    score -= noise_pen
     return score
 
 
@@ -730,6 +783,7 @@ def find_best_stream(
     duration: int = 0,
     isrc: str = "",
     min_score: float = 0.65,
+    relaxed: bool = False,
 ) -> Optional[Tuple[str, str, str]]:
     """Search Monochrome for a matching full-length lossless track WITHOUT probing /track/{id}.
 
@@ -744,11 +798,17 @@ def find_best_stream(
     if not primary_query:
         return None
 
+    eff_min_score = 0.48 if (relaxed and min_score == 0.65) else min_score
+
     queries: List[str] = [primary_query]
     ascii_q = lrc_parser.normalize_key(primary_query).strip()
     if ascii_q and ascii_q.lower() != primary_query.lower():
         queries.append(ascii_q)
-    if search_title and len(search_title.strip()) >= 4 and primary_artist:
+    if relaxed:
+        rq = f"{clean_title} {primary_artist}".strip()
+        if rq and all(rq.lower() != q.lower() for q in queries):
+            queries.append(rq)
+    if search_title and len(search_title.strip()) >= (4 if relaxed else 4) and primary_artist:
         ct_q = search_title.strip()
         if all(ct_q.lower() != q.lower() for q in queries):
             queries.append(ct_q)
@@ -771,8 +831,9 @@ def find_best_stream(
                 target_duration=duration,
                 target_isrc=isrc,
                 raw_target_title=title,
+                relaxed=relaxed,
             )
-            if sc >= min_score:
+            if sc >= eff_min_score:
                 scored.append((sc, cand))
         if scored:
             break

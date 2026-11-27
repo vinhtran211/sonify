@@ -214,16 +214,48 @@ class CatalogService:
             )
         ]
 
-        # Build rich music-only New Releases carousel (filter out Deezer audiobook entries and prefer fresh albums)
+        # Build rich music-only New Releases carousel:
+        # Prioritize top-streamed US albums + Deezer chart albums + live chart track albums FIRST
+        # (which have ~100% full-track availability), using Deezer editorial releases only as a last resort
+        # if < 12 albums were collected (avoids obscure 1990s soundtrack/regional reissues).
         audiobook_kw = ("ungekürzt", "gekürzt", "hörbuch", "audiobook", "kapitel", "teil ")
-        dz_music_albums = [
+
+        def _is_clean_album(alb: Dict[str, Any]) -> bool:
+            title_l = (alb.get("title") or "").lower()
+            if any(kw in title_l for kw in audiobook_kw):
+                return False
+            return not _is_genre_spam(alb)
+
+        chart_track_albums: List[Dict[str, Any]] = []
+        for tr in global_tracks + vn_songs:
+            alb_id = tr.get("albumId") or ""
+            alb_title = tr.get("album") or ""
+            if not alb_id or not alb_title:
+                continue
+            if any(kw in alb_title.lower() for kw in audiobook_kw) or _is_genre_spam(tr):
+                continue
+            chart_track_albums.append(
+                {
+                    "id": alb_id,
+                    "source": tr.get("source", "deezer"),
+                    "title": alb_title,
+                    "artist": tr.get("artist", "Various Artists"),
+                    "artistId": tr.get("artistId", ""),
+                    "coverSmall": tr.get("coverSmall", ""),
+                    "coverLarge": tr.get("coverLarge", ""),
+                    "releaseDate": tr.get("releaseDate", ""),
+                    "trackCount": 0,
+                }
+            )
+
+        primary_albums = [
             a
-            for a in (dz_releases or dz_chart.get("albums") or [])
-            if not any(kw in (a.get("title") or "").lower() for kw in audiobook_kw)
+            for a in (list(us_albums or []) + chart_track_albums + list(dz_chart.get("albums") or []))
+            if _is_clean_album(a)
         ]
         new_releases: List[Dict[str, Any]] = []
         seen_alb: set[str] = set()
-        for alb in dz_music_albums + us_albums:
+        for alb in primary_albums:
             key = f"{lrc_parser.normalize_key(alb.get('title', ''))}::{lrc_parser.normalize_key(alb.get('artist', ''))}"
             if key not in seen_alb:
                 seen_alb.add(key)
@@ -231,32 +263,15 @@ class CatalogService:
             if len(new_releases) >= 16:
                 break
 
-        # Guarantee a full New Releases carousel even if Apple RSS albums times out, using real albums from live charts
+        # Last-resort fallback to Deezer editorial releases only if < 12 albums were collected
         if len(new_releases) < 12:
-            for tr in global_tracks + vn_songs:
-                alb_id = tr.get("albumId") or ""
-                alb_title = tr.get("album") or ""
-                if not alb_id or not alb_title:
+            for alb in (dz_releases or []):
+                if not _is_clean_album(alb):
                     continue
-                if any(kw in alb_title.lower() for kw in audiobook_kw):
-                    continue
-                key = f"{lrc_parser.normalize_key(alb_title)}::{lrc_parser.normalize_key(tr.get('artist', ''))}"
-                if key in seen_alb:
-                    continue
-                seen_alb.add(key)
-                new_releases.append(
-                    {
-                        "id": alb_id,
-                        "source": tr.get("source", "deezer"),
-                        "title": alb_title,
-                        "artist": tr.get("artist", "Various Artists"),
-                        "artistId": tr.get("artistId", ""),
-                        "coverSmall": tr.get("coverSmall", ""),
-                        "coverLarge": tr.get("coverLarge", ""),
-                        "releaseDate": tr.get("releaseDate", ""),
-                        "trackCount": 0,
-                    }
-                )
+                key = f"{lrc_parser.normalize_key(alb.get('title', ''))}::{lrc_parser.normalize_key(alb.get('artist', ''))}"
+                if key not in seen_alb:
+                    seen_alb.add(key)
+                    new_releases.append(alb)
                 if len(new_releases) >= 16:
                     break
 
@@ -1126,45 +1141,49 @@ class CatalogService:
         home_indie: List[Dict[str, Any]] = []
         for sec in home.get("sections") or []:
             if sec.get("id") == "trending-global":
-                home_global = list(sec.get("items") or [])
+                home_global = [t for t in (sec.get("items") or []) if not _is_genre_spam(t)]
             elif sec.get("id") == "trending-vn":
-                home_vn = list(sec.get("items") or [])
+                home_vn = [t for t in (sec.get("items") or []) if not _is_genre_spam(t)]
             elif sec.get("id") == "audius-trending":
-                home_indie = list(sec.get("items") or [])
+                home_indie = [t for t in (sec.get("items") or []) if not _is_genre_spam(t)]
 
         played_tracks = [h["track"] for h in history_items if h.get("track")]
         played_ids = {t["id"] for t in played_tracks if t.get("id")}
         user_seed_tracks = self._dedup_tracks_keep_order(played_tracks + liked_tracks, limit=20)
 
-        # Daily Mix 1: top played/liked artists + radio expansion
+        # Daily Mix 1: top played/liked artists + radio expansion (cold-start: trending-global + trending-vn)
         dm1_pool: List[Dict[str, Any]] = list(user_seed_tracks[:8])
         if user_seed_tracks:
             radio1 = self.get_radio(track_id=user_seed_tracks[0]["id"], limit=14)
-            dm1_pool.extend(radio1.get("tracks") or [])
+            dm1_pool.extend(t for t in (radio1.get("tracks") or []) if not _is_genre_spam(t))
         elif followed_artists:
             radio1 = self.get_radio(artist_id=followed_artists[0]["id"], limit=16)
-            dm1_pool.extend(radio1.get("tracks") or [])
+            dm1_pool.extend(t for t in (radio1.get("tracks") or []) if not _is_genre_spam(t))
         dm1_pool.extend(home_global if region_key == "global" else home_vn)
+        dm1_pool.extend(home_vn if region_key == "global" else home_global)
         dm1_tracks = self._dedup_tracks_keep_order(dm1_pool, limit=18)
 
-        # Daily Mix 2: secondary artist/vibe + regional blend
+        # Daily Mix 2: secondary artist/vibe + regional blend + direct full-track Audius
         dm2_pool: List[Dict[str, Any]] = []
         if len(user_seed_tracks) >= 2:
             dm2_pool.extend(user_seed_tracks[1:6])
             radio2 = self.get_radio(track_id=user_seed_tracks[1]["id"], limit=12)
-            dm2_pool.extend(radio2.get("tracks") or [])
+            dm2_pool.extend(t for t in (radio2.get("tracks") or []) if not _is_genre_spam(t))
         dm2_pool.extend(home_vn if region_key == "global" else home_global)
+        dm2_pool.extend(home_global[8:] if region_key == "global" else home_vn[8:])
         dm2_pool.extend(home_indie)
         dm2_tracks = self._dedup_tracks_keep_order(dm2_pool, limit=18)
 
-        # Discover Weekly: tracks user hasn't played yet from related artists / indie / charts
+        # Discover Weekly: tracks user hasn't played yet from related artists / charts / indie
         dw_pool: List[Dict[str, Any]] = []
         if len(followed_artists) >= 1:
             dw_radio = self.get_radio(artist_id=followed_artists[-1]["id"], limit=15)
-            dw_pool.extend(dw_radio.get("tracks") or [])
+            dw_pool.extend(t for t in (dw_radio.get("tracks") or []) if not _is_genre_spam(t))
+        dw_pool.extend(home_global[5:])
+        dw_pool.extend(home_vn[5:])
         dw_pool.extend(home_indie)
-        dw_pool.extend(home_global)
-        dw_pool.extend(home_vn)
+        dw_pool.extend(home_global[:5])
+        dw_pool.extend(home_vn[:5])
         dw_tracks = self._dedup_tracks_keep_order(dw_pool, exclude_ids=played_ids, limit=18)
         if not dw_tracks:
             dw_tracks = self._dedup_tracks_keep_order(dw_pool, limit=18)

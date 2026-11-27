@@ -23,6 +23,8 @@ SC_HOME_URL = "https://soundcloud.com"
 SC_API_BASE = "https://api-v2.soundcloud.com"
 CLIENT_ID_TTL = 12 * 3600  # 12 hours
 
+is_valid_full_duration = lrc_parser.is_valid_full_duration
+
 _SCRIPT_SRC_RE = re.compile(r'<script[^>]+src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)"', re.IGNORECASE)
 _CLIENT_ID_RE = re.compile(r'client_id["\']?\s*[:=]\s*["\']([a-zA-Z0-9_-]{30,36})["\']')
 _EXT_MAP_RE = re.compile(r'#EXT-X-MAP:URI="([^"]+)"')
@@ -173,18 +175,50 @@ def search_raw_tracks(query: str, limit: int = 25) -> List[Dict[str, Any]]:
     return []
 
 
-def is_full_allow_track(item: Dict[str, Any], target_duration: int = 0) -> bool:
-    """Return True ONLY if the SoundCloud item is a full-length playable track (never a 30s Go+ SNIP preview)."""
+def has_playable_transcoding(item: Dict[str, Any]) -> bool:
+    """Return True if item exposes at least one non-snipped, non-DRM progressive or HLS transcoding."""
+    tcs = ((item.get("media") or {}).get("transcodings")) or []
+    if not tcs:
+        return False
+    for tc in tcs:
+        if tc.get("snipped") is True:
+            continue
+        fmt = tc.get("format") or {}
+        proto = str(fmt.get("protocol") or "").lower()
+        mime = str(fmt.get("mime_type") or "").lower()
+        preset = str(tc.get("preset") or "").lower()
+        if proto == "progressive":
+            return True
+        if proto == "hls" and "mpegurl" not in mime and "encrypted" not in mime and not preset.startswith("abr"):
+            return True
+    return False
+
+
+def is_full_allow_track(item: Dict[str, Any], target_duration: int = 0, relaxed: bool = False) -> bool:
+    """Return True ONLY if the SoundCloud item is a full-length playable track (never a 30s Go+ SNIP or DRM-only)."""
     if str(item.get("policy") or "").upper() != "ALLOW":
+        return False
+    if "media" in item and not has_playable_transcoding(item):
         return False
     dur_ms = int(item.get("duration") or 0)
     full_dur_ms = int(item.get("full_duration") or dur_ms)
-    if dur_ms < 90_000 or full_dur_ms < 90_000:
+    if dur_ms <= 0 or full_dur_ms <= 0:
         return False
     if abs(dur_ms - full_dur_ms) > 5000:
         return False
+    dur_sec = dur_ms // 1000
+    full_sec = full_dur_ms // 1000
+    if not is_valid_full_duration(dur_sec, target_duration) or not is_valid_full_duration(full_sec, target_duration):
+        return False
+    if relaxed:
+        if dur_sec > 900:
+            return False
+        return True
+    if (target_duration == 0 or target_duration >= 90) and (dur_ms < 90_000 or full_dur_ms < 90_000):
+        return False
+    if dur_sec > 900:
+        return False
     if target_duration > 30:
-        dur_sec = dur_ms // 1000
         max_diff = max(140, int(target_duration * 0.75))
         if abs(dur_sec - target_duration) > max_diff:
             return False
@@ -226,15 +260,17 @@ def score_candidate(
     full_artist: str,
     target_duration: int = 0,
     raw_target_title: str = "",
+    relaxed: bool = False,
 ) -> float:
     """Score a SoundCloud track item; returns -1.0 if rejected by full-track or quality gates."""
-    if not is_full_allow_track(item, target_duration=target_duration):
+    if not is_full_allow_track(item, target_duration=target_duration, relaxed=relaxed):
         return -1.0
 
     raw_title = str(item.get("title") or "").strip()
     user = item.get("user") or {}
     username = str(user.get("username") or user.get("full_name") or "").strip()
     pub_artist = str((item.get("publisher_metadata") or {}).get("artist") or "").strip()
+    description = str(item.get("description") or "").strip()
     cand_artist = pub_artist or username
 
     norm_pa = lrc_parser.normalize_key(primary_artist)
@@ -277,12 +313,14 @@ def score_candidate(
         lrc_parser.token_similarity(cleaned_raw, clean_title),
         lrc_parser.token_similarity(lrc_parser.clean_track_title(raw_title), clean_title),
     )
-    if title_sim < 0.58:
+    if title_sim < (0.52 if relaxed else 0.58):
         return -1.0
 
     dur_sec = int(item.get("duration") or 0) // 1000
     target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
     noise_pen = _noise_penalty(f"{raw_title} {username}", target_context)
+    if relaxed:
+        noise_pen *= 0.25
 
     target_has_artist = bool(
         primary_artist and primary_artist.lower() not in ("unknown artist", "various artists")
@@ -317,7 +355,7 @@ def score_candidate(
     # Studio master / reupload match when uploader username is a label/fan channel but title & duration match closely
     if (
         artist_sim < 0.40
-        and title_sim >= 0.88
+        and title_sim >= (0.85 if relaxed else 0.88)
         and (
             target_duration <= 30
             or (dur_sec > 0 and abs(dur_sec - target_duration) <= 45)
@@ -325,11 +363,20 @@ def score_candidate(
     ):
         artist_sim = 0.55
 
-    if target_has_artist and artist_sim < 0.40:
-        return -1.0
+    if relaxed:
+        haystack = f"{raw_title} {cand_artist} {username} {description[:300]}"
+        if artist_sim >= 0.25 or lrc_parser.has_primary_artist_token(primary_artist, haystack):
+            artist_sim = max(artist_sim, 0.50)
+        elif target_has_artist:
+            return -1.0
+    else:
+        if target_has_artist and artist_sim < 0.40:
+            return -1.0
 
     if target_duration > 0 and dur_sec > 0:
-        dur_prox = max(0.0, 1.0 - abs(dur_sec - target_duration) / 60.0)
+        denom = 120.0 if relaxed else 60.0
+        floor_prox = 0.25 if relaxed else 0.0
+        dur_prox = max(floor_prox, 1.0 - abs(dur_sec - target_duration) / denom)
     else:
         dur_prox = 0.65
 
@@ -569,6 +616,7 @@ def find_best_stream(
     min_score: float = 0.60,
     assemble_now: bool = True,
     stats: Optional[Dict[str, Any]] = None,
+    relaxed: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Find and resolve a full-length SoundCloud stream.
 
@@ -583,18 +631,30 @@ def find_best_stream(
     ascii_artist = lrc_parser.normalize_key(primary_artist).strip()
     ascii_title = lrc_parser.normalize_key(clean_title).strip()
 
+    eff_min_score = 0.48 if (relaxed and min_score == 0.60) else min_score
+
     primary_queries: List[str] = []
-    for candidate_q in (
-        f"{primary_artist} {clean_title}".strip(),
-        f"{artist} {clean_title}".strip(),
-        f"{ascii_artist} {ascii_title}".strip(),
-    ):
+    base_candidates = (
+        (
+            f"{primary_artist} {clean_title} audio".strip(),
+            f"{clean_title} {primary_artist}".strip(),
+            f"{primary_artist} {clean_title}".strip(),
+            f"{ascii_artist} {ascii_title}".strip(),
+        )
+        if relaxed
+        else (
+            f"{primary_artist} {clean_title}".strip(),
+            f"{artist} {clean_title}".strip(),
+            f"{ascii_artist} {ascii_title}".strip(),
+        )
+    )
+    for candidate_q in base_candidates:
         if candidate_q and all(candidate_q.lower() != q.lower() for q in primary_queries):
             primary_queries.append(candidate_q)
 
     fallback_query = (
         clean_title.strip()
-        if len(clean_title.strip()) >= 4
+        if len(clean_title.strip()) >= (5 if relaxed else 4)
         else f"{clean_title} {primary_artist} full".strip()
     )
 
@@ -632,18 +692,20 @@ def find_best_stream(
                 full_artist=artist,
                 target_duration=duration,
                 raw_target_title=title,
+                relaxed=relaxed,
             )
-            if sc >= min_score:
+            if sc >= eff_min_score:
                 scored.append((sc, item))
 
+    max_queries = 4 if relaxed else 3
     for q in primary_queries:
-        if queries_tried >= 3 or len(scored) >= 4:
+        if queries_tried >= max_queries or len(scored) >= 4:
             break
         _run_query(q)
 
     if (
         len(scored) < 3
-        and queries_tried < 3
+        and queries_tried < max_queries
         and fallback_query
         and all(fallback_query.lower() != q.lower() for q in primary_queries)
     ):
@@ -671,7 +733,7 @@ def find_best_stream(
 
     _SC_THREAD_LOCAL.http_errors = []
     try:
-        for _, item in scored[:6]:
+        for _, item in scored[: (8 if relaxed else 6)]:
             cid = get_client_id(force_refresh=False) or cid
             resolved = _resolve_item_stream(item, cid, assemble_now=assemble_now)
             if resolved:

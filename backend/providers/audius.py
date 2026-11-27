@@ -13,6 +13,9 @@ from backend import config, http_client, lrc_parser
 APP_NAME = "Sonify"
 DISCOVERY_API = "https://api.audius.co"
 FALLBACK_HOST = "https://discoveryprovider.audius.co"
+MIN_TRACK_BYTES = 350_000
+
+is_valid_full_duration = lrc_parser.is_valid_full_duration
 
 _NOISE_KEYWORDS = (
     "nightcore",
@@ -173,16 +176,24 @@ def find_best_stream(
     artist: str,
     duration: int = 0,
     min_score: float = 0.78,
+    relaxed: bool = False,
 ) -> Optional[Tuple[str, str]]:
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
     query = f"{primary_artist} {clean_title}".strip()
     if not query:
         return None
-    try:
-        candidates = search_tracks(query, limit=8)
-    except Exception:
-        return None
+
+    eff_min_score = 0.48 if (relaxed and min_score == 0.78) else min_score
+    queries: List[str] = [query]
+    if relaxed:
+        for rq in (
+            f"{primary_artist} {clean_title} audio".strip(),
+            f"{clean_title} {primary_artist}".strip(),
+            clean_title.strip() if len(clean_title.strip()) >= 5 else "",
+        ):
+            if rq and all(rq.lower() != q.lower() for q in queries):
+                queries.append(rq)
 
     target_context = f"{title or ''} {artist or ''}"
     target_has_artist = bool(
@@ -191,47 +202,92 @@ def find_best_stream(
 
     best_score = 0.0
     best_id = ""
-    for cand in candidates:
-        cand_title = str(cand.get("title") or "")
-        cand_artist = str(cand.get("artist") or "")
-        cand_dur = int(cand.get("duration") or 0)
+    seen_ids: set[str] = set()
 
-        # Hard Gate 1: Title similarity >= 0.60
-        title_sim = lrc_parser.token_similarity(
-            lrc_parser.clean_track_title(cand_title), clean_title
-        )
-        if title_sim < 0.60:
-            continue
+    for q in queries:
+        try:
+            candidates = search_tracks(q, limit=8)
+        except Exception:
+            candidates = []
 
-        # Hard Gate 2: Artist similarity >= 0.50 when target artist is known
-        artist_sim = max(
-            lrc_parser.token_similarity(cand_artist, primary_artist),
-            lrc_parser.token_similarity(cand_artist, artist or primary_artist),
-        )
-        if target_has_artist and artist_sim < 0.50:
-            continue
+        for cand in candidates:
+            cid = str(cand.get("id") or "")
+            if cid and cid in seen_ids:
+                continue
+            if cid:
+                seen_ids.add(cid)
 
-        # Hard Gate 3: Duration within max(25s, 20%)
-        if duration > 30 and cand_dur > 0:
-            max_diff = max(25, int(duration * 0.20))
-            if abs(cand_dur - duration) > max_diff:
+            cand_title = str(cand.get("title") or "")
+            cand_artist = str(cand.get("artist") or "")
+            cand_dur = int(cand.get("duration") or 0)
+
+            # Universal anti-short-clip floor (>= 60s unless genuine short interlude)
+            if not is_valid_full_duration(cand_dur, duration):
+                continue
+            if relaxed and cand_dur > 900:
                 continue
 
-        if duration > 0 and cand_dur > 0:
-            dur_prox = max(0.0, 1.0 - abs(cand_dur - duration) / 25.0)
-        else:
-            dur_prox = 0.65
-        score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox
-        score -= _noise_penalty(f"{cand_title} {cand_artist}", target_context)
-        if score >= min_score and score > best_score:
-            best_score = score
-            best_id = str(cand["id"]).split(":", 1)[-1]
+            # Hard Gate 1: Title similarity (>= 0.60 strict, >= 0.52 relaxed)
+            title_sim = max(
+                lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
+                lrc_parser.token_similarity(cand_title, clean_title),
+            )
+            if title_sim < (0.52 if relaxed else 0.60):
+                continue
+
+            # Hard Gate 2: Artist similarity when target artist is known
+            artist_sim = max(
+                lrc_parser.token_similarity(cand_artist, primary_artist),
+                lrc_parser.token_similarity(cand_artist, artist or primary_artist),
+            )
+            if relaxed:
+                if (
+                    artist_sim >= 0.25
+                    or lrc_parser.has_primary_artist_token(primary_artist, f"{cand_title} {cand_artist}")
+                    or (
+                        title_sim >= 0.85
+                        and (duration <= 30 or (cand_dur > 0 and abs(cand_dur - duration) <= 45))
+                    )
+                ):
+                    artist_sim = max(artist_sim, 0.50)
+                elif target_has_artist:
+                    continue
+            else:
+                if target_has_artist and artist_sim < 0.50:
+                    continue
+
+            # Hard Gate 3: Duration within max(25s, 20%) in strict mode; [60, 900] in relaxed mode
+            if not relaxed and duration > 30 and cand_dur > 0:
+                max_diff = max(25, int(duration * 0.20))
+                if abs(cand_dur - duration) > max_diff:
+                    continue
+
+            if duration > 0 and cand_dur > 0:
+                dur_prox = max(
+                    0.25 if relaxed else 0.0,
+                    1.0 - abs(cand_dur - duration) / (90.0 if relaxed else 25.0),
+                )
+            else:
+                dur_prox = 0.65
+            score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox
+            noise_pen = _noise_penalty(f"{cand_title} {cand_artist}", target_context)
+            if relaxed:
+                noise_pen *= 0.25
+            score -= noise_pen
+            if score >= eff_min_score and score > best_score:
+                best_score = score
+                best_id = str(cand["id"]).split(":", 1)[-1]
+
+        if best_id:
+            break
 
     if not best_id:
         return None
 
     stream_url = get_stream_url(best_id)
-    ok, _, hdrs, final_url = http_client.probe_url(stream_url, timeout=config.STREAM_PROBE_TIMEOUT)
+    ok, _, hdrs, final_url = http_client.probe_url(
+        stream_url, timeout=config.STREAM_PROBE_TIMEOUT, min_total_bytes=MIN_TRACK_BYTES
+    )
     if ok:
         ctype = hdrs.get("content-type", "audio/mpeg").split(";")[0].strip()
         if not ctype.startswith("audio/"):

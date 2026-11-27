@@ -193,3 +193,32 @@ def token_similarity(a: str, b: str) -> float:
     jaccard = inter / union
     overlap = inter / min(len(ta), len(tb))
     return 0.55 * jaccard + 0.45 * overlap
+
+
+def is_valid_full_duration(cand_dur: int, target_duration: int = 0) -> bool:
+    """Return True only if cand_dur passes the universal anti-short-clip floor.
+
+    - cand_dur <= 0: unknown metadata duration -> True (rely on min_total_bytes >= 350_000).
+    - 30 <= target_duration < 60: genuine short album interlude -> require >= max(30, target_duration - 10).
+    - Otherwise: strictly require cand_dur >= 60 (blocks 29-30s previews/ringtones/teasers).
+    """
+    if cand_dur <= 0:
+        return True
+    if 30 <= target_duration < 60:
+        return cand_dur >= max(30, target_duration - 10)
+    return cand_dur >= 60
+
+
+def has_primary_artist_token(primary_artist: str, haystack: str) -> bool:
+    """Return True if any normalized primary artist token of length >= 3 appears in haystack."""
+    norm_pa = normalize_key(primary_artist)
+    norm_hay = normalize_key(haystack)
+    if not norm_pa or not norm_hay:
+        return False
+    hay_tokens = set(norm_hay.split())
+    hay_compact = norm_hay.replace(" ", "")
+    for tok in norm_pa.split():
+        if len(tok) >= 3 and (tok in hay_tokens or (len(tok) >= 4 and tok in hay_compact)):
+            return True
+    return False
+

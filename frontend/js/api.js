@@ -47,9 +47,12 @@ export const api = {
 
   getAlbum: (albumId) => request(`/api/album/${encodeURIComponent(albumId)}`),
 
-  getStreamInfo: (trackId, signal = undefined, quality = 'auto') => {
-    const q = quality && quality !== 'auto' ? `?quality=${encodeURIComponent(quality)}` : '';
-    return request(`/api/stream/${encodeURIComponent(trackId)}/info${q}`, { signal });
+  getStreamInfo: (trackId, signal = undefined, quality = 'auto', prewarm = false) => {
+    const params = new URLSearchParams();
+    if (quality && quality !== 'auto') params.set('quality', quality);
+    if (prewarm) params.set('prewarm', '1');
+    const qs = params.toString();
+    return request(`/api/stream/${encodeURIComponent(trackId)}/info${qs ? `?${qs}` : ''}`, { signal });
   },
 
   getLyrics: ({ trackId = '', title = '', artist = '', album = '', duration = 0, refresh = false }, signal = undefined) => {

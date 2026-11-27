@@ -23,7 +23,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
     private static let searchEndpoint = URL(string: "https://music.youtube.com/youtubei/v1/search?prettyPrint=false")!
     private static let playerEndpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!
     private static let cacheTTL: TimeInterval = 20 * 60
-    private static let minProbeBytes: Int64 = 300_000
+    private static let minProbeBytes: Int64 = 350_000
 
     private static let noiseKeywords: [String] = [
         "cover", "karaoke", "remix", "slowed", "sped up", "speed up",
@@ -75,11 +75,10 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         let query = "\(cleaned) \(primary)".trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return nil }
 
-        guard let candidates = await searchYouTubeMusic(query: query), !candidates.isEmpty else {
-            return nil
-        }
+        let pass1Candidates = await searchYouTubeMusic(query: query) ?? []
 
-        let scored: [(Double, YouTubeSearchCandidate)] = candidates
+        // Pass 1: Strict Studio Master scoring (>= 0.58)
+        let strictScored: [(Double, YouTubeSearchCandidate)] = pass1Candidates
             .map { cand in
                 let sc = Self.scoreCandidate(
                     cand,
@@ -87,14 +86,52 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                     primaryArtist: primary,
                     fullArtist: track.artist,
                     targetDuration: track.duration,
-                    rawTargetTitle: track.title
+                    rawTargetTitle: track.title,
+                    relaxed: false
                 )
                 return (sc, cand)
             }
             .filter { $0.0 >= 0.58 }
             .sorted { $0.0 > $1.0 }
 
-        for (_, cand) in scored.prefix(2) {
+        var triedVideoIds = Set<String>()
+        for (_, cand) in strictScored.prefix(2) {
+            triedVideoIds.insert(cand.videoId)
+            if let resolved = await resolveVideoStream(videoId: cand.videoId) {
+                storeCache(resolved, for: track.id)
+                return resolved
+            }
+        }
+
+        // Pass 2: Relaxed Full-Track Rescue (>= 0.45, duration 60..900s, reduced noise penalty + secondary query)
+        var rescuePool = pass1Candidates
+        let secondaryQuery = "\(cleaned) \(primary) official audio".trimmingCharacters(in: .whitespacesAndNewlines)
+        if let extra = await searchYouTubeMusic(query: secondaryQuery), !extra.isEmpty {
+            var seenPool = Set(rescuePool.map(\.videoId))
+            for item in extra where !seenPool.contains(item.videoId) {
+                seenPool.insert(item.videoId)
+                rescuePool.append(item)
+            }
+        }
+
+        let relaxedScored: [(Double, YouTubeSearchCandidate)] = rescuePool
+            .filter { !triedVideoIds.contains($0.videoId) }
+            .map { cand in
+                let sc = Self.scoreCandidate(
+                    cand,
+                    cleanTitle: cleaned,
+                    primaryArtist: primary,
+                    fullArtist: track.artist,
+                    targetDuration: track.duration,
+                    rawTargetTitle: track.title,
+                    relaxed: true
+                )
+                return (sc, cand)
+            }
+            .filter { $0.0 >= 0.45 }
+            .sorted { $0.0 > $1.0 }
+
+        for (_, cand) in relaxedScored.prefix(3) {
             if let resolved = await resolveVideoStream(videoId: cand.videoId) {
                 storeCache(resolved, for: track.id)
                 return resolved
@@ -126,7 +163,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                 ]
             ],
             "query": query,
-            "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D",
+            "params": "EgWKAQIIAWoKEAkQBRAKEAMQBA==",
         ]
 
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return nil }
@@ -283,7 +320,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
     static func cleanTitle(_ title: String) -> String {
         var s = title
         let patterns = [
-            #"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with|from\s+["']?|official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|remaster(?:ed)?(?:\s+\d{4})?|radio\s*edit|single\s*version|album\s*version|explicit|clean)[^)\]]*[\)\]]"#,
+            #"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with|from\s+["']?|official\s*(?:music\s*)?(?:video|audio|mv|lyric\s*video|visualizer)|mv|remaster(?:ed)?(?:\s+\d{4})?|radio\s*edit|single\s*version|album\s*version|explicit|clean)[^)\]]*[\)\]]"#,
             #"\s+(?:feat\.?|ft\.?|featuring)\s+.*$"#,
         ]
         for pat in patterns {
@@ -315,11 +352,20 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         let normB = normalizeKey(b)
         if normA.isEmpty || normB.isEmpty { return 0.0 }
         if normA == normB { return 1.0 }
+        let paddedA = " \(normA) "
+        let paddedB = " \(normB) "
+        let shorter = min(normA.count, normB.count)
+        let longer = max(normA.count, normB.count)
+        if shorter >= 3 && (paddedA.contains(paddedB) || paddedB.contains(paddedA)) {
+            return 0.8 + 0.2 * (Double(shorter) / Double(longer))
+        }
         let setA = Set(normA.split(separator: " ").map(String.init))
         let setB = Set(normB.split(separator: " ").map(String.init))
         if setA.isEmpty || setB.isEmpty { return 0.0 }
-        let overlap = Double(setA.intersection(setB).count)
-        return (2.0 * overlap) / Double(setA.count + setB.count)
+        let inter = Double(setA.intersection(setB).count)
+        let union = Double(setA.union(setB).count)
+        let minCount = Double(min(setA.count, setB.count))
+        return 0.55 * (inter / union) + 0.45 * (inter / minCount)
     }
 
     static func parseDurationSeconds(_ text: String) -> Int {
@@ -417,13 +463,23 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         primaryArtist: String,
         fullArtist: String,
         targetDuration: Int,
-        rawTargetTitle: String
+        rawTargetTitle: String,
+        relaxed: Bool = false
     ) -> Double {
-        // Duration gate
-        if cand.duration > 0 && (cand.duration < 75 || cand.duration > 720) {
-            return -1.0
+        // Duration gate (universal >= 60s full-track floor unless genuine short interlude)
+        if cand.duration > 0 {
+            let minDur: Int
+            if targetDuration >= 30 && targetDuration < 60 {
+                minDur = max(30, targetDuration - 10)
+            } else {
+                minDur = relaxed ? 60 : 75
+            }
+            let maxDur = relaxed ? 900 : 720
+            if cand.duration < minDur || cand.duration > maxDur {
+                return -1.0
+            }
         }
-        if targetDuration > 30 && cand.duration > 0 {
+        if !relaxed && targetDuration > 30 && cand.duration > 0 {
             let maxDiff = max(25, Int(Double(targetDuration) * 0.25))
             if abs(cand.duration - targetDuration) > maxDiff {
                 return -1.0
@@ -435,7 +491,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             tokenSimilarity(candClean, cleanTitle),
             tokenSimilarity(cand.title, cleanTitle)
         )
-        if titleSim < 0.50 {
+        if titleSim < (relaxed ? 0.48 : 0.50) {
             return -1.0
         }
 
@@ -460,13 +516,28 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             artistSim = max(artistSim, 0.85)
         }
 
-        if targetHasArtist && artistSim < 0.35 {
+        if relaxed {
+            let hayWords = Set("\(normCandTitle) \(normCandArt)".split(separator: " ").map(String.init))
+            let hasArtistToken = normPA.split(separator: " ").map(String.init).contains { tok in
+                tok.count >= 3 && hayWords.contains(tok)
+            }
+            let closeTitleAndDur = titleSim >= 0.85 && (
+                targetDuration <= 30 || cand.duration == 0 || abs(cand.duration - targetDuration) <= 45
+            )
+            if artistSim >= 0.25 || hasArtistToken || closeTitleAndDur {
+                artistSim = max(artistSim, 0.50)
+            } else if targetHasArtist {
+                return -1.0
+            }
+        } else if targetHasArtist && artistSim < 0.35 {
             return -1.0
         }
 
         let durProx: Double
         if targetDuration > 0 && cand.duration > 0 {
-            durProx = max(0.0, 1.0 - Double(abs(cand.duration - targetDuration)) / 35.0)
+            let denom = relaxed ? 100.0 : 35.0
+            let floorVal = relaxed ? 0.25 : 0.0
+            durProx = max(floorVal, 1.0 - Double(abs(cand.duration - targetDuration)) / denom)
         } else {
             durProx = 0.65
         }
@@ -479,6 +550,9 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             if !nkw.isEmpty && paddedCandAll.contains(" \(nkw) ") && !paddedTargetAll.contains(" \(nkw) ") {
                 noisePen += 0.25
             }
+        }
+        if relaxed {
+            noisePen *= 0.25
         }
 
         return 0.55 * titleSim + 0.30 * artistSim + 0.15 * durProx - noisePen

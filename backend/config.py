@@ -48,6 +48,16 @@ def is_offline_env() -> bool:
     )
 
 
+def allow_previews() -> bool:
+    """Return True ONLY when SONIFY_ALLOW_PREVIEWS is explicitly enabled (default False: zero 30s previews)."""
+    return os.environ.get("SONIFY_ALLOW_PREVIEWS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def is_cloud_env() -> bool:
     """Detect cloud hosting environment (Render, Railway, Fly.io, HF Spaces, or explicit SONIFY_CLOUD_MODE)."""
     cloud_flag = os.environ.get("SONIFY_CLOUD_MODE", "").strip().lower()

@@ -11,6 +11,9 @@ from backend import config, crypto_des, http_client, lrc_parser
 
 DIRECT_API = "https://www.jiosaavn.com/api.php"
 MIRROR_API = "https://saavn.sumit.co/api/search/songs"
+MIN_TRACK_BYTES = 350_000
+
+is_valid_full_duration = lrc_parser.is_valid_full_duration
 
 _NOISE_KEYWORDS = (
     "nightcore",
@@ -232,10 +235,14 @@ def resolve_candidate_urls(extra: Dict[str, Any]) -> List[str]:
     return urls
 
 
-def probe_best_url(urls: List[str]) -> Optional[Tuple[str, str]]:
+def probe_best_url(
+    urls: List[str], min_total_bytes: int = MIN_TRACK_BYTES
+) -> Optional[Tuple[str, str]]:
     """Return (reachable_url, content_type) for the highest-bitrate playable JioSaavn URL."""
     for url in urls:
-        ok, _, hdrs, final_url = http_client.probe_url(url, timeout=config.STREAM_PROBE_TIMEOUT)
+        ok, _, hdrs, final_url = http_client.probe_url(
+            url, timeout=config.STREAM_PROBE_TIMEOUT, min_total_bytes=min_total_bytes
+        )
         if ok:
             ctype = hdrs.get("content-type", "audio/mp4").split(";")[0].strip()
             if not ctype.startswith("audio/") and ctype != "application/octet-stream":
@@ -277,6 +284,7 @@ def find_best_stream(
     artist: str,
     duration: int = 0,
     min_score: float = 0.72,
+    relaxed: bool = False,
 ) -> Optional[Tuple[str, str]]:
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
@@ -284,11 +292,21 @@ def find_best_stream(
     if not query:
         return None
 
+    eff_min_score = 0.48 if (relaxed and min_score == 0.72) else min_score
+
     queries = [query]
     if any(ord(ch) > 127 for ch in query):
         ascii_q = lrc_parser.normalize_key(query).strip()
         if ascii_q and ascii_q.lower() != query.lower():
             queries.append(ascii_q)
+    if relaxed:
+        for rq in (
+            f"{primary_artist} {clean_title} audio".strip(),
+            f"{clean_title} {primary_artist}".strip(),
+            clean_title.strip() if len(clean_title.strip()) >= 5 else "",
+        ):
+            if rq and all(rq.lower() != q.lower() for q in queries):
+                queries.append(rq)
 
     target_context = f"{title or ''} {artist or ''}"
     target_has_artist = bool(
@@ -317,14 +335,21 @@ def find_best_stream(
             cand_artist = str(cand.get("artist") or "")
             cand_dur = int(cand.get("duration") or 0)
 
-            # Hard Gate 1: Title similarity >= 0.60
-            title_sim = lrc_parser.token_similarity(
-                lrc_parser.clean_track_title(cand_title), clean_title
-            )
-            if title_sim < 0.60:
+            # Universal anti-short-clip floor (>= 60s unless genuine short interlude)
+            if not is_valid_full_duration(cand_dur, duration):
+                continue
+            if relaxed and cand_dur > 900:
                 continue
 
-            # Hard Gate 2: Artist similarity >= 0.50 (with multi-artist substring match)
+            # Hard Gate 1: Title similarity (>= 0.60 strict, >= 0.52 relaxed)
+            title_sim = max(
+                lrc_parser.token_similarity(lrc_parser.clean_track_title(cand_title), clean_title),
+                lrc_parser.token_similarity(cand_title, clean_title),
+            )
+            if title_sim < (0.52 if relaxed else 0.60):
+                continue
+
+            # Hard Gate 2: Artist similarity (with multi-artist substring match & Pass-2 rescue)
             artist_sim = max(
                 lrc_parser.token_similarity(cand_artist, primary_artist),
                 lrc_parser.token_similarity(cand_artist, artist or primary_artist),
@@ -336,23 +361,39 @@ def find_best_stream(
             ):
                 artist_sim = max(artist_sim, 0.70)
 
-            if target_has_artist and artist_sim < 0.50:
-                continue
+            if relaxed:
+                if (
+                    artist_sim >= 0.25
+                    or lrc_parser.has_primary_artist_token(primary_artist, f"{cand_title} {cand_artist}")
+                    or (
+                        title_sim >= 0.85
+                        and (duration <= 30 or (cand_dur > 0 and abs(cand_dur - duration) <= 45))
+                    )
+                ):
+                    artist_sim = max(artist_sim, 0.50)
+                elif target_has_artist:
+                    continue
+            else:
+                if target_has_artist and artist_sim < 0.50:
+                    continue
 
-            # Hard Gate 3: Duration within max(25s, 20%) when both durations are known
-            if duration > 30 and cand_dur > 0:
+            # Hard Gate 3: Duration within max(25s, 20%) in strict mode; [60, 900] in relaxed mode
+            if not relaxed and duration > 30 and cand_dur > 0:
                 max_diff = max(25, int(duration * 0.20))
                 if abs(cand_dur - duration) > max_diff:
                     continue
 
             dur_prox = (
-                max(0.0, 1.0 - abs(cand_dur - duration) / 25.0)
+                max(0.25 if relaxed else 0.0, 1.0 - abs(cand_dur - duration) / (90.0 if relaxed else 25.0))
                 if (duration > 0 and cand_dur > 0)
                 else 0.7
             )
             sc = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox
-            sc -= _noise_penalty(f"{cand_title} {cand_artist}", target_context)
-            if sc >= min_score:
+            noise_pen = _noise_penalty(f"{cand_title} {cand_artist}", target_context)
+            if relaxed:
+                noise_pen *= 0.25
+            sc -= noise_pen
+            if sc >= eff_min_score:
                 scored.append((sc, cand))
 
         if scored:

@@ -32,8 +32,10 @@ let sleepTimerInterval = null;
 let crossfadeTriggeredForSeq = -1;
 let fadeInRaf = null;
 let autoplayFetching = false;
+let consecutiveSkips = 0;
 
 const PREFETCH_INFO_TTL_MS = 10 * 60 * 1000;
+const PREFETCH_HLS_TTL_MS = 210_000;
 const prefetchedInfoCache = new Map();
 
 function streamCacheKey(trackId, quality) {
@@ -44,7 +46,8 @@ function getCachedStreamInfo(trackId, quality) {
   const key = streamCacheKey(trackId, quality);
   const entry = prefetchedInfoCache.get(key);
   if (!entry) return null;
-  if (Date.now() - entry.fetchedAt > PREFETCH_INFO_TTL_MS) {
+  const ttl = entry.info?.hlsUrl ? PREFETCH_HLS_TTL_MS : PREFETCH_INFO_TTL_MS;
+  if (Date.now() - entry.fetchedAt > ttl) {
     prefetchedInfoCache.delete(key);
     return null;
   }
@@ -99,7 +102,7 @@ function scheduleNextTrackPrefetch(seq) {
     const qual = getState().audioQuality || 'auto';
     if (!nextTrack || !nextTrack.id || getCachedStreamInfo(nextTrack.id, qual)) return;
     api
-      .getStreamInfo(nextTrack.id, undefined, qual)
+      .getStreamInfo(nextTrack.id, undefined, qual, true)
       .then((info) => {
         if (info) setCachedStreamInfo(nextTrack.id, qual, info);
       })
@@ -277,6 +280,7 @@ export function initPlayer() {
   });
 
   audioEl.addEventListener('playing', () => {
+    consecutiveSkips = 0;
     scheduleNextTrackPrefetch(playbackSeq);
   });
 
@@ -472,6 +476,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
   // 2. Resolve online stream metadata (respecting audioQuality preference)
   const st = getState();
   const quality = st.audioQuality || 'auto';
+  let streamTrackId = track.id;
   let info = getCachedStreamInfo(track.id, quality);
   if (!info) {
     try {
@@ -479,18 +484,58 @@ async function startTrackPlayback(track, withFadeIn = false) {
       if (info) setCachedStreamInfo(track.id, quality, info);
     } catch (err) {
       if (err.name === 'AbortError' || seq !== playbackSeq) return;
-      setState({
-        isPlaying: false,
-        isLoading: false,
-        streamMode: 'error',
-        streamSource: '',
-      });
-      showToast(
-        err.message || `Could not stream "${track.title}" right now — try another result`,
-        'error',
-        3600
-      );
-      return;
+
+      // 2a. 1-Shot Alternate Track Rescue: search for another catalog version of the same song
+      if (track.title) {
+        try {
+          const rescueQuery = `${track.title} ${track.artist || ''}`.trim();
+          const searchRes = await api.search(rescueQuery, 'tracks', 5, signal);
+          if (seq !== playbackSeq || signal.aborted) return;
+          const alt = (searchRes?.tracks || []).find((t) => t && t.id && t.id !== track.id);
+          if (alt) {
+            const altInfo = await api.getStreamInfo(alt.id, signal, quality);
+            if (altInfo) {
+              info = altInfo;
+              streamTrackId = alt.id;
+              setCachedStreamInfo(alt.id, quality, altInfo);
+            }
+          }
+        } catch (rescueErr) {
+          if (rescueErr?.name === 'AbortError' || seq !== playbackSeq) return;
+        }
+      }
+
+      // 2b. Smart Queue Auto-Skip (Spotify behavior, capped at 3 consecutive skips)
+      if (!info) {
+        if (seq !== playbackSeq || signal.aborted) return;
+        const curSt = getState();
+        const inMultiQueue =
+          (Array.isArray(curSt.queue) && curSt.queue.length > 1) ||
+          (Array.isArray(curSt.userQueue) && curSt.userQueue.length > 0);
+        if (inMultiQueue && consecutiveSkips < 3) {
+          consecutiveSkips += 1;
+          showToast(
+            `Full track unavailable for '${track.title}' — skipping to next`,
+            'info',
+            2800
+          );
+          playNextTrack(true);
+          return;
+        }
+        consecutiveSkips = 0;
+        setState({
+          isPlaying: false,
+          isLoading: false,
+          streamMode: 'error',
+          streamSource: '',
+        });
+        showToast(
+          err.message || `Could not stream "${track.title}" right now — try another result`,
+          'error',
+          3600
+        );
+        return;
+      }
     }
   }
 
@@ -504,7 +549,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
     isLoading: true,
   });
 
-  const proxyUrl = `/api/stream/${encodeURIComponent(track.id)}?s=${seq}`;
+  const proxyUrl = `/api/stream/${encodeURIComponent(streamTrackId)}?s=${seq}`;
   activeProxyUrl = proxyUrl;
 
   // Prefer IP-agnostic edge CDN unless Web Audio EQ is attached/non-flat (same-origin proxy required for CORS-safe Web Audio)
@@ -575,12 +620,14 @@ export function playTrack(track, contextList = null, contextIndex = -1) {
     }
   }
 
+  consecutiveSkips = 0;
   setState({ queue, queueIndex: qIndex });
   startTrackPlayback(track);
 }
 
 export function playList(tracks, startIndex = 0, shuffleStart = false) {
   if (!Array.isArray(tracks) || tracks.length === 0) return;
+  consecutiveSkips = 0;
   const list = tracks.slice();
   let idx = Math.max(0, Math.min(startIndex, list.length - 1));
   if (shuffleStart) {

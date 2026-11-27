@@ -353,8 +353,11 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         return
                     debug = self._qparam(qs, "debug", "0").strip().lower() in ("1", "true", "yes")
                     quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
+                    prewarm = self._qparam(qs, "prewarm", "0").strip().lower() in ("1", "true", "yes")
                     self._send_json(
-                        self.server.stream.get_stream_info(track_id, debug=debug, quality=quality)
+                        self.server.stream.get_stream_info(
+                            track_id, debug=debug, quality=quality, prewarm=prewarm
+                        )
                     )
                     return
                 track_id = strip_known_stream_extension(urllib.parse.unquote(rest).strip("/"))

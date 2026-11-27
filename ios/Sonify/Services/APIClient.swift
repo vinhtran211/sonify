@@ -231,7 +231,12 @@ final class APIClient: ObservableObject, @unchecked Sendable {
 
     // MARK: - Stream & Lyrics
 
-    func getStreamInfo(trackId: String, debug: Bool = false, quality: String? = nil) async throws -> StreamInfoResponse {
+    func getStreamInfo(
+        trackId: String,
+        debug: Bool = false,
+        quality: String? = nil,
+        prewarm: Bool = false
+    ) async throws -> StreamInfoResponse {
         let encoded = Self.encodePathSegment(trackId)
         var items: [URLQueryItem] = []
         if debug {
@@ -239,6 +244,9 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         }
         if let quality, !quality.isEmpty, quality != "auto" {
             items.append(URLQueryItem(name: "quality", value: quality))
+        }
+        if prewarm {
+            items.append(URLQueryItem(name: "prewarm", value: "1"))
         }
         return try await send(path: "/api/stream/\(encoded)/info", queryItems: items, timeout: 30)
     }

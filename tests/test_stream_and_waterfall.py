@@ -308,7 +308,7 @@ class TestProbeUrlAndStrictMatchers(unittest.TestCase):
         # Single-flight /tmp LRU cache: retries HTTP 429, sniffs fLaC -> audio/flac, serves 2nd call from disk
         import io
         from pathlib import Path
-        flac_payload = b"fLaC" + bytes(i % 256 for i in range(250_000))
+        flac_payload = b"fLaC" + bytes(i % 256 for i in range(380_000))
 
         class _FakeResp:
             def __init__(self, data: bytes):
@@ -793,8 +793,9 @@ class TestStreamWaterfall(unittest.TestCase):
                 r3 = self.stream.resolve_stream("dz:908604612", force_refresh=True)
                 self.assertEqual((r3.mode, r3.source), ("full", "audius"))
 
-            # Tier 4: All full sources fail -> Official Deezer 30s preview (with expired-403 refresh)
-            with mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
+            # Tier 6 (opt-in SONIFY_ALLOW_PREVIEWS=1): All full sources fail -> Official Deezer 30s preview (with expired-403 refresh)
+            with mock.patch.dict(os.environ, {"SONIFY_ALLOW_PREVIEWS": "1"}, clear=False), \
+                 mock.patch("backend.providers.youtube_music.resolve_audio_stream", return_value=None), \
                  mock.patch("backend.providers.monochrome.probe_track_stream", return_value=None), \
                  mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
                  mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
@@ -973,7 +974,8 @@ class TestStreamWaterfall(unittest.TestCase):
             "duration": 220,
             "previewUrl": "",
         })
-        with mock.patch("backend.providers.youtube_music.find_best_video_id", return_value=None), \
+        with mock.patch.dict(os.environ, {"SONIFY_ALLOW_PREVIEWS": "1"}, clear=False), \
+             mock.patch("backend.providers.youtube_music.find_best_video_id", return_value=None), \
              mock.patch("backend.providers.monochrome.find_best_stream", return_value=None), \
              mock.patch("backend.providers.jiosaavn.find_best_stream", return_value=None), \
              mock.patch("backend.providers.soundcloud.find_best_stream", return_value=None), \
@@ -1163,7 +1165,7 @@ class TestStreamProxyLiveHTTP(unittest.TestCase):
         from pathlib import Path
 
         head_chunk = b"fLaC" + bytes(i % 256 for i in range(65532))  # 65,536 bytes (64 KiB)
-        tail_chunk = bytes((i * 7) % 256 for i in range(196608))     # 196,608 bytes (192 KiB) -> total 262,144 B
+        tail_chunk = bytes((i * 7) % 256 for i in range(327680))     # 327,680 bytes (320 KiB) -> total 393,216 B >= 350KB floor
         full_payload = head_chunk + tail_chunk
         release_tail = threading.Event()
         open_calls = []

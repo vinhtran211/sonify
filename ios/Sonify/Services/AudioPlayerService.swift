@@ -168,6 +168,7 @@ final class AudioPlayerService: ObservableObject {
     private var prefetchedOrder: [String] = []
     private var currentRoute: PlaybackRoute?
     private var didFallbackToProxy: Bool = false
+    private var didAttemptYouTubeRescue: Bool = false
     private var timeObserverToken: Any?
     private var itemStatusObserver: NSKeyValueObservation?
     private var timeControlObserver: NSKeyValueObservation?
@@ -178,6 +179,7 @@ final class AudioPlayerService: ObservableObject {
     private var cachedArtwork: MPMediaItemArtwork?
 
     private static let prefetchTTL: TimeInterval = 600.0
+    private static let prefetchHLSTTL: TimeInterval = 210.0
     private static let maxPrefetchedEntries: Int = 12
 
     init(api: APIClient) {
@@ -428,7 +430,8 @@ final class AudioPlayerService: ObservableObject {
     private func cachedPrefetchInfo(for trackId: String) -> StreamInfoResponse? {
         let key = prefetchCacheKey(trackId: trackId)
         guard let entry = prefetchedInfo[key] else { return nil }
-        if Date().timeIntervalSince(entry.fetchedAt) > Self.prefetchTTL {
+        let ttl: TimeInterval = (entry.info.hlsUrl != nil) ? Self.prefetchHLSTTL : Self.prefetchTTL
+        if Date().timeIntervalSince(entry.fetchedAt) > ttl {
             prefetchedInfo.removeValue(forKey: key)
             prefetchedOrder.removeAll { $0 == key }
             return nil
@@ -460,7 +463,7 @@ final class AudioPlayerService: ObservableObject {
         prefetchTask = Task(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard !Task.isCancelled, let self, seq == self.playbackSeq else { return }
-            if let info = try? await self.api.getStreamInfo(trackId: nextId, quality: qual) {
+            if let info = try? await self.api.getStreamInfo(trackId: nextId, quality: qual, prewarm: true) {
                 guard !Task.isCancelled else { return }
                 self.storePrefetchInfo(info, for: nextId)
             }
@@ -506,6 +509,7 @@ final class AudioPlayerService: ObservableObject {
         streamInfo = nil
         currentRoute = nil
         didFallbackToProxy = false
+        didAttemptYouTubeRescue = false
         currentTime = 0
         duration = Double(max(track.duration, 0))
         isPlaying = false
@@ -583,6 +587,7 @@ final class AudioPlayerService: ObservableObject {
                     // Residential-IP Native iOS Full-Track Fallback when cloud backend only returned a 30s preview
                     if info.isPreview, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
                         guard !Task.isCancelled, seq == self.playbackSeq else { return }
+                        self.didAttemptYouTubeRescue = true
                         info = StreamInfoResponse(
                             trackId: track.id,
                             streamUrl: yt.url.absoluteString,
@@ -599,6 +604,7 @@ final class AudioPlayerService: ObservableObject {
                     throw CancellationError()
                 } catch {
                     // Residential-IP fallback if backend /info failed
+                    self.didAttemptYouTubeRescue = true
                     if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
                         guard !Task.isCancelled, seq == self.playbackSeq else { return }
                         info = StreamInfoResponse(
@@ -685,6 +691,53 @@ final class AudioPlayerService: ObservableObject {
                         self.player.play()
                         if abs(self.playbackRate - 1.0) > 0.01 {
                             self.player.rate = self.playbackRate
+                        }
+                        return
+                    }
+                    if !self.didAttemptYouTubeRescue,
+                       let track = self.currentTrack,
+                       self.offlineDownloads?.offlineModeEnabled != true {
+                        self.didAttemptYouTubeRescue = true
+                        self.itemStatusObserver?.invalidate()
+                        self.itemStatusObserver = nil
+                        self.isLoading = true
+                        Task { @MainActor [weak self] in
+                            guard let self, seq == self.playbackSeq else { return }
+                            if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                                guard seq == self.playbackSeq else { return }
+                                let ytInfo = StreamInfoResponse(
+                                    trackId: track.id,
+                                    streamUrl: yt.url.absoluteString,
+                                    streamMode: "full",
+                                    streamSource: "youtube-direct",
+                                    contentType: yt.mimeType,
+                                    adFree: true,
+                                    directUrl: yt.url.absoluteString
+                                )
+                                let ytRoute = PlaybackRoute.direct(yt.url)
+                                self.streamInfo = ytInfo
+                                self.currentRoute = ytRoute
+                                let rescuedItem = self.makePlayerItem(
+                                    for: ytRoute,
+                                    contentType: yt.mimeType,
+                                    headers: yt.headers
+                                )
+                                self.observePlayerItem(rescuedItem, seq: seq)
+                                self.player.replaceCurrentItem(with: rescuedItem)
+                                self.player.play()
+                                if abs(self.playbackRate - 1.0) > 0.01 {
+                                    self.player.rate = self.playbackRate
+                                }
+                                self.updateNowPlayingInfo()
+                                return
+                            }
+                            guard seq == self.playbackSeq else { return }
+                            self.isLoading = false
+                            self.isPlaying = false
+                            let msg = observedItem.error?.localizedDescription ?? "Unable to play this track"
+                            self.errorMessage = msg
+                            self.libraryStore?.showToast(msg)
+                            self.updateNowPlayingInfo()
                         }
                         return
                     }

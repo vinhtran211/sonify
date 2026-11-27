@@ -22,6 +22,8 @@ BILI_REFERER = "https://www.bilibili.com/"
 BILI_ORIGIN = "https://www.bilibili.com"
 BUVID_TTL = 12 * 3600  # 12 hours
 
+is_valid_full_duration = lrc_parser.is_valid_full_duration
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _DECORATIVE_BRACKETS_RE = re.compile(r"(?:【[^】]*】|《[^》]*》|「[^」]*」|\[[^\]]*\]|\([^)]*\))")
 _SEP_SPLIT_RE = re.compile(r"\s*[-–—|/:：]\s*")
@@ -206,26 +208,35 @@ def score_candidate(
     full_artist: str,
     target_duration: int = 0,
     raw_target_title: str = "",
+    relaxed: bool = False,
 ) -> float:
-    """Strictly score a Bilibili candidate; returns -1.0 if rejected by duration/title/artist gates."""
+    """Score a Bilibili candidate; returns -1.0 if rejected by duration/title/artist gates."""
     raw_title = str(item.get("title") or "").strip()
     author = str(item.get("author") or "").strip()
     cand_dur = int(item.get("duration") or 0)
 
-    # Hard Gate 1: Full-track duration (90..720s) + target duration match
-    if cand_dur < 90 or cand_dur > 720:
+    # Hard Gate 1: Full-track duration + universal anti-short-clip floor
+    if cand_dur <= 0 or not is_valid_full_duration(cand_dur, target_duration):
         return -1.0
-    if target_duration > 30:
-        max_diff = max(35, int(target_duration * 0.25))
-        if abs(cand_dur - target_duration) > max_diff:
+    if relaxed:
+        if cand_dur > 900:
             return -1.0
+    else:
+        if (target_duration == 0 or target_duration >= 90) and cand_dur < 90:
+            return -1.0
+        if cand_dur > 720:
+            return -1.0
+        if target_duration > 30:
+            max_diff = max(35, int(target_duration * 0.25))
+            if abs(cand_dur - target_duration) > max_diff:
+                return -1.0
 
     # Clean decorative brackets for title comparison while preserving raw title for artist & noise gates
     stripped_brackets = _DECORATIVE_BRACKETS_RE.sub(" ", raw_title)
     stripped_brackets = re.sub(r"\s+", " ", stripped_brackets).strip(" -–—|/:：")
     cleaned_cand = lrc_parser.clean_track_title(stripped_brackets or raw_title)
 
-    # Hard Gate 2: Title similarity >= 0.58 (across cleaned title & separator-split segments)
+    # Hard Gate 2: Title similarity (>= 0.58 strict, >= 0.52 relaxed)
     title_sim = max(
         lrc_parser.token_similarity(cleaned_cand, clean_title),
         lrc_parser.token_similarity(stripped_brackets, clean_title),
@@ -237,10 +248,10 @@ def score_candidate(
             title_sim,
             lrc_parser.token_similarity(lrc_parser.clean_track_title(part), clean_title),
         )
-    if title_sim < 0.58:
+    if title_sim < (0.52 if relaxed else 0.58):
         return -1.0
 
-    # Hard Gate 3: Artist similarity >= 0.40 when target artist is known
+    # Hard Gate 3: Artist similarity when target artist is known
     target_has_artist = bool(
         primary_artist and primary_artist.lower() not in ("unknown artist", "various artists")
     )
@@ -270,16 +281,34 @@ def score_candidate(
         if norm_pa_compact in norm_raw_compact or norm_pa_compact in norm_author_compact:
             artist_sim = max(artist_sim, 0.85)
 
-    if target_has_artist and artist_sim < 0.40:
-        return -1.0
+    if relaxed:
+        if (
+            artist_sim >= 0.25
+            or lrc_parser.has_primary_artist_token(primary_artist, f"{raw_title} {author}")
+            or (
+                title_sim >= 0.85
+                and (target_duration <= 30 or abs(cand_dur - target_duration) <= 45)
+            )
+        ):
+            artist_sim = max(artist_sim, 0.50)
+        elif target_has_artist:
+            return -1.0
+    else:
+        if target_has_artist and artist_sim < 0.40:
+            return -1.0
 
     if target_duration > 0 and cand_dur > 0:
-        dur_prox = max(0.0, 1.0 - abs(cand_dur - target_duration) / 45.0)
+        dur_prox = max(
+            0.25 if relaxed else 0.0,
+            1.0 - abs(cand_dur - target_duration) / (120.0 if relaxed else 45.0),
+        )
     else:
         dur_prox = 0.65
 
     target_context = f"{raw_target_title or clean_title} {full_artist or primary_artist}"
     noise_pen = _noise_penalty(f"{raw_title} {author}", target_context)
+    if relaxed:
+        noise_pen *= 0.25
 
     score = 0.55 * title_sim + 0.30 * artist_sim + 0.15 * dur_prox - noise_pen
     return score
@@ -381,6 +410,7 @@ def find_best_stream(
     artist: str,
     duration: int = 0,
     min_score: float = 0.62,
+    relaxed: bool = False,
 ) -> Optional[Tuple[str, str, Dict[str, str]]]:
     """Search Bilibili and return (audio_url, 'audio/mp4', proxy_headers) for a verified full track."""
     clean_title = lrc_parser.clean_track_title(title)
@@ -389,10 +419,20 @@ def find_best_stream(
     if not query:
         return None
 
+    eff_min_score = 0.48 if (relaxed and min_score == 0.62) else min_score
+
     queries = [query]
     ascii_q = lrc_parser.normalize_key(query).strip()
     if ascii_q and ascii_q.lower() != query.lower():
         queries.append(ascii_q)
+    if relaxed:
+        for rq in (
+            f"{primary_artist} {clean_title} audio".strip(),
+            f"{clean_title} {primary_artist}".strip(),
+            clean_title.strip() if len(clean_title.strip()) >= 5 else "",
+        ):
+            if rq and all(rq.lower() != q.lower() for q in queries):
+                queries.append(rq)
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
     seen_bvids: set[str] = set()
@@ -410,8 +450,9 @@ def find_best_stream(
                 full_artist=artist,
                 target_duration=duration,
                 raw_target_title=title,
+                relaxed=relaxed,
             )
-            if sc >= min_score:
+            if sc >= eff_min_score:
                 scored.append((sc, item))
         if scored:
             break
@@ -420,7 +461,7 @@ def find_best_stream(
         return None
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    for _, item in scored[:3]:
+    for _, item in scored[: (4 if relaxed else 3)]:
         found = resolve_bvid_audio(item["bvid"])
         if found:
             return found

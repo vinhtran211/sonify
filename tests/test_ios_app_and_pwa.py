@@ -76,7 +76,7 @@ class TestIOSBackendAVPlayerCompatibility(unittest.TestCase):
 
     def test_stream_info_with_ext_and_ios_avplayer_2byte_probe_single_upstream_fetch(self):
         head_chunk = b"fLaC" + bytes(i % 256 for i in range(65532))
-        tail_chunk = bytes((i * 3) % 256 for i in range(196608))
+        tail_chunk = bytes((i * 3) % 256 for i in range(327680))
         full_flac = head_chunk + tail_chunk
         open_calls = []
 

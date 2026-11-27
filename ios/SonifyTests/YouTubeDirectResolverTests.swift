@@ -104,6 +104,54 @@ final class YouTubeDirectResolverTests: XCTestCase {
             rawTargetTitle: "Alive"
         )
         XCTAssertGreaterThanOrEqual(aliveScore, 0.95)
+
+        // Pass-2 relaxed rescue: label uploader (HYBE LABELS) + Official MV (+25s) rescued in relaxed=true,
+        // while < 60s short clips remain strictly rejected!
+        let labelMV = YouTubeSearchCandidate(
+            videoId: "hybeMV123",
+            title: "Magnetic (Official MV)",
+            artist: "HYBE LABELS",
+            duration: 186
+        )
+        let strictMV = YouTubeDirectResolver.scoreCandidate(
+            labelMV,
+            cleanTitle: "Magnetic",
+            primaryArtist: "ILLIT",
+            fullArtist: "ILLIT",
+            targetDuration: 161,
+            rawTargetTitle: "Magnetic",
+            relaxed: false
+        )
+        XCTAssertLessThan(strictMV, 0.58)
+        let relaxedMV = YouTubeDirectResolver.scoreCandidate(
+            labelMV,
+            cleanTitle: "Magnetic",
+            primaryArtist: "ILLIT",
+            fullArtist: "ILLIT",
+            targetDuration: 161,
+            rawTargetTitle: "Magnetic",
+            relaxed: true
+        )
+        XCTAssertGreaterThanOrEqual(relaxedMV, 0.45)
+
+        let shortClip = YouTubeSearchCandidate(
+            videoId: "short30s",
+            title: "Magnetic",
+            artist: "ILLIT",
+            duration: 30
+        )
+        XCTAssertLessThan(
+            YouTubeDirectResolver.scoreCandidate(
+                shortClip,
+                cleanTitle: "Magnetic",
+                primaryArtist: "ILLIT",
+                fullArtist: "ILLIT",
+                targetDuration: 161,
+                rawTargetTitle: "Magnetic",
+                relaxed: true
+            ),
+            0.0
+        )
     }
 
     func testPickProgressiveItag18FormatAndRejectsLoginRequired() {
