@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Install CA certificates and curl (for Docker HEALTHCHECK)
+# Install CA certificates, curl (for Docker HEALTHCHECK), and ffmpeg (compact MP3/M4A transcoding)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install optional cloud streaming & decryption dependencies (cryptography + yt-dlp)

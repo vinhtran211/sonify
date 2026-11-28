@@ -2,6 +2,26 @@
 
 const AUDIO_CACHE_NAME = 'sonify-offline-audio-v1';
 const META_STORAGE_KEY = 'sonify_downloads_v1';
+const DL_QUALITY_KEY = 'sonify_download_quality_v1';
+
+export function getDownloadQuality() {
+  try {
+    const val = (localStorage.getItem(DL_QUALITY_KEY) || 'compact').trim().toLowerCase();
+    return val === 'lossless' ? 'lossless' : 'compact';
+  } catch {
+    return 'compact';
+  }
+}
+
+export function setDownloadQuality(q) {
+  const norm = String(q || '').trim().toLowerCase() === 'lossless' ? 'lossless' : 'compact';
+  try {
+    localStorage.setItem(DL_QUALITY_KEY, norm);
+  } catch {
+    // Ignore storage errors
+  }
+  return norm;
+}
 
 function readDownloadsMeta() {
   try {
@@ -38,13 +58,14 @@ export function isDownloaded(trackId) {
   return readDownloadsMeta().some((t) => t.id === trackId);
 }
 
-export async function downloadTrack(track) {
+export async function downloadTrack(track, qualityOverride = null) {
   if (!track || !track.id) throw new Error('Invalid track');
   if (!('caches' in window)) {
     throw new Error('Offline Cache API is not supported in this browser');
   }
 
-  const streamEndpoint = `/api/stream/${encodeURIComponent(track.id)}`;
+  const qual = qualityOverride || getDownloadQuality();
+  const streamEndpoint = `/api/stream/${encodeURIComponent(track.id)}?quality=${encodeURIComponent(qual)}`;
   const res = await fetch(streamEndpoint);
   if (!res.ok) {
     throw new Error(`Could not download audio (HTTP ${res.status})`);
@@ -83,6 +104,8 @@ export async function downloadTrack(track) {
     explicit: Boolean(track.explicit),
     downloadedAt: Date.now(),
     sizeBytes: blob.size,
+    quality: qual,
+    contentType,
   });
   writeDownloadsMeta(list);
   return true;

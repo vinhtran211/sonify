@@ -5,6 +5,21 @@ struct DirectYouTubeStream: Equatable, Sendable {
     let mimeType: String
     let headers: [String: String]
     let videoId: String
+    let isHLS: Bool
+
+    init(
+        url: URL,
+        mimeType: String,
+        headers: [String: String],
+        videoId: String,
+        isHLS: Bool = false
+    ) {
+        self.url = url
+        self.mimeType = mimeType
+        self.headers = headers
+        self.videoId = videoId
+        self.isHLS = isHLS
+    }
 }
 
 struct YouTubeSearchCandidate: Equatable, Sendable {
@@ -74,8 +89,8 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         cache[trackId] = CacheEntry(stream: stream, resolvedAt: Date())
     }
 
-    func resolveFullTrack(for track: Track) async -> DirectYouTubeStream? {
-        if let cached = cachedStream(for: track.id) {
+    func resolveFullTrack(for track: Track, allowHLS: Bool = true) async -> DirectYouTubeStream? {
+        if let cached = cachedStream(for: track.id), (allowHLS || !cached.isHLS) {
             return cached
         }
 
@@ -106,7 +121,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         var triedVideoIds = Set<String>()
         for (_, cand) in strictScored.prefix(2) {
             triedVideoIds.insert(cand.videoId)
-            if let resolved = await resolveVideoStream(videoId: cand.videoId) {
+            if let resolved = await resolveVideoStream(videoId: cand.videoId, allowHLS: allowHLS) {
                 storeCache(resolved, for: track.id)
                 return resolved
             }
@@ -141,7 +156,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
             .sorted { $0.0 > $1.0 }
 
         for (_, cand) in relaxedScored.prefix(3) {
-            if let resolved = await resolveVideoStream(videoId: cand.videoId) {
+            if let resolved = await resolveVideoStream(videoId: cand.videoId, allowHLS: allowHLS) {
                 storeCache(resolved, for: track.id)
                 return resolved
             }
@@ -190,12 +205,13 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         }
     }
 
-    private func resolveVideoStream(videoId: String) async -> DirectYouTubeStream? {
+    private func resolveVideoStream(videoId: String, allowHLS: Bool = true) async -> DirectYouTubeStream? {
         struct ClientSpec {
             let clientBody: [String: Any]
             let userAgent: String
             let clientNameId: String
             let clientVersion: String
+            let supportsHLS: Bool
         }
 
         let clients: [ClientSpec] = [
@@ -211,7 +227,8 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                 ],
                 userAgent: "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
                 clientNameId: "3",
-                clientVersion: "20.10.38"
+                clientVersion: "20.10.38",
+                supportsHLS: false
             ),
             ClientSpec(
                 clientBody: [
@@ -224,7 +241,8 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                 ],
                 userAgent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
                 clientNameId: "5",
-                clientVersion: "20.10.4"
+                clientVersion: "20.10.4",
+                supportsHLS: true
             ),
         ]
 
@@ -250,17 +268,44 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                 guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                     continue
                 }
-                guard let dict = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-                      let picked = Self.pickProgressiveFormat(from: dict) else {
+                guard let dict = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] else {
                     continue
                 }
                 let hdrs = ["User-Agent": spec.userAgent]
-                if await probeStreamURL(picked.url, headers: hdrs) {
+
+                // 1. Prefer pure audio-only M4A (itag=140, ~3.4 MB) when 2-step head+tail probe passes
+                if let adaptive = Self.pickAdaptiveAudioFormat(from: dict),
+                   await probeStreamURL(adaptive.url, headers: hdrs, verifyTail: true) {
+                    return DirectYouTubeStream(
+                        url: adaptive.url,
+                        mimeType: adaptive.mimeType,
+                        headers: hdrs,
+                        videoId: videoId,
+                        isHLS: false
+                    )
+                }
+
+                // 2. Fall back to progressive itag=18 (PO-token exempt, ~2.3 MB on YTM Art Tracks)
+                if let picked = Self.pickProgressiveFormat(from: dict),
+                   await probeStreamURL(picked.url, headers: hdrs, verifyTail: false) {
                     return DirectYouTubeStream(
                         url: picked.url,
                         mimeType: picked.mimeType,
                         headers: hdrs,
-                        videoId: videoId
+                        videoId: videoId,
+                        isHLS: false
+                    )
+                }
+
+                // 3. Fall back to native Apple HLS manifest on IOS client for smooth AVPlayer streaming
+                if allowHLS && spec.supportsHLS,
+                   let hlsURL = Self.pickHLSManifestURL(from: dict) {
+                    return DirectYouTubeStream(
+                        url: hlsURL,
+                        mimeType: "application/vnd.apple.mpegurl",
+                        headers: hdrs,
+                        videoId: videoId,
+                        isHLS: true
                     )
                 }
             } catch {
@@ -270,7 +315,7 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         return nil
     }
 
-    private func probeStreamURL(_ url: URL, headers: [String: String]) async -> Bool {
+    private func probeStreamURL(_ url: URL, headers: [String: String], verifyTail: Bool = false) async -> Bool {
         var req = URLRequest(url: url, timeoutInterval: 5.0)
         req.httpMethod = "GET"
         req.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
@@ -284,8 +329,24 @@ final class YouTubeDirectResolver: @unchecked Sendable {
                   !data.isEmpty else {
                 return false
             }
-            if let total = Self.parseTotalBytes(from: http), total < Self.minProbeBytes {
+            let total = Self.parseTotalBytes(from: http)
+            if let total, total < Self.minProbeBytes {
                 return false
+            }
+            // 2-step tail Range probe blocks GVS 1 MiB PO-token 403 traps on adaptive audio formats
+            if verifyTail, let total, total > 1_200_000 {
+                var tailReq = URLRequest(url: url, timeoutInterval: 5.0)
+                tailReq.httpMethod = "GET"
+                tailReq.setValue("bytes=\(total - 1024)-\(total - 1)", forHTTPHeaderField: "Range")
+                for (k, v) in headers {
+                    tailReq.setValue(v, forHTTPHeaderField: k)
+                }
+                let (tailData, tailResp) = try await session.data(for: tailReq)
+                guard let tailHTTP = tailResp as? HTTPURLResponse,
+                      tailHTTP.statusCode == 200 || tailHTTP.statusCode == 206,
+                      !tailData.isEmpty else {
+                    return false
+                }
             }
             return true
         } catch {
@@ -598,6 +659,53 @@ final class YouTubeDirectResolver: @unchecked Sendable {
 
         let noisePen = isDerivative ? 0.35 : (isLiveAcoustic ? 0.12 : 0.0)
         return 0.55 * titleSim + 0.30 * artistSim + 0.15 * durProx - noisePen
+    }
+
+    static func pickAdaptiveAudioFormat(from playerJSON: [String: Any]) -> (url: URL, mimeType: String)? {
+        guard let playability = playerJSON["playabilityStatus"] as? [String: Any],
+              (playability["status"] as? String)?.uppercased() == "OK",
+              let streamingData = playerJSON["streamingData"] as? [String: Any],
+              let formats = streamingData["adaptiveFormats"] as? [[String: Any]] else {
+            return nil
+        }
+
+        // 1. Prefer itag 140 (128 kbps AAC audio/mp4, ~3.4 MB, universal AVPlayer support)
+        for fmt in formats {
+            let itag = fmt["itag"] as? Int ?? 0
+            if itag == 140, let rawURL = fmt["url"] as? String, let u = URL(string: rawURL) {
+                let mime = (fmt["mimeType"] as? String)?.split(separator: ";").first.map(String.init) ?? "audio/mp4"
+                return (u, mime)
+            }
+        }
+
+        // 2. Fallback to highest-bitrate audio/mp4 (mp4a) adaptive format
+        var best: (bitrate: Int, url: URL, mime: String)?
+        for fmt in formats {
+            guard let rawURL = fmt["url"] as? String, let u = URL(string: rawURL) else { continue }
+            let rawMime = (fmt["mimeType"] as? String ?? "").lowercased()
+            guard rawMime.hasPrefix("audio/mp4") else { continue }
+            let br = fmt["bitrate"] as? Int ?? fmt["averageBitrate"] as? Int ?? 0
+            let mime = rawMime.split(separator: ";").first.map(String.init) ?? "audio/mp4"
+            if best == nil || br > best!.bitrate {
+                best = (br, u, mime)
+            }
+        }
+        if let best {
+            return (best.url, best.mime)
+        }
+        return nil
+    }
+
+    static func pickHLSManifestURL(from playerJSON: [String: Any]) -> URL? {
+        guard let playability = playerJSON["playabilityStatus"] as? [String: Any],
+              (playability["status"] as? String)?.uppercased() == "OK",
+              let streamingData = playerJSON["streamingData"] as? [String: Any],
+              let raw = streamingData["hlsManifestUrl"] as? String,
+              raw.lowercased().hasPrefix("https://"),
+              let u = URL(string: raw) else {
+            return nil
+        }
+        return u
     }
 
     static func pickProgressiveFormat(from playerJSON: [String: Any]) -> (url: URL, mimeType: String)? {

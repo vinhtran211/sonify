@@ -265,6 +265,10 @@ export function updatePlayerBar() {
         const srcLabel =
           st.streamSource === 'monochrome'
             ? 'Lossless FLAC'
+            : String(st.streamSource || '').endsWith('-mp3')
+            ? 'Compact MP3'
+            : String(st.streamSource || '').endsWith('-compact')
+            ? 'Compact M4A'
             : st.streamSource || '';
         badgeEl.textContent = `Full Track${srcLabel ? ` • ${srcLabel}` : ''}`;
         badgeEl.className = 'stream-badge full';

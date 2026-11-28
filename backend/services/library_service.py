@@ -428,8 +428,12 @@ class LibraryService:
                 raise LibraryError("INVALID_SETTING", "playbackRate must be a number in [0.5, 2.0]", 400)
         if "audioQuality" in body:
             qual = str(body["audioQuality"]).strip().lower()
-            if qual not in ("auto", "lossless", "fast"):
-                raise LibraryError("INVALID_SETTING", "audioQuality must be 'auto', 'lossless', or 'fast'", 400)
+            if qual not in ("auto", "compact", "lossless", "fast"):
+                raise LibraryError(
+                    "INVALID_SETTING",
+                    "audioQuality must be 'auto', 'compact', 'lossless', or 'fast'",
+                    400,
+                )
             cleaned["audioQuality"] = qual
         if "eqPreset" in body:
             preset = str(body["eqPreset"] or "flat").strip().lower()[:40]

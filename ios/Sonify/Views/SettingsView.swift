@@ -22,6 +22,11 @@ struct SettingsView: View {
                         Toggle("Offline Mode", isOn: $offlineDownloads.offlineModeEnabled)
                             .tint(SonifyTheme.accentGreen)
 
+                        Picker("Download Quality", selection: $offlineDownloads.downloadQuality) {
+                            Text("Light (~3–4 MB)").tag("compact")
+                            Text("Lossless FLAC (~25–35 MB)").tag("lossless")
+                        }
+
                         HStack {
                             Text("Downloaded Songs")
                             Spacer()
@@ -69,8 +74,17 @@ struct SettingsView: View {
                             set: { val in Task { await library.updateAudioSettings(audioQuality: val) } }
                         )) {
                             Text("Auto").tag("auto")
+                            Text("Light / Compact (~3–4 MB)").tag("compact")
                             Text("Lossless FLAC").tag("lossless")
                             Text("Fast").tag("fast")
+                        }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Toggle("YouTube Direct Smooth Audio", isOn: $player.preferYouTubeDirect)
+                                .tint(SonifyTheme.accentGreen)
+                            Text("Stream ad-free YouTube audio directly on your iPhone residential connection (~2.5–4 MB) with instant backend fallback.")
+                                .font(.caption2)
+                                .foregroundColor(SonifyTheme.textSecondary)
                         }
 
                         Picker("Playback Speed", selection: Binding(

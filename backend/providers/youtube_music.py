@@ -469,7 +469,7 @@ def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str
 
             if vcodec == "none":
                 mime = "audio/mp4" if ext in ("m4a", "mp4") else ("audio/webm" if ext == "webm" else "audio/mpeg")
-                pref = 2 if mime == "audio/mp4" else 1
+                pref = 3 if mime == "audio/mp4" else (2 if mime == "audio/mpeg" else 1)
                 audio_only.append((pref, abr, url, mime, hdrs))
             elif ext == "mp4":
                 fid = str(fmt.get("format_id") or "")
@@ -584,17 +584,6 @@ def _resolve_via_innertube_player(video_id: str) -> Optional[Tuple[str, str, Dic
             },
             "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
             {"X-YouTube-Client-Name": "5", "X-YouTube-Client-Version": "20.10.4"},
-        ),
-        (
-            {
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.60.19",
-                "androidSdkVersion": 32,
-                "hl": "en",
-                "gl": "US",
-            },
-            "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-            {"X-YouTube-Client-Name": "28", "X-YouTube-Client-Version": "1.60.19"},
         ),
     ]
 

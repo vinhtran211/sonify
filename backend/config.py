@@ -128,8 +128,15 @@ DEFAULT_SETTINGS = {
 }
 
 
+VALID_AUDIO_QUALITIES = ("auto", "compact", "lossless", "fast")
+
+
 def has_yt_dlp() -> bool:
     return shutil.which("yt-dlp") is not None
+
+
+def has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
 
 
 # Optional iOS distribution / App Store / TestFlight / OTA env helpers

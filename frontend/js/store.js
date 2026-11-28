@@ -127,7 +127,7 @@ const state = {
   autoplay: initialPrefs.autoplay !== undefined ? Boolean(initialPrefs.autoplay) : true,
   crossfade: typeof initialPrefs.crossfade === 'number' ? initialPrefs.crossfade : 0,
   playbackRate: typeof initialPrefs.playbackRate === 'number' ? initialPrefs.playbackRate : 1.0,
-  audioQuality: ['auto', 'lossless', 'fast'].includes(initialPrefs.audioQuality)
+  audioQuality: ['auto', 'compact', 'lossless', 'fast'].includes(initialPrefs.audioQuality)
     ? initialPrefs.audioQuality
     : 'auto',
   eqPreset: typeof initialPrefs.eqPreset === 'string' ? initialPrefs.eqPreset : 'flat',
@@ -383,7 +383,7 @@ export async function hydrateFromBackend() {
       if (typeof localPrefs.autoplay === 'boolean') restored.autoplay = localPrefs.autoplay;
       if (typeof localPrefs.crossfade === 'number') restored.crossfade = localPrefs.crossfade;
       if (typeof localPrefs.playbackRate === 'number') restored.playbackRate = localPrefs.playbackRate;
-      if (['auto', 'lossless', 'fast'].includes(localPrefs.audioQuality)) restored.audioQuality = localPrefs.audioQuality;
+      if (['auto', 'compact', 'lossless', 'fast'].includes(localPrefs.audioQuality)) restored.audioQuality = localPrefs.audioQuality;
       if (typeof localPrefs.eqPreset === 'string') restored.eqPreset = localPrefs.eqPreset;
       if (Array.isArray(localPrefs.eqBands) && localPrefs.eqBands.length === 5) restored.eqBands = localPrefs.eqBands;
       Object.assign(patch, restored);
@@ -399,7 +399,7 @@ export async function hydrateFromBackend() {
       if (typeof s.autoplay === 'boolean') patch.autoplay = s.autoplay;
       if (typeof s.crossfade === 'number') patch.crossfade = Math.max(0, Math.min(12, s.crossfade));
       if (typeof s.playbackRate === 'number') patch.playbackRate = Math.max(0.5, Math.min(2.0, s.playbackRate));
-      if (['auto', 'lossless', 'fast'].includes(s.audioQuality)) patch.audioQuality = s.audioQuality;
+      if (['auto', 'compact', 'lossless', 'fast'].includes(s.audioQuality)) patch.audioQuality = s.audioQuality;
       if (typeof s.eqPreset === 'string') patch.eqPreset = s.eqPreset;
       if (Array.isArray(s.eqBands) && s.eqBands.length === 5) {
         patch.eqBands = s.eqBands.map((v) => Math.max(-12, Math.min(12, Number(v) || 0)));
@@ -640,7 +640,7 @@ export function updateAudioSettings(partial) {
     patch.playbackRate = v;
     serverPatch.playbackRate = v;
   }
-  if (['auto', 'lossless', 'fast'].includes(partial.audioQuality)) {
+  if (['auto', 'compact', 'lossless', 'fast'].includes(partial.audioQuality)) {
     patch.audioQuality = partial.audioQuality;
     serverPatch.audioQuality = partial.audioQuality;
   }

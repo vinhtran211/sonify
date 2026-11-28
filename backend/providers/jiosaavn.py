@@ -217,13 +217,27 @@ def get_song_details(raw_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def resolve_candidate_urls(extra: Dict[str, Any]) -> List[str]:
+def _reorder_compact_candidates(urls: List[str]) -> List[str]:
+    """Prefer ~160kbps (~3.5 MB) before 320kbps (~8 MB), keeping 96kbps as last resort."""
+    def _rank(u: str) -> int:
+        low = u.lower()
+        if "_160." in low or "160kbps" in low:
+            return 3
+        if "_128." in low or "128kbps" in low:
+            return 2
+        if "_320." in low or "320kbps" in low:
+            return 1
+        return 0
+    return sorted(urls, key=_rank, reverse=True)
+
+
+def resolve_candidate_urls(extra: Dict[str, Any], prefer_compact: bool = False) -> List[str]:
     urls: List[str] = []
     enc = extra.get("encrypted_media_url")
     if enc:
         try:
             decrypted = crypto_des.decrypt_media_url(enc)
-            prefer_320 = bool(extra.get("320kbps", True))
+            prefer_320 = False if prefer_compact else bool(extra.get("320kbps", True))
             for cand in crypto_des.upgrade_bitrate_candidates(decrypted, prefer_320=prefer_320):
                 if cand not in urls:
                     urls.append(cand)
@@ -232,6 +246,8 @@ def resolve_candidate_urls(extra: Dict[str, Any]) -> List[str]:
     for u in extra.get("direct_urls") or []:
         if u and u not in urls:
             urls.append(u)
+    if prefer_compact and len(urls) > 1:
+        urls = _reorder_compact_candidates(urls)
     return urls
 
 
@@ -285,6 +301,7 @@ def find_best_stream(
     duration: int = 0,
     min_score: float = 0.72,
     relaxed: bool = False,
+    prefer_compact: bool = False,
 ) -> Optional[Tuple[str, str]]:
     clean_title = lrc_parser.clean_track_title(title)
     primary_artist = lrc_parser.extract_primary_artist(artist)
@@ -405,7 +422,7 @@ def find_best_stream(
 
     scored.sort(key=lambda item: item[0], reverse=True)
     for _, cand in scored[:3]:
-        urls = resolve_candidate_urls(cand.get("_extra") or {})
+        urls = resolve_candidate_urls(cand.get("_extra") or {}, prefer_compact=prefer_compact)
         found = probe_best_url(urls)
         if found:
             return found

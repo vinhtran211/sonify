@@ -227,4 +227,42 @@ final class YouTubeDirectResolverTests: XCTestCase {
         ]
         XCTAssertNil(YouTubeDirectResolver.pickProgressiveFormat(from: blockedPlayer))
     }
+
+    func testPickAdaptiveAudioItag140AndHLSManifest() {
+        let adaptivePlayer: [String: Any] = [
+            "playabilityStatus": ["status": "OK"],
+            "streamingData": [
+                "adaptiveFormats": [
+                    [
+                        "itag": 251,
+                        "url": "https://rr1---sn-example.googlevideo.com/videoplayback?itag=251",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "bitrate": 160000,
+                    ],
+                    [
+                        "itag": 140,
+                        "url": "https://rr1---sn-example.googlevideo.com/videoplayback?itag=140",
+                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                        "bitrate": 128000,
+                    ],
+                ],
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_variant/example.m3u8",
+            ],
+        ]
+        let adaptive = YouTubeDirectResolver.pickAdaptiveAudioFormat(from: adaptivePlayer)
+        XCTAssertEqual(adaptive?.url.absoluteString, "https://rr1---sn-example.googlevideo.com/videoplayback?itag=140")
+        XCTAssertEqual(adaptive?.mimeType, "audio/mp4")
+
+        let hls = YouTubeDirectResolver.pickHLSManifestURL(from: adaptivePlayer)
+        XCTAssertEqual(hls?.absoluteString, "https://manifest.googlevideo.com/api/manifest/hls_variant/example.m3u8")
+
+        let blocked: [String: Any] = [
+            "playabilityStatus": ["status": "LOGIN_REQUIRED"],
+            "streamingData": [
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_variant/blocked.m3u8",
+            ],
+        ]
+        XCTAssertNil(YouTubeDirectResolver.pickAdaptiveAudioFormat(from: blocked))
+        XCTAssertNil(YouTubeDirectResolver.pickHLSManifestURL(from: blocked))
+    }
 }

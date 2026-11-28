@@ -16,6 +16,7 @@ struct HealthResponse: Decodable, Equatable {
     let dbReady: Bool
     let ytDlpAvailable: Bool
     let ytDlpConfigured: Bool?
+    let ffmpegAvailable: Bool?
     let cloudMode: Bool?
     let renderRegion: String?
     let offlineMode: Bool
@@ -70,6 +71,8 @@ struct StreamInfoResponse: Decodable, Equatable {
     let directUrl: String?
     let diagnostics: [StreamDiagnostic]?
     let cloudMode: Bool?
+    let compact: Bool?
+    let transcoded: Bool?
 
     init(
         trackId: String,
@@ -82,7 +85,9 @@ struct StreamInfoResponse: Decodable, Equatable {
         hlsUrl: String? = nil,
         directUrl: String? = nil,
         diagnostics: [StreamDiagnostic]? = nil,
-        cloudMode: Bool? = nil
+        cloudMode: Bool? = nil,
+        compact: Bool? = nil,
+        transcoded: Bool? = nil
     ) {
         self.trackId = trackId
         self.streamUrl = streamUrl
@@ -95,6 +100,8 @@ struct StreamInfoResponse: Decodable, Equatable {
         self.directUrl = directUrl
         self.diagnostics = diagnostics
         self.cloudMode = cloudMode
+        self.compact = compact
+        self.transcoded = transcoded
     }
 
     var isFullTrack: Bool {
@@ -114,10 +121,19 @@ struct StreamInfoResponse: Decodable, Equatable {
             if contentType.lowercased().contains("flac") {
                 return "Offline • FLAC"
             }
-            return "Offline • Downloaded"
+            if contentType.lowercased().contains("mpeg") {
+                return "Offline • MP3"
+            }
+            return "Offline • Light"
         }
         if isPreview {
             return "30s Preview"
+        }
+        if streamSource.hasSuffix("-mp3") {
+            return "Compact MP3"
+        }
+        if streamSource.hasSuffix("-compact") {
+            return "Compact M4A"
         }
         if contentType.lowercased().contains("flac") || streamSource == "monochrome" {
             return "Lossless FLAC"

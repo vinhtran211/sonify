@@ -135,6 +135,8 @@ struct PlaybackQueueEngine: Equatable {
 
 @MainActor
 final class AudioPlayerService: ObservableObject {
+    private static let preferYouTubeDirectDefaultsKey = "sonify.preferYouTubeDirect"
+
     @Published private(set) var currentTrack: Track?
     @Published private(set) var streamInfo: StreamInfoResponse?
     @Published private(set) var isPlaying: Bool = false
@@ -144,6 +146,11 @@ final class AudioPlayerService: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var queueEngine = PlaybackQueueEngine()
     @Published var showNowPlayingSheet: Bool = false
+    @Published var preferYouTubeDirect: Bool {
+        didSet {
+            UserDefaults.standard.set(preferYouTubeDirect, forKey: Self.preferYouTubeDirectDefaultsKey)
+        }
+    }
     @Published private(set) var playbackRate: Float = 1.0
     @Published private(set) var sleepTimerMode: SleepTimerMode = .off
     @Published private(set) var sleepTimerRemainingSec: Int = 0
@@ -185,6 +192,7 @@ final class AudioPlayerService: ObservableObject {
 
     init(api: APIClient) {
         self.api = api
+        self.preferYouTubeDirect = UserDefaults.standard.bool(forKey: Self.preferYouTubeDirectDefaultsKey)
         configureAudioSession()
         setupRemoteCommandCenter()
         setupObservers()
@@ -571,6 +579,7 @@ final class AudioPlayerService: ObservableObject {
         }
 
         let qual = libraryStore?.settings.audioQuality ?? "auto"
+        let useYTFirst = self.preferYouTubeDirect
 
         loadTask = Task { [weak self] in
             guard let self else { return }
@@ -579,57 +588,77 @@ final class AudioPlayerService: ObservableObject {
                 var customHeaders: [String: String] = [:]
                 var customRoute: PlaybackRoute?
 
-                do {
-                    if let cached = self.cachedPrefetchInfo(for: track.id) {
-                        info = cached
-                    } else {
-                        let fetched = try await self.api.getStreamInfo(trackId: track.id, quality: qual)
-                        self.storePrefetchInfo(fetched, for: track.id)
-                        info = fetched
-                    }
+                if useYTFirst, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
                     guard !Task.isCancelled, seq == self.playbackSeq else { return }
-
-                    // Residential-IP Native iOS Full-Track Fallback when cloud backend only returned a 30s preview
-                    if info.isPreview, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
-                        guard !Task.isCancelled, seq == self.playbackSeq else { return }
-                        self.didAttemptYouTubeRescue = true
-                        info = StreamInfoResponse(
-                            trackId: track.id,
-                            streamUrl: yt.url.absoluteString,
-                            streamMode: "full",
-                            streamSource: "youtube-direct",
-                            contentType: yt.mimeType,
-                            adFree: true,
-                            directUrl: yt.url.absoluteString
-                        )
-                        customRoute = .direct(yt.url)
-                        customHeaders = yt.headers
-                    }
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    // Residential-IP fallback if backend /info failed
                     self.didAttemptYouTubeRescue = true
-                    if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                    info = StreamInfoResponse(
+                        trackId: track.id,
+                        streamUrl: yt.url.absoluteString,
+                        streamMode: "full",
+                        streamSource: "youtube-direct",
+                        contentType: yt.mimeType,
+                        adFree: true,
+                        hlsUrl: yt.isHLS ? yt.url.absoluteString : nil,
+                        directUrl: yt.isHLS ? nil : yt.url.absoluteString,
+                        compact: true
+                    )
+                    customRoute = yt.isHLS ? .hls(yt.url) : .direct(yt.url)
+                    customHeaders = yt.headers
+                } else {
+                    do {
+                        if let cached = self.cachedPrefetchInfo(for: track.id) {
+                            info = cached
+                        } else {
+                            let fetched = try await self.api.getStreamInfo(trackId: track.id, quality: qual)
+                            self.storePrefetchInfo(fetched, for: track.id)
+                            info = fetched
+                        }
                         guard !Task.isCancelled, seq == self.playbackSeq else { return }
-                        info = StreamInfoResponse(
-                            trackId: track.id,
-                            streamUrl: yt.url.absoluteString,
-                            streamMode: "full",
-                            streamSource: "youtube-direct",
-                            contentType: yt.mimeType,
-                            adFree: true,
-                            directUrl: yt.url.absoluteString
-                        )
-                        customRoute = .direct(yt.url)
-                        customHeaders = yt.headers
-                    } else {
-                        throw error
+
+                        // Residential-IP Native iOS Full-Track Fallback when cloud backend only returned a 30s preview
+                        if info.isPreview, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                            guard !Task.isCancelled, seq == self.playbackSeq else { return }
+                            self.didAttemptYouTubeRescue = true
+                            info = StreamInfoResponse(
+                                trackId: track.id,
+                                streamUrl: yt.url.absoluteString,
+                                streamMode: "full",
+                                streamSource: "youtube-direct",
+                                contentType: yt.mimeType,
+                                adFree: true,
+                                hlsUrl: yt.isHLS ? yt.url.absoluteString : nil,
+                                directUrl: yt.isHLS ? nil : yt.url.absoluteString
+                            )
+                            customRoute = yt.isHLS ? .hls(yt.url) : .direct(yt.url)
+                            customHeaders = yt.headers
+                        }
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        // Residential-IP fallback if backend /info failed
+                        self.didAttemptYouTubeRescue = true
+                        if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                            guard !Task.isCancelled, seq == self.playbackSeq else { return }
+                            info = StreamInfoResponse(
+                                trackId: track.id,
+                                streamUrl: yt.url.absoluteString,
+                                streamMode: "full",
+                                streamSource: "youtube-direct",
+                                contentType: yt.mimeType,
+                                adFree: true,
+                                hlsUrl: yt.isHLS ? yt.url.absoluteString : nil,
+                                directUrl: yt.isHLS ? nil : yt.url.absoluteString
+                            )
+                            customRoute = yt.isHLS ? .hls(yt.url) : .direct(yt.url)
+                            customHeaders = yt.headers
+                        } else {
+                            throw error
+                        }
                     }
                 }
                 guard !Task.isCancelled, seq == self.playbackSeq else { return }
 
-                let proxyURL = self.api.streamURL(for: info)
+                let proxyURL = self.api.streamURL(for: info, quality: qual)
                 guard let route = customRoute ?? info.preferredPlaybackRoute(proxyURL: proxyURL) else {
                     self.isLoading = false
                     self.errorMessage = "Invalid audio stream URL"
@@ -685,7 +714,7 @@ final class AudioPlayerService: ObservableObject {
                        !route.isLocal,
                        let info = self.streamInfo,
                        info.streamSource != "youtube-direct",
-                       let proxyURL = self.api.streamURL(for: info) {
+                       let proxyURL = self.api.streamURL(for: info, quality: self.libraryStore?.settings.audioQuality ?? "auto") {
                         self.didFallbackToProxy = true
                         let proxyRoute = PlaybackRoute.proxy(proxyURL)
                         self.currentRoute = proxyRoute
@@ -721,9 +750,10 @@ final class AudioPlayerService: ObservableObject {
                                     streamSource: "youtube-direct",
                                     contentType: yt.mimeType,
                                     adFree: true,
-                                    directUrl: yt.url.absoluteString
+                                    hlsUrl: yt.isHLS ? yt.url.absoluteString : nil,
+                                    directUrl: yt.isHLS ? nil : yt.url.absoluteString
                                 )
-                                let ytRoute = PlaybackRoute.direct(yt.url)
+                                let ytRoute: PlaybackRoute = yt.isHLS ? .hls(yt.url) : .direct(yt.url)
                                 self.streamInfo = ytInfo
                                 self.currentRoute = ytRoute
                                 let rescuedItem = self.makePlayerItem(
@@ -752,7 +782,7 @@ final class AudioPlayerService: ObservableObject {
                                 ) {
                                     guard seq == self.playbackSeq else { return }
                                     self.storePrefetchInfo(fresh, for: track.id)
-                                    let pURL = self.api.streamURL(for: fresh)
+                                    let pURL = self.api.streamURL(for: fresh, quality: qual)
                                     if let freshRoute = fresh.preferredPlaybackRoute(proxyURL: pURL) {
                                         self.streamInfo = fresh
                                         self.currentRoute = freshRoute

@@ -413,6 +413,7 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         "dbReady": self.server.db.is_ready(),
                         "ytDlpAvailable": config.has_yt_dlp(),
                         "ytDlpConfigured": youtube_music.has_cloud_youtube_credentials(),
+                        "ffmpegAvailable": config.has_ffmpeg(),
                         "cloudMode": cloud_mode,
                         "renderRegion": os.environ.get("RENDER_REGION") or ("cloud" if cloud_mode else "local"),
                         "offlineMode": http_client.is_offline_mode(),
@@ -559,23 +560,33 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     )
                     debug = raw_debug and (config.is_debug_allowed() or valid_dbg_token)
                     quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
+                    fmt = self._qparam(qs, "format", "").strip().lower()
                     prewarm = self._qparam(qs, "prewarm", "0").strip().lower() in ("1", "true", "yes")
                     refresh = self._qparam(qs, "refresh", "0").strip().lower() in ("1", "true", "yes")
+                    info_kwargs: Dict[str, Any] = {
+                        "debug": debug,
+                        "quality": quality,
+                        "prewarm": prewarm,
+                        "force_refresh": refresh,
+                    }
+                    if fmt:
+                        info_kwargs["target_format"] = fmt
                     self._send_json(
-                        self.server.stream.get_stream_info(
-                            track_id,
-                            debug=debug,
-                            quality=quality,
-                            prewarm=prewarm,
-                            force_refresh=refresh,
-                        )
+                        self.server.stream.get_stream_info(track_id, **info_kwargs)
                     )
                     return
                 track_id = strip_known_stream_extension(urllib.parse.unquote(rest).strip("/"))
                 if not track_id:
                     self._send_error_json(400, "INVALID_TRACK", "Missing trackId")
                     return
-                self.server.stream.stream_to_handler(self, track_id, head_only=head_only)
+                quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
+                fmt = self._qparam(qs, "format", "").strip().lower()
+                stream_kwargs: Dict[str, Any] = {"head_only": head_only}
+                if quality != "auto":
+                    stream_kwargs["quality"] = quality
+                if fmt:
+                    stream_kwargs["target_format"] = fmt
+                self.server.stream.stream_to_handler(self, track_id, **stream_kwargs)
                 return
 
             # /api/lyrics

@@ -113,7 +113,7 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         value.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed) ?? value
     }
 
-    func streamURL(for info: StreamInfoResponse) -> URL? {
+    func streamURL(for info: StreamInfoResponse, quality: String? = nil, format: String? = nil) -> URL? {
         let rawRelative = info.resolvedRelativeStreamPath()
         let prefix = "/api/stream/"
         let encodedPath: String
@@ -123,7 +123,21 @@ final class APIClient: ObservableObject, @unchecked Sendable {
         } else {
             encodedPath = rawRelative
         }
-        return URL(string: baseURLString + encodedPath)
+        var queryItems: [URLQueryItem] = []
+        if let quality, !quality.isEmpty, quality != "auto" {
+            queryItems.append(URLQueryItem(name: "quality", value: quality))
+        }
+        if let format, !format.isEmpty {
+            queryItems.append(URLQueryItem(name: "format", value: format))
+        }
+        if queryItems.isEmpty {
+            return URL(string: baseURLString + encodedPath)
+        }
+        guard var comps = URLComponents(string: baseURLString + encodedPath) else {
+            return URL(string: baseURLString + encodedPath)
+        }
+        comps.queryItems = (comps.queryItems ?? []) + queryItems
+        return comps.url
     }
 
     // MARK: - Core Request Engine

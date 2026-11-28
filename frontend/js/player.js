@@ -658,7 +658,8 @@ async function startTrackPlayback(track, withFadeIn = false) {
     isLoading: true,
   });
 
-  const proxyUrl = `/api/stream/${encodeURIComponent(streamTrackId)}?s=${seq}`;
+  const qualParam = quality && quality !== 'auto' ? `&quality=${encodeURIComponent(quality)}` : '';
+  const proxyUrl = `/api/stream/${encodeURIComponent(streamTrackId)}?s=${seq}${qualParam}`;
   activeProxyUrl = proxyUrl;
 
   // Prefer IP-agnostic edge CDN unless Web Audio EQ is attached/non-flat (same-origin proxy required for CORS-safe Web Audio)

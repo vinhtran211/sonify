@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 
@@ -190,6 +191,7 @@ private final class DownloadDelegateBridge: NSObject, URLSessionDownloadDelegate
 @MainActor
 final class OfflineDownloadManager: ObservableObject {
     private static let offlineModeDefaultsKey = "sonify.offlineModeEnabled"
+    private static let downloadQualityDefaultsKey = "sonify.downloadQuality"
 
     @Published private(set) var downloadedTracks: [DownloadedTrackRecord] = []
     @Published private(set) var downloadedIds: Set<String> = []
@@ -198,6 +200,15 @@ final class OfflineDownloadManager: ObservableObject {
     @Published var offlineModeEnabled: Bool {
         didSet {
             userDefaults.set(offlineModeEnabled, forKey: Self.offlineModeDefaultsKey)
+        }
+    }
+    @Published var downloadQuality: String {
+        didSet {
+            let norm = downloadQuality == "lossless" ? "lossless" : "compact"
+            if downloadQuality != norm {
+                downloadQuality = norm
+            }
+            userDefaults.set(norm, forKey: Self.downloadQualityDefaultsKey)
         }
     }
 
@@ -220,6 +231,8 @@ final class OfflineDownloadManager: ObservableObject {
         self.userDefaults = userDefaults
         self.fileManager = fileManager
         self.offlineModeEnabled = userDefaults.bool(forKey: Self.offlineModeDefaultsKey)
+        let savedQuality = userDefaults.string(forKey: Self.downloadQualityDefaultsKey) ?? "compact"
+        self.downloadQuality = savedQuality == "lossless" ? "lossless" : "compact"
 
         let rootDir: URL
         if let baseDirectory {
@@ -295,9 +308,11 @@ final class OfflineDownloadManager: ObservableObject {
     // MARK: - Download Operations
 
     @discardableResult
-    func downloadTrack(_ track: Track, api: APIClient, quality: String = "auto") async -> Bool {
+    func downloadTrack(_ track: Track, api: APIClient, quality: String? = nil) async -> Bool {
         if isDownloaded(track.id) { return true }
         if isDownloading(track.id) { return false }
+
+        let effectiveQuality = (quality == nil || quality == "auto") ? downloadQuality : (quality ?? downloadQuality)
 
         ensureDirectoriesExist()
         activeDownloads[track.id] = 0.02
@@ -316,18 +331,18 @@ final class OfflineDownloadManager: ObservableObject {
             var downloadHeaders: [String: String] = [:]
             var usedYouTubeDirect = false
 
-            let backendInfo = try? await api.getStreamInfo(trackId: track.id, quality: quality)
-            if let info = backendInfo, !info.isPreview, let proxyURL = api.streamURL(for: info) {
+            let backendInfo = try? await api.getStreamInfo(trackId: track.id, quality: effectiveQuality)
+            if let info = backendInfo, !info.isPreview, let proxyURL = api.streamURL(for: info, quality: effectiveQuality) {
                 downloadURL = proxyURL
                 resolvedContentType = info.contentType
                 resolvedSource = info.streamSource
-            } else if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+            } else if let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track), !yt.isHLS {
                 downloadURL = yt.url
                 downloadHeaders = yt.headers
                 resolvedContentType = yt.mimeType
                 resolvedSource = "youtube-direct"
                 usedYouTubeDirect = true
-            } else if let info = backendInfo, let proxyURL = api.streamURL(for: info) {
+            } else if let info = backendInfo, let proxyURL = api.streamURL(for: info, quality: effectiveQuality) {
                 downloadURL = proxyURL
                 resolvedContentType = info.contentType
                 resolvedSource = info.streamSource
@@ -369,7 +384,7 @@ final class OfflineDownloadManager: ObservableObject {
                 audioBytes = downloaded
             } catch {
                 // If backend proxy download failed (e.g. HTTP 502/timeout), fall back to YouTubeDirectResolver!
-                if !usedYouTubeDirect, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track) {
+                if !usedYouTubeDirect, let yt = await YouTubeDirectResolver.shared.resolveFullTrack(for: track, allowHLS: false) {
                     try? fileManager.removeItem(at: audioDestURL)
                     resolvedContentType = yt.mimeType
                     resolvedSource = "youtube-direct"
@@ -413,6 +428,16 @@ final class OfflineDownloadManager: ObservableObject {
                 }
             }
 
+            // 4. On-device audio-only compaction: strip video track from downloaded video/mp4 (e.g. YouTube itag=18)
+            if effectiveQuality == "compact" && resolvedContentType == "video/mp4" {
+                if let compacted = await compactVideoToAudioOnlyM4A(sourceURL: audioDestURL, safeId: safeId) {
+                    audioDestURL = compacted.url
+                    audioFilename = compacted.filename
+                    audioBytes = compacted.bytes
+                    resolvedContentType = "audio/mp4"
+                }
+            }
+
             let artData = await artworkTask
             let lyricsResp = await lyricsTask
 
@@ -431,8 +456,56 @@ final class OfflineDownloadManager: ObservableObject {
         }
     }
 
+    private func compactVideoToAudioOnlyM4A(
+        sourceURL: URL,
+        safeId: String
+    ) async -> (url: URL, filename: String, bytes: Int64)? {
+        let asset = AVURLAsset(url: sourceURL)
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            return nil
+        }
+        let tempFilename = "\(safeId).compact.\(UUID().uuidString.prefix(8)).m4a"
+        let tempURL = audioDirectory.appendingPathComponent(tempFilename, isDirectory: false)
+        try? fileManager.removeItem(at: tempURL)
+
+        exporter.outputURL = tempURL
+        exporter.outputFileType = .m4a
+        exporter.shouldOptimizeForNetworkUse = true
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            exporter.exportAsynchronously {
+                continuation.resume()
+            }
+        }
+
+        guard exporter.status == .completed,
+              let attrs = try? fileManager.attributesOfItem(atPath: tempURL.path),
+              let outBytes = (attrs[.size] as? NSNumber)?.int64Value,
+              outBytes >= 100_000 else {
+            try? fileManager.removeItem(at: tempURL)
+            return nil
+        }
+
+        let finalFilename = "\(safeId).m4a"
+        let finalURL = audioDirectory.appendingPathComponent(finalFilename, isDirectory: false)
+        do {
+            if fileManager.fileExists(atPath: finalURL.path) {
+                try fileManager.removeItem(at: finalURL)
+            }
+            try fileManager.moveItem(at: tempURL, to: finalURL)
+            if sourceURL.path != finalURL.path {
+                try? fileManager.removeItem(at: sourceURL)
+            }
+            applyBackupExclusion(to: finalURL)
+            return (finalURL, finalFilename, outBytes)
+        } catch {
+            try? fileManager.removeItem(at: tempURL)
+            return nil
+        }
+    }
+
     @discardableResult
-    func downloadTracks(_ tracks: [Track], api: APIClient, quality: String = "auto") async -> Int {
+    func downloadTracks(_ tracks: [Track], api: APIClient, quality: String? = nil) async -> Int {
         let pending = tracks.filter { !isDownloaded($0.id) && !isDownloading($0.id) }
         guard !pending.isEmpty else { return 0 }
 

@@ -3,6 +3,7 @@
 import { EQ_LABELS, EQ_PRESETS } from '../audioEffects.js';
 import { ICONS } from '../icons.js';
 import { escapeHtml, formatTime } from '../lrc.js';
+import { getDownloadQuality, setDownloadQuality } from '../offlineDownloads.js';
 import {
   applyEqSettings,
   cancelSleepTimer,
@@ -115,6 +116,7 @@ export function openAudioSettingsModal() {
           <div class="eq-presets-row">
             ${[
               { id: 'auto', label: 'Auto (Recommended)' },
+              { id: 'compact', label: 'Light / Compact (~3–4 MB)' },
               { id: 'lossless', label: 'Lossless FLAC' },
               { id: 'fast', label: 'Fast Standard' },
             ]
@@ -122,6 +124,25 @@ export function openAudioSettingsModal() {
                 (q) => `
               <button type="button" class="pill-btn ${st.audioQuality === q.id ? 'active' : ''}" data-quality="${q.id}">
                 ${q.label}
+              </button>
+            `
+              )
+              .join('')}
+          </div>
+
+          <div class="audio-sec-header" style="margin-top:14px;">
+            <h3>Offline Download Size</h3>
+            <span class="audio-sec-badge">${getDownloadQuality() === 'lossless' ? 'Lossless (~25–35 MB)' : 'Light (~3–4 MB)'}</span>
+          </div>
+          <div class="eq-presets-row">
+            ${[
+              { id: 'compact', label: 'Light (~3–4 MB)' },
+              { id: 'lossless', label: 'Lossless FLAC (~25–35 MB)' },
+            ]
+              .map(
+                (dq) => `
+              <button type="button" class="pill-btn ${getDownloadQuality() === dq.id ? 'active' : ''}" data-dl-quality="${dq.id}">
+                ${dq.label}
               </button>
             `
               )
@@ -203,6 +224,20 @@ export function openAudioSettingsModal() {
             const qual = btn.dataset.quality;
             updateAudioSettings({ audioQuality: qual });
             showToast(`Audio quality set to ${qual}`, 'success', 1800);
+            render();
+          });
+        });
+
+        root.querySelectorAll('[data-dl-quality]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const dq = setDownloadQuality(btn.dataset.dlQuality);
+            showToast(
+              dq === 'lossless'
+                ? 'Offline downloads set to Lossless FLAC (~25–35 MB)'
+                : 'Offline downloads set to Light (~3–4 MB)',
+              'success',
+              2000
+            );
             render();
           });
         });
