@@ -89,9 +89,33 @@ final class YouTubeDirectResolver: @unchecked Sendable {
         cache[trackId] = CacheEntry(stream: stream, resolvedAt: Date())
     }
 
+    static func extractDirectVideoId(from trackId: String) -> String? {
+        guard trackId.hasPrefix("yt:") else { return nil }
+        let raw = String(trackId.dropFirst(3))
+        guard raw.count == 11,
+              !raw.hasPrefix("--"),
+              raw.unicodeScalars.allSatisfy({
+                  ($0.value >= 65 && $0.value <= 90) ||
+                  ($0.value >= 97 && $0.value <= 122) ||
+                  ($0.value >= 48 && $0.value <= 57) ||
+                  $0 == "-" || $0 == "_"
+              }) else {
+            return nil
+        }
+        return raw
+    }
+
     func resolveFullTrack(for track: Track, allowHLS: Bool = true) async -> DirectYouTubeStream? {
         if let cached = cachedStream(for: track.id), (allowHLS || !cached.isHLS) {
             return cached
+        }
+
+        // Instant fast-path for direct yt:<videoId> tracks (skips YouTube search completely!)
+        if let directVideoId = Self.extractDirectVideoId(from: track.id) {
+            if let resolved = await resolveVideoStream(videoId: directVideoId, allowHLS: allowHLS) {
+                storeCache(resolved, for: track.id)
+                return resolved
+            }
         }
 
         let cleaned = Self.cleanTitle(track.title)

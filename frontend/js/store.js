@@ -122,6 +122,7 @@ const state = {
   repeat: initialPrefs.repeat || 'off', // 'off' | 'all' | 'one'
   streamMode: null, // 'full' | 'preview' | 'offline-download' | 'offline-synth' | 'error'
   streamSource: '',
+  streamContentType: '',
 
   // Audio Settings & Spotify Parity Controls
   autoplay: initialPrefs.autoplay !== undefined ? Boolean(initialPrefs.autoplay) : true,

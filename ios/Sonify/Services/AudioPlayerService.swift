@@ -192,7 +192,11 @@ final class AudioPlayerService: ObservableObject {
 
     init(api: APIClient) {
         self.api = api
-        self.preferYouTubeDirect = UserDefaults.standard.bool(forKey: Self.preferYouTubeDirectDefaultsKey)
+        if UserDefaults.standard.object(forKey: Self.preferYouTubeDirectDefaultsKey) == nil {
+            self.preferYouTubeDirect = true
+        } else {
+            self.preferYouTubeDirect = UserDefaults.standard.bool(forKey: Self.preferYouTubeDirectDefaultsKey)
+        }
         configureAudioSession()
         setupRemoteCommandCenter()
         setupObservers()

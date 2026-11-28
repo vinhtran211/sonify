@@ -262,12 +262,19 @@ export function updatePlayerBar() {
         badgeEl.textContent = 'Offline Download';
         badgeEl.className = 'stream-badge full';
       } else if (st.streamMode === 'full') {
+        const rawSrc = String(st.streamSource || '').toLowerCase();
         const srcLabel =
-          st.streamSource === 'monochrome'
+          rawSrc === 'monochrome'
             ? 'Lossless FLAC'
-            : String(st.streamSource || '').endsWith('-mp3')
+            : rawSrc === 'youtube-mp3' || rawSrc === 'yt-dlp-mp3' || rawSrc === 'youtube-innertube-mp3'
+            ? 'YouTube MP3'
+            : rawSrc === 'youtube-compact' || rawSrc === 'yt-dlp-compact' || rawSrc === 'youtube-innertube-compact' || rawSrc === 'youtube-direct'
+            ? 'YouTube Audio'
+            : rawSrc === 'youtube' || rawSrc === 'yt-dlp' || rawSrc === 'youtube-innertube'
+            ? (st.streamContentType === 'video/mp4' ? 'YouTube MP4' : 'YouTube Audio')
+            : rawSrc.endsWith('-mp3')
             ? 'Compact MP3'
-            : String(st.streamSource || '').endsWith('-compact')
+            : rawSrc.endsWith('-compact')
             ? 'Compact M4A'
             : st.streamSource || '';
         badgeEl.textContent = `Full Track${srcLabel ? ` • ${srcLabel}` : ''}`;

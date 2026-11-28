@@ -78,6 +78,120 @@ _FAILED_INSTANCES: Dict[str, float] = {}
 _INVIDIOUS_DYNAMIC: List[str] = []
 _INVIDIOUS_FETCHED_AT: float = 0.0
 
+_CLOUD_ANON_LOCK = threading.Lock()
+_CLOUD_ANON_GATE_UNTIL: float = 0.0
+_CLOUD_ANON_GATE_COOLDOWN_SEC: float = 300.0
+
+
+def is_cloud_anon_gated() -> bool:
+    """Return True when anonymous cloud datacenter YouTube requests are in 5-min cooldown."""
+    with _CLOUD_ANON_LOCK:
+        return time.monotonic() < _CLOUD_ANON_GATE_UNTIL
+
+
+def trip_cloud_anon_gate(seconds: float = _CLOUD_ANON_GATE_COOLDOWN_SEC) -> None:
+    """Trip the anonymous cloud YouTube circuit-breaker for `seconds` (default 300s)."""
+    global _CLOUD_ANON_GATE_UNTIL
+    with _CLOUD_ANON_LOCK:
+        _CLOUD_ANON_GATE_UNTIL = time.monotonic() + max(1.0, float(seconds))
+
+
+def reset_cloud_anon_gate() -> None:
+    """Reset the anonymous cloud YouTube circuit-breaker (primarily for unit tests)."""
+    global _CLOUD_ANON_GATE_UNTIL
+    with _CLOUD_ANON_LOCK:
+        _CLOUD_ANON_GATE_UNTIL = 0.0
+
+
+def get_runtime_status() -> Dict[str, Any]:
+    """Return strictly non-sensitive YouTube runtime capabilities for /api/health."""
+    return {
+        "ytDlp": bool(shutil.which("yt-dlp")),
+        "deno": bool(shutil.which("deno")),
+        "node": bool(shutil.which("node")),
+        "ffmpeg": bool(shutil.which("ffmpeg")),
+        "cloudMode": config.is_cloud_env(),
+        "cloudCredentialsConfigured": has_cloud_youtube_credentials(),
+        "cloudAnonGated": is_cloud_anon_gated(),
+    }
+
+
+def get_track_metadata(video_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch title, artist, duration, and thumbnail for a direct yt:<videoId> track via InnerTube."""
+    if not security.validate_provider_id("yt", video_id):
+        return None
+    if config.is_cloud_env() and not has_cloud_youtube_credentials() and is_cloud_anon_gated():
+        return None
+    try:
+        body = {
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "clientName": "ANDROID",
+                    "clientVersion": "20.10.38",
+                    "androidSdkVersion": 35,
+                    "osName": "Android",
+                    "osVersion": "15",
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+        }
+        headers = {
+            "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 15) gzip",
+            "Content-Type": "application/json",
+            "X-YouTube-Client-Name": "3",
+            "X-YouTube-Client-Version": "20.10.38",
+        }
+        data = http_client.fetch_json(
+            YT_PLAYER_URL,
+            method="POST",
+            headers=headers,
+            json_body=body,
+            timeout=min(config.STREAM_PROBE_TIMEOUT, 4.0),
+        )
+        details = data.get("videoDetails") or {}
+        title = str(details.get("title") or "").strip()
+        if not title:
+            return None
+        author = _clean_candidate_artist(str(details.get("author") or "YouTube Music"))
+        try:
+            duration = max(0, int(details.get("lengthSeconds") or 0))
+        except Exception:
+            duration = 0
+        thumbs = (details.get("thumbnail") or {}).get("thumbnails") or []
+        cover_small = (
+            str(thumbs[0].get("url") or "")
+            if thumbs and isinstance(thumbs[0], dict)
+            else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+        )
+        cover_large = (
+            str(thumbs[-1].get("url") or "")
+            if thumbs and isinstance(thumbs[-1], dict)
+            else f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+        )
+        return {
+            "id": f"yt:{video_id}",
+            "source": "youtube_music",
+            "title": title,
+            "artist": author or "YouTube Music",
+            "artistId": "",
+            "album": "",
+            "albumId": "",
+            "duration": duration,
+            "coverSmall": cover_small,
+            "coverLarge": cover_large or cover_small,
+            "explicit": False,
+            "releaseDate": "",
+            "previewUrl": "",
+            "streamUrl": f"/api/stream/yt:{video_id}",
+            "_extra": {"videoId": video_id, "videoIdMatchVersion": 2},
+        }
+    except Exception:
+        return None
+
 
 def _ytm_context() -> Dict[str, Any]:
     return {
@@ -423,6 +537,12 @@ def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str
     if config.is_cloud_env() and not has_cloud_youtube_credentials():
         return None
     try:
+        has_creds = has_cloud_youtube_credentials()
+        extractor_clients = (
+            "youtube:player_client=web,tv_embedded,android,ios"
+            if has_creds
+            else "youtube:player_client=android,ios,web"
+        )
         cmd = [
             "yt-dlp",
             "-J",
@@ -431,10 +551,14 @@ def _resolve_via_yt_dlp(video_id: str) -> Optional[Tuple[str, str, Dict[str, str
             "--no-warnings",
             "--no-check-formats",
             "--extractor-args",
-            "youtube:player_client=android,tv_embedded,ios",
+            extractor_clients,
             "--socket-timeout",
             "6",
         ]
+        if shutil.which("deno"):
+            cmd.extend(["--js-runtimes", "deno"])
+        elif shutil.which("node"):
+            cmd.extend(["--js-runtimes", "node"])
         cmd.extend(_get_ytdlp_extra_args())
         cmd.append("--")
         cmd.append(f"https://www.youtube.com/watch?v={video_id}")
@@ -603,8 +727,21 @@ def _resolve_via_innertube_player(video_id: str) -> Optional[Tuple[str, str, Dic
                 json_body=body,
                 timeout=config.STREAM_PROBE_TIMEOUT,
             )
-            play_status = (data.get("playabilityStatus") or {}).get("status")
+            playability = data.get("playabilityStatus") or {}
+            play_status = str(playability.get("status") or "").upper()
             if play_status and play_status != "OK":
+                reason_low = str(playability.get("reason") or "").lower()
+                if (
+                    config.is_cloud_env()
+                    and not has_cloud_youtube_credentials()
+                    and play_status in ("LOGIN_REQUIRED", "UNPLAYABLE", "ERROR")
+                    and (
+                        play_status == "LOGIN_REQUIRED"
+                        or any(tok in reason_low for tok in ("bot", "sign in", "confirm"))
+                    )
+                ):
+                    trip_cloud_anon_gate()
+                    return None
                 continue
 
             streaming_data = data.get("streamingData") or {}
@@ -795,13 +932,25 @@ def resolve_audio_stream(video_id: str) -> Optional[Tuple[str, str, Dict[str, st
     if not video_id or not security.validate_provider_id("yt", video_id):
         return None
 
-    res = _resolve_via_innertube_player(video_id)
-    if res:
-        return res[0], res[1], res[2], "youtube-innertube"
+    if config.is_cloud_env() and not has_cloud_youtube_credentials() and is_cloud_anon_gated():
+        return None
 
-    res = _resolve_via_yt_dlp(video_id)
-    if res:
-        return res[0], res[1], res[2], "yt-dlp"
+    # When cloud credentials (cookies/proxy) are configured, try yt-dlp first (uses cookies + Deno EJS),
+    # then fall back to direct InnerTube; locally/residential try fast InnerTube first then yt-dlp.
+    if config.is_cloud_env() and has_cloud_youtube_credentials():
+        res = _resolve_via_yt_dlp(video_id)
+        if res:
+            return res[0], res[1], res[2], "yt-dlp"
+        res = _resolve_via_innertube_player(video_id)
+        if res:
+            return res[0], res[1], res[2], "youtube-innertube"
+    else:
+        res = _resolve_via_innertube_player(video_id)
+        if res:
+            return res[0], res[1], res[2], "youtube-innertube"
+        res = _resolve_via_yt_dlp(video_id)
+        if res:
+            return res[0], res[1], res[2], "yt-dlp"
 
     # Skip dead public Piped/Invidious seeds on cloud datacenter IPs unless explicitly enabled
     if config.is_cloud_env() and os.environ.get("SONIFY_ENABLE_PUBLIC_PIPED", "").strip().lower() not in (

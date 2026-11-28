@@ -265,4 +265,14 @@ final class YouTubeDirectResolverTests: XCTestCase {
         XCTAssertNil(YouTubeDirectResolver.pickAdaptiveAudioFormat(from: blocked))
         XCTAssertNil(YouTubeDirectResolver.pickHLSManifestURL(from: blocked))
     }
+
+    func testExtractDirectVideoIdValidation() {
+        XCTAssertEqual(YouTubeDirectResolver.extractDirectVideoId(from: "yt:dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        XCTAssertEqual(YouTubeDirectResolver.extractDirectVideoId(from: "yt:-tKVN2mAKRI"), "-tKVN2mAKRI")
+        XCTAssertNil(YouTubeDirectResolver.extractDirectVideoId(from: "dz:908604612"))
+        XCTAssertNil(YouTubeDirectResolver.extractDirectVideoId(from: "yt:--exec=foo"))
+        XCTAssertNil(YouTubeDirectResolver.extractDirectVideoId(from: "yt:abc&list=12"))
+        XCTAssertNil(YouTubeDirectResolver.extractDirectVideoId(from: "yt:short"))
+        XCTAssertNil(YouTubeDirectResolver.extractDirectVideoId(from: "yt:../../etc/p"))
+    }
 }

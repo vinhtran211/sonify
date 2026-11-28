@@ -414,6 +414,7 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         "ytDlpAvailable": config.has_yt_dlp(),
                         "ytDlpConfigured": youtube_music.has_cloud_youtube_credentials(),
                         "ffmpegAvailable": config.has_ffmpeg(),
+                        "youtubeRuntime": youtube_music.get_runtime_status(),
                         "cloudMode": cloud_mode,
                         "renderRegion": os.environ.get("RENDER_REGION") or ("cloud" if cloud_mode else "local"),
                         "offlineMode": http_client.is_offline_mode(),
@@ -561,6 +562,9 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                     debug = raw_debug and (config.is_debug_allowed() or valid_dbg_token)
                     quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
                     fmt = self._qparam(qs, "format", "").strip().lower()
+                    if fmt not in ("", "mp3", "m4a", "auto"):
+                        self._send_error_json(400, "INVALID_FORMAT", "format must be 'mp3', 'm4a', or 'auto'")
+                        return
                     prewarm = self._qparam(qs, "prewarm", "0").strip().lower() in ("1", "true", "yes")
                     refresh = self._qparam(qs, "refresh", "0").strip().lower() in ("1", "true", "yes")
                     info_kwargs: Dict[str, Any] = {
@@ -569,18 +573,29 @@ class SonifyRequestHandler(BaseHTTPRequestHandler):
                         "prewarm": prewarm,
                         "force_refresh": refresh,
                     }
-                    if fmt:
+                    if fmt and fmt != "auto":
                         info_kwargs["target_format"] = fmt
                     self._send_json(
                         self.server.stream.get_stream_info(track_id, **info_kwargs)
                     )
                     return
-                track_id = strip_known_stream_extension(urllib.parse.unquote(rest).strip("/"))
+                raw_stream_segment = urllib.parse.unquote(rest).strip("/")
+                lower_seg = raw_stream_segment.lower()
+                inferred_fmt = ""
+                if lower_seg.endswith(".mp3"):
+                    inferred_fmt = "mp3"
+                elif lower_seg.endswith(".m4a"):
+                    inferred_fmt = "m4a"
+                track_id = strip_known_stream_extension(raw_stream_segment)
                 if not track_id:
                     self._send_error_json(400, "INVALID_TRACK", "Missing trackId")
                     return
                 quality = self._qparam(qs, "quality", "auto").strip().lower() or "auto"
-                fmt = self._qparam(qs, "format", "").strip().lower()
+                raw_fmt = self._qparam(qs, "format", "").strip().lower()
+                if raw_fmt not in ("", "mp3", "m4a", "auto"):
+                    self._send_error_json(400, "INVALID_FORMAT", "format must be 'mp3', 'm4a', or 'auto'")
+                    return
+                fmt = ("" if raw_fmt == "auto" else raw_fmt) or inferred_fmt
                 stream_kwargs: Dict[str, Any] = {"head_only": head_only}
                 if quality != "auto":
                     stream_kwargs["quality"] = quality

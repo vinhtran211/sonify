@@ -414,10 +414,10 @@ class CatalogService:
         dedup: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
         source_bonus = {
-            "deezer": 0.14,
-            "itunes": 0.12,
-            "jiosaavn": 0.08,
-            "youtube_music": 0.05,
+            "youtube_music": 0.11,
+            "deezer": 0.08,
+            "itunes": 0.07,
+            "jiosaavn": 0.04,
             "audius": 0.02,
             "local": 0.0,
         }
@@ -482,7 +482,11 @@ class CatalogService:
             elif artist_hits_query and title_hits_query:
                 exact_boost = 0.18
 
-            rank_boost = max(0.0, 0.07 * (1.0 - pos / 20.0)) if src in ("deezer", "itunes") else 0.0
+            rank_boost = (
+                max(0.0, 0.07 * (1.0 - pos / 20.0))
+                if src in ("youtube_music", "deezer", "itunes")
+                else 0.0
+            )
             meta_boost = (0.04 if t.get("coverLarge") else 0.0) + (0.03 if t.get("duration", 0) > 0 else 0.0)
             score = (
                 max(t_sim, a_sim * 0.96, combined_sim)
@@ -500,8 +504,41 @@ class CatalogService:
                     break
 
             existing = dedup.get(key)
-            if existing is None or score > existing[0]:
-                dedup[key] = (score, t)
+            if existing is None:
+                dedup[key] = (score, dict(t))
+            else:
+                prev_score, prev_track = existing
+                winner = dict(t) if score > prev_score else dict(prev_track)
+                loser = prev_track if score > prev_score else t
+                # Cross-enrich winner with videoId, richer album/artwork/isrc/previewUrl from loser
+                w_extra = dict(winner.get("_extra") or {})
+                l_extra = dict(loser.get("_extra") or {})
+                if not w_extra.get("videoId") and l_extra.get("videoId"):
+                    w_extra["videoId"] = l_extra["videoId"]
+                    w_extra["videoIdMatchVersion"] = 2
+                if not w_extra.get("isrc") and l_extra.get("isrc"):
+                    w_extra["isrc"] = l_extra["isrc"]
+                if w_extra:
+                    winner["_extra"] = w_extra
+                if not winner.get("album") and loser.get("album"):
+                    winner["album"] = loser["album"]
+                    if not winner.get("albumId") and loser.get("albumId"):
+                        winner["albumId"] = loser["albumId"]
+                if not winner.get("artistId") and loser.get("artistId"):
+                    winner["artistId"] = loser["artistId"]
+                if not winner.get("previewUrl") and loser.get("previewUrl"):
+                    winner["previewUrl"] = loser["previewUrl"]
+                if (
+                    loser.get("coverLarge")
+                    and (
+                        not winner.get("coverLarge")
+                        or "i.ytimg.com" in str(winner.get("coverLarge") or "")
+                    )
+                ):
+                    winner["coverLarge"] = loser["coverLarge"]
+                    if loser.get("coverSmall"):
+                        winner["coverSmall"] = loser["coverSmall"]
+                dedup[key] = (max(score, prev_score), winner)
 
         ranked = sorted(dedup.values(), key=lambda x: x[0], reverse=True)
         return [item[1] for item in ranked[:limit]]
@@ -635,7 +672,8 @@ class CatalogService:
         need_artists = stype in ("all", "artists")
         need_albums = stype in ("all", "albums")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
+            f_yt_t = pool.submit(_safe, youtube_music.search_songs, q, min(lim, 15)) if need_tracks else None
             f_dz_t = pool.submit(_safe, deezer.search_tracks, q, lim) if need_tracks else None
             f_it_t = pool.submit(_safe, apple_itunes.search_songs, q, "vn", 12) if need_tracks else None
             f_au_t = pool.submit(_safe, audius.search_tracks, q, 8) if need_tracks else None
@@ -643,6 +681,7 @@ class CatalogService:
             f_dz_a = pool.submit(_safe, deezer.search_artists, q, 10) if need_artists else None
             f_dz_al = pool.submit(_safe, deezer.search_albums, q, 10) if need_albums else None
 
+            yt_tracks = f_yt_t.result() if f_yt_t else None
             dz_tracks = f_dz_t.result() if f_dz_t else None
             it_tracks = f_it_t.result() if f_it_t else None
             au_tracks = f_au_t.result() if f_au_t else None
@@ -653,6 +692,7 @@ class CatalogService:
         submitted_results = [
             res
             for fut, res in (
+                (f_yt_t, yt_tracks if yt_tracks else None),
                 (f_dz_t, dz_tracks),
                 (f_it_t, it_tracks),
                 (f_au_t, au_tracks),
@@ -666,11 +706,13 @@ class CatalogService:
         if not any(res is not None for res in submitted_results):
             return self._search_offline(q, stype, lim, owner_id=owner_id)
 
-        combined_tracks = (dz_tracks or []) + (it_tracks or []) + (js_tracks or []) + (au_tracks or [])
-        # If standard providers found < 3 tracks, also supplement with YTM InnerTube search
-        if need_tracks and len(combined_tracks) < 3:
-            yt_tracks = _safe(youtube_music.search_songs, q, 8) or []
-            combined_tracks.extend(yt_tracks)
+        combined_tracks = (
+            (yt_tracks or [])
+            + (dz_tracks or [])
+            + (it_tracks or [])
+            + (js_tracks or [])
+            + (au_tracks or [])
+        )
 
         ranked_tracks = self._dedup_and_rank_tracks(combined_tracks, q, lim) if need_tracks else []
         if ranked_tracks:

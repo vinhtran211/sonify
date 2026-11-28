@@ -5,7 +5,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install optional cloud streaming & decryption dependencies (cryptography + yt-dlp)
+# Official Deno binary (default JS runtime for 2026 yt-dlp EJS player extraction)
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
+# Install cloud streaming & decryption dependencies (cryptography + yt-dlp[default] with yt-dlp-ejs)
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm -f /tmp/requirements.txt
@@ -27,6 +30,7 @@ USER user
 
 ENV HOME=/home/user \
     PATH="/home/user/.local/bin:${PATH}" \
+    XDG_CACHE_HOME=/tmp/.cache \
     SONIFY_HOST=0.0.0.0 \
     PORT=10000 \
     PYTHONUNBUFFERED=1

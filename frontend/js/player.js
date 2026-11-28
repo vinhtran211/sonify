@@ -655,6 +655,7 @@ async function startTrackPlayback(track, withFadeIn = false) {
   setState({
     streamMode: info?.streamMode || 'full',
     streamSource: info?.streamSource || '',
+    streamContentType: info?.contentType || '',
     isLoading: true,
   });
 

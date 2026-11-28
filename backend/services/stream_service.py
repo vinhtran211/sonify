@@ -229,6 +229,10 @@ def _should_transcode_to_mp3(
         if norm_mime == "audio/mpeg":
             return None
         return "mp3"
+    if fmt == "m4a":
+        if norm_mime == "audio/mp4":
+            return None
+        return "m4a_copy"
     if qual == "compact":
         ctype_low = (resolved.content_type or "").lower()
         if resolved.source == "monochrome" or "flac" in ctype_low or "wav" in ctype_low:
@@ -319,7 +323,7 @@ class StreamService:
             elif prefix == "js" and security.validate_provider_id("js", raw_id):
                 fetched = jiosaavn.get_song_details(raw_id)
             elif prefix == "yt" and security.validate_provider_id("yt", raw_id):
-                fetched = {
+                fetched = youtube_music.get_track_metadata(raw_id) or {
                     "id": track_id,
                     "source": "youtube_music",
                     "title": raw_id,
@@ -1079,26 +1083,26 @@ class StreamService:
             sc_allowed = bool(title) and "soundcloud" not in excluded
             has_yt_creds = youtube_music.has_cloud_youtube_credentials()
 
+            # Tier 1 PRIMARY on Cloud WITH credentials (YTDLP_COOKIES_B64 / YTDLP_PROXY):
+            # ALWAYS try YouTube FIRST before Monochrome & SoundCloud in ALL quality modes!
+            if has_yt_creds and not yt_excluded and prefix != "yt":
+                t0 = time.monotonic()
+                yt_resolved = self._try_resolve_youtube(
+                    track_id, prefix, track, title, artist, duration, extra, excluded
+                )
+                ms = int((time.monotonic() - t0) * 1000)
+                if yt_resolved:
+                    attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
+                    yt_resolved.diagnostics = list(attempts)
+                    return yt_resolved
+                attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
+
             if quality == "compact":
-                # Light / Compact waterfall on Cloud: prefer naturally ~2.4-5.2 MB full tracks FIRST
-                # (YouTube w/ creds -> SoundCloud -> JioSaavn 160k -> Bilibili 128k -> Audius),
-                # falling back to Monochrome FLAC (compacted via ffmpeg to 128k MP3) only if needed.
-                if not yt_excluded and prefix != "yt":
-                    if has_yt_creds:
-                        t0 = time.monotonic()
-                        yt_resolved = self._try_resolve_youtube(
-                            track_id, prefix, track, title, artist, duration, extra, excluded
-                        )
-                        ms = int((time.monotonic() - t0) * 1000)
-                        if yt_resolved:
-                            attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
-                            yt_resolved.diagnostics = list(attempts)
-                            return yt_resolved
-                        attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
-                    else:
-                        attempts.append(
-                            {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
-                        )
+                # Light / Compact fallback on Cloud: SoundCloud -> JioSaavn 160k -> Bilibili 128k -> Audius -> Monochrome (compacted)
+                if not has_yt_creds and not yt_excluded and prefix != "yt":
+                    attempts.append(
+                        {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
+                    )
 
                 if sc_allowed:
                     sc_resolved = self._try_resolve_soundcloud(
@@ -1286,22 +1290,10 @@ class StreamService:
                             return mc_resolved
                         attempts.append({"provider": "monochrome", "outcome": "no_match", "ms": ms})
 
-                    if not yt_excluded and prefix != "yt":
-                        if has_yt_creds:
-                            t0 = time.monotonic()
-                            yt_resolved = self._try_resolve_youtube(
-                                track_id, prefix, track, title, artist, duration, extra, excluded
-                            )
-                            ms = int((time.monotonic() - t0) * 1000)
-                            if yt_resolved:
-                                attempts.append({"provider": yt_resolved.source, "outcome": "ok", "ms": ms})
-                                yt_resolved.diagnostics = list(attempts)
-                                return yt_resolved
-                            attempts.append({"provider": "youtube", "outcome": "no_match", "ms": ms})
-                        else:
-                            attempts.append(
-                                {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
-                            )
+                    if not has_yt_creds and not yt_excluded and prefix != "yt":
+                        attempts.append(
+                            {"provider": "youtube", "outcome": "skipped_cloud_no_credentials", "ms": 0}
+                        )
 
                     if sc_allowed:
                         sc_resolved = self._try_resolve_soundcloud(
@@ -1662,8 +1654,16 @@ class StreamService:
                 payload["directUrl"] = resolved.url
 
         if debug:
+            is_cloud = config.is_cloud_env()
+            yt_ready = (not is_cloud) or youtube_music.has_cloud_youtube_credentials()
             payload["diagnostics"] = list(resolved.diagnostics)
-            payload["cloudMode"] = config.is_cloud_env()
+            payload["cloudMode"] = is_cloud
+            payload["youtubeCloudReady"] = yt_ready
+            payload["youtubeCloudHint"] = (
+                None
+                if yt_ready
+                else "Set YTDLP_COOKIES_B64 on Render for cloud YouTube MP3/MP4"
+            )
         return payload
 
     def _send_common_stream_headers(self, handler: Any, resolved: ResolvedStream) -> None:
